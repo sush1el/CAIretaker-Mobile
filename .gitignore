@@ -1,34 +1,89 @@
-# Gradle files
-.gradle/
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+
+# typescript
+*.tsbuildinfo
+
+# generated native folders
+/ios
+/android
+
+# --- Node.js & React Dependencies ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json # Optional: Keep this if you want to lock versions, ignore if you want flexibility. Usually KEPT.
+
+# --- Build Outputs (Vite) ---
+dist/
 build/
 
-# Local configuration file (sdk path, etc)
-local.properties
+# --- Python Backend ---
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-# Log/OS Files
-*.log
+# Virtual Environments
+venv/
+.venv/
+env/
+backend/venv/
 
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
-*.apk
-output-metadata.json
+# --- Environment Variables (CRITICAL FOR SECURITY) ---
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
-# IntelliJ
-*.iml
+# --- OS & IDE Files (Junk) ---
+.DS_Store
+Thumbs.db
+.vscode/
 .idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
+*.swp
 
-# Keystore files
-*.jks
-*.keystore
-
-# Google Services (e.g. APIs or Firebase)
-google-services.json
-
-# Android Profiling
-*.hprof
+# --- Large AI Models (Optional but Recommended) ---
+# GitHub has a 100MB file limit. If these are large, ignore them.
+*.pt
+*.pth
+*.onnx
+# Specific models from your folder:
+yolo11n-pose.pt
+yolo11m-pose.pt
+backend/spatial_branch_output/*.pth
