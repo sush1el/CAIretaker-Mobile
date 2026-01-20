@@ -1,70 +1,85 @@
-# CAIretaker-Mobile
-CAIretaker-Mobile: Developer Workflow Guide
+## 🛠 Developer Workflow Guide
+**⚠️ IMPORTANT:** We are using an "Honor System" for this repository. Please strictly follow these rules to avoid breaking the production code.
 
-Phase 1: First-Time Setup
-Do this once before you start coding.
-
-Clone the Repository Open your terminal/command prompt and run:
-
-Bash
-git clone https://github.com/YourUsername/CAIretaker-Mobile.git
+### 1. Setup & Installation
+```bash
+# Clone the repository
+git clone [https://github.com/YourUsername/CAIretaker-Mobile.git](https://github.com/YourUsername/CAIretaker-Mobile.git)
 cd CAIretaker-Mobile
-(Replace YourUsername with the actual organization or username where the repo lives).
 
-Install Dependencies Since we are shifting to a React Native environment, ensure you have Node.js installed, then run:
-
-Bash
+# Install dependencies (React Native environment)
 npm install
-Phase 2: Starting a New Task (The Golden Rules)
-🛑 RULE 1: NEVER push directly to main or develop. 🛑 RULE 2: Always create a new branch for your specific task.
 
-Switch to the Integration Branch Always start your work from the latest version of the develop branch.
+```
 
-Bash
+### 2. Branching Strategy
+
+We adhere to an industry-standard git flow. **NEVER** push directly to `main` or `develop`.
+
+* **`main`**: Production-ready code only.
+* **`develop`**: Integration branch (The base for all features).
+* **`feature/[name]`**: Working branches for specific tasks.
+
+#### Active Feature Branches:
+
+* `feature/dashboard-mobile`
+* `feature/push-notifications`
+
+### 3. How to Contribute (Step-by-Step)
+
+**Step A: Start a Task**
+Always pull the latest `develop` branch before starting.
+
+```bash
 git checkout develop
 git pull origin develop
-Create Your Feature Branch Name your branch based on what you are working on (e.g., feature/dashboard-mobile or feature/push-notifications ).
+git checkout -b feature/your-feature-name
 
-Bash
-# Syntax: git checkout -b feature/name-of-task
-git checkout -b feature/login-screen
-Phase 3: Coding & Directory Structure
-Place your files strictly according to our repository structure:
+```
 
-src/pages/: Full screen layouts (e.g., Login, Dashboard).
+**Step B: Save Your Work**
 
-src/components/: Reusable widgets (e.g., Buttons, Headers, Alert Cards).
-
-
-backend/: Any API or server-side logic (reused from the web interface).
-
-
-public/: Static assets like images or icons.
-
-Phase 4: Saving & Uploading Work
-Stage and Commit Changes
-
-Bash
+```bash
 git add .
-git commit -m "Added login screen layout"
-Push to GitHub Push your branch, not the main branch.
+git commit -m "Brief description of changes"
+git push origin feature/your-feature-name
 
-Bash
-# Syntax: git push origin feature/name-of-task
-git push origin feature/login-screen
-Phase 5: Making a Pull Request (PR)
-This is how your code gets into the official project.
+```
 
-Go to the repository on GitHub.
+**Step C: Submit Code (Pull Request)**
 
-You will see a yellow banner saying "feature/login-screen had recent pushes." Click Compare & pull request.
+1. Go to the GitHub repository page.
+2. Click **"Compare & pull request"**.
+3. **CRITICAL:** Set the **base** branch to **`develop`** (NOT `main`).
+4. Assign a group member to review your code.
+5. Merge only after approval.
 
-IMPORTANT: Change the "base" branch to develop.
+---
 
-Do NOT merge into main yet! main is only for production-ready code.
+## 📂 Repository Structure
 
-Title: Describe what you did.
+Please ensure files are placed in the correct directories:
 
-Review: Since we can't enforce rules, assign one team member to review your code (e.g., have Cyril or Jasmine check it).
+```text
+CAIretaker-Mobile/
+├── .github/workflows/   # CI/CD configurations
+├── backend/             # Server-side logic & API (from web interface)
+├── public/              # Static assets (images, icons)
+├── src/
+│   ├── components/      # Reusable widgets (Buttons, Headers, etc.)
+│   ├── pages/           # Full screen layouts (Login, Dashboard)
+└── package.json         # Project dependencies
 
-Once approved, click Merge pull request.
+```
+
+---
+
+## 🖥 Hardware & Enclosure
+
+* **Hardware:** Raspberry Pi 5 + Camera Module V3.
+* **Enclosure:** Custom 3D-printed case designed in Onshape.
+* **Design Focus:** Ventilation, Adjustable Camera Mounts, and Non-intrusive aesthetics.
+
+```
+
+```
