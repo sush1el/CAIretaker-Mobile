@@ -71,15 +71,3 @@ CAIretaker-Mobile/
 └── package.json         # Project dependencies
 
 ```
-
----
-
-## 🖥 Hardware & Enclosure
-
-* **Hardware:** Raspberry Pi 5 + Camera Module V3.
-* **Enclosure:** Custom 3D-printed case designed in Onshape.
-* **Design Focus:** Ventilation, Adjustable Camera Mounts, and Non-intrusive aesthetics.
-
-```
-
-```
