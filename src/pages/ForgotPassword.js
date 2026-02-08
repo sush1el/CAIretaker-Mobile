@@ -175,7 +175,7 @@ export default function ForgotPassword() {
       <StatusBar barStyle="light-content" backgroundColor={darkBlue} />
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.container}>
         <View style={styles.staticContainer}>
-          <View style={styles.headerContainer}> 
+          <View style={styles.headerContainer}>
             <TouchableOpacity onPress={() => router.back()} style={styles.backButton}><Text style={styles.backButtonText}>← Back</Text></TouchableOpacity>
             <Image source={require("../../assets/login_header_v2.png")} style={styles.headerImage} resizeMode="contain" />
           </View>
