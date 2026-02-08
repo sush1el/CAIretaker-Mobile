@@ -3,10 +3,37 @@ import { Stack } from 'expo-router';
 export default function RootLayout() {
   return (
     <Stack screenOptions={{ headerShown: false }}>
-      <Stack.Screen name="/" />
-      <Stack.Screen name="register" />
-      <Stack.Screen name="forgot-password" />
-      <Stack.Screen name="(tabs)" />
+      {/* Auth routes - public */}
+      <Stack.Screen name="index" />
+      <Stack.Screen
+        name="login"
+        options={{
+          presentation: 'card',
+          headerShown: false
+        }}
+      />
+      <Stack.Screen
+        name="register"
+        options={{
+          presentation: 'card',
+          headerShown: false
+        }}
+      />
+      <Stack.Screen
+        name="forgot-password"
+        options={{
+          presentation: 'card',
+          headerShown: false
+        }}
+      />
+
+      {/* Protected routes - main app */}
+      <Stack.Screen
+        name="(tabs)"
+        options={{
+          headerShown: false
+        }}
+      />
     </Stack>
   );
 }

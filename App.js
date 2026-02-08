@@ -41,7 +41,6 @@ import LiveView from './src/pages/LiveView';
 import Logs from './src/pages/Logs';
 
 export default function App() {
-
   const router = useRouter();
 
   // Navigation State
@@ -78,21 +77,16 @@ export default function App() {
   ];
 
   // Actions
-  const handleDeleteLog = () => {
-    setLogs(logs.filter(log => log.id !== logToDelete));
-    setShowDeleteConfirm(false);
-  };
-
   const handleLogout = () => {
     console.log('🚪 Logging out...');
     setShowLogoutConfirm(false);
-    setCurrentScreen('Home');
     setLogs([]);
-    // Clear navigation stack and return to login
-    if (router.canDismiss()) {
-      router.dismissAll();
-    }
     router.replace('/login');
+  };
+
+  const handleDeleteLog = () => {
+    setLogs(logs.filter(log => log.id !== logToDelete));
+    setShowDeleteConfirm(false);
   };
 
   const requestDeleteLog = (id) => {
@@ -135,43 +129,31 @@ export default function App() {
         return <Logs logs={logs} requestDeleteLog={requestDeleteLog} setLogs={setLogs} />;
       default:
         return <Home logs={logs} setScreen={setCurrentScreen} setMonitoringRoom={setMonitoringRoom} requestDeleteLog={requestDeleteLog} setLogs={setLogs} />;
-
     }
   };
 
   return (
-    // 2. Wrap the entire app in SafeAreaProvider
     <SafeAreaProvider>
-      {/* 3. Use the new SafeAreaView. 'edges' ensures we only pad the top, sides */}
       <SafeAreaView style={styles.container} edges={['top']}>
         <StatusBar barStyle="dark-content" backgroundColor="#FFF" />
+
         {/* Header */}
         <View style={styles.header}>
-          <Text style={styles.headerTitle}>CAIretaker</Text>
-        </View>
-        {/* Main Content Area */}
-        <View style={styles.content}>
-          {renderContent()}
+          <TouchableOpacity onPress={() => setSidebarOpen(true)} style={styles.navIcon}>
+            <FontAwesomeIcon icon={faBars} color="#1E3A5F" size={24} />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => setCurrentScreen('Home')} activeOpacity={0.8} style={styles.logoContainer}>
+            <Image source={require('./assets/LANDSCAPE_LOGO.png')} style={styles.headerLogo} resizeMode="contain" />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => setShowLogoutConfirm(true)} style={styles.navIcon}>
+            <FontAwesomeIcon icon={faRightFromBracket} color="#1E3A5F" size={24} />
+          </TouchableOpacity>
         </View>
 
-        {/* Bottom Navigation Tab */}
-        <View style={styles.tabBar}>
-          <TabButton
-            title="Dashboard"
-            isActive={currentTab === 'dashboard'}
-            onPress={() => setCurrentTab('dashboard')}
-          />
-          <TabButton
-            title="Monitoring"
-            isActive={currentTab === 'monitoring'}
-            onPress={() => setCurrentTab('monitoring')}
-          />
-          <TabButton
-            title="Logs"
-            isActive={currentTab === 'logs'}
-            onPress={() => setCurrentTab('logs')}
-          />
-        </View>
+        {/* Main Content */}
+        <ScrollView contentContainerStyle={styles.scrollContent}>
+          {renderScreen()}
+        </ScrollView>
 
         {/* Global Components */}
         <SidebarMenu
@@ -197,40 +179,11 @@ export default function App() {
   );
 }
 
-const TabButton = ({ title, isActive, onPress }) => (
-  <TouchableOpacity
-    style={[styles.tabItem, isActive && styles.activeTab]}
-    onPress={onPress}
-  >
-    <Text style={[styles.tabText, isActive && styles.activeTabText]}>{title}</Text>
-  </TouchableOpacity>
-);
-
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#2c3e50' // Matches header color to blend with status bar
-  },
-  header: {
-    height: 60,
-    backgroundColor: '#2c3e50',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  headerTitle: { color: 'white', fontSize: 20, fontWeight: 'bold' },
-  content: {
-    flex: 1,
-    backgroundColor: '#f0f2f5' // Content background
-  },
-  tabBar: {
-    flexDirection: 'row',
-    height: 60,
-    backgroundColor: '#fff',
-    borderTopWidth: 1,
-    borderTopColor: '#ddd',
-  },
-  tabItem: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  activeTab: { borderTopWidth: 3, borderTopColor: '#1890ff' },
-  tabText: { color: '#666' },
-  activeTabText: { color: '#1890ff', fontWeight: 'bold' },
+  container: { flex: 1, backgroundColor: '#E8F4F8' },
+  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#FFF', height: 80, paddingHorizontal: 15, borderBottomWidth: 1, borderBottomColor: '#EEE' },
+  headerLogo: { height: 150, width: 150 },
+  logoContainer: { flex: 1, alignItems: 'center' },
+  navIcon: { width: 40, alignItems: 'center' },
+  scrollContent: { padding: 20 },
 });
