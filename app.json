@@ -3,6 +3,9 @@
     "name": "CAIretakerApp",
     "slug": "CAIretakerApp",
     "version": "1.0.0",
+    
+    "scheme": "cairetakerapp",  // <--- ADD THIS LINE HERE
+    
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -19,8 +22,7 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
-      },
-      "edgeToEdgeEnabled": true
+      }
     },
     "web": {
       "favicon": "./assets/favicon.png"
