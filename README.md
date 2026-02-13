@@ -2,7 +2,22 @@
 
 ---
 
-## 📋 Quick Start Checklist
+## � App Features
+
+### Real-Time Fall Detection
+- **Continuous Monitoring** - Falls detected with 500ms polling interval
+- **Live Status Indicator** - "No Active Falls" (green) / "Active Falls Detected!" (red) on Home page
+- **Background Stream** - Hidden WebView keeps camera stream active for real-time detection
+- **Persistent Logs** - Fall events logged with Room No, Status, Date, Time
+
+### Architecture
+- **Frontend**: React Native + Expo
+- **Backend**: Flask servers (Port 5001: Auth, Port 5002: Camera/Detection)
+- **AI Models**: YOLOv11 Pose + Custom CNN for fall classification
+
+---
+
+## �📋 Quick Start Checklist
 
 Before you start coding, complete these steps:
 

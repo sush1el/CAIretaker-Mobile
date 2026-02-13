@@ -4,6 +4,8 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
+  Keyboard,
   StyleSheet,
   Dimensions,
   StatusBar,
@@ -11,11 +13,13 @@ import {
   Platform,
   Image,
   ScrollView,
-  Alert
+  Alert,
+  ActivityIndicator
 } from "react-native";
 import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { Ionicons } from '@expo/vector-icons'; // Import Icon
+import { Ionicons } from '@expo/vector-icons';
+import api from '../services/api';
 
 const darkBlue = "#142237";
 const lightGreyInput = "#E5E7EB";
@@ -28,6 +32,7 @@ export default function Register() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
 
   // Toggles
   const [showPassword, setShowPassword] = useState(false);
@@ -57,7 +62,7 @@ export default function Register() {
     }
   };
 
-  const handleRegister = () => {
+  const handleRegister = async () => {
     if (!fullName || !email || !password || !confirmPassword) {
       Alert.alert("Error", "Please fill in all fields.");
       return;
@@ -67,19 +72,46 @@ export default function Register() {
       return;
     }
     if (strength === "Weak") {
-        Alert.alert("Error", "Password is too weak.");
-        return;
+      Alert.alert("Error", "Password is too weak.");
+      return;
     }
-    Alert.alert("Success", "Account created successfully!", [
-      { text: "Log In Now", onPress: () => router.back() }
-    ]);
+
+    setIsLoading(true);
+
+    try {
+      const result = await api.register(fullName, email, password);
+      
+      if (result.ok && result.data.success) {
+        Alert.alert("Success", "Account created successfully!", [
+          { text: "Log In Now", onPress: () => router.back() }
+        ]);
+      } else {
+        Alert.alert("Registration Failed", result.data.error || "Unable to create account");
+      }
+    } catch (error) {
+      console.error("Registration error:", error);
+      Alert.alert("Error", "Unable to connect to server. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   return (
     <SafeAreaView edges={['top', 'left', 'right']} style={styles.safeArea}>
       <StatusBar barStyle="light-content" backgroundColor={darkBlue} />
 
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.container}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={styles.container}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
+      >
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          bounces={false}
+        >
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
         <View style={styles.staticContainer}>
           
           <View style={styles.headerContainer}>
@@ -90,7 +122,6 @@ export default function Register() {
           </View>
 
           <View style={styles.formSection}>
-            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{paddingBottom: 20}}>
               
               <Text style={styles.heading}>Create Account</Text>
               <Text style={styles.subHeading}>Sign up to get started.</Text>
@@ -155,8 +186,16 @@ export default function Register() {
                   <Text style={styles.reqItem}>• A special character</Text>
               </View>
 
-              <TouchableOpacity style={styles.registerButton} onPress={handleRegister}>
-                <Text style={styles.registerButtonText}>Sign Up</Text>
+              <TouchableOpacity 
+                style={[styles.registerButton, isLoading && styles.registerButtonDisabled]} 
+                onPress={handleRegister}
+                disabled={isLoading}
+              >
+                {isLoading ? (
+                  <ActivityIndicator color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.registerButtonText}>Sign Up</Text>
+                )}
               </TouchableOpacity>
 
               <View style={styles.footerContainer}>
@@ -166,10 +205,11 @@ export default function Register() {
                 </TouchableOpacity>
               </View>
 
-            </ScrollView>
           </View>
 
         </View>
+        </TouchableWithoutFeedback>
+        </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -178,6 +218,7 @@ export default function Register() {
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: darkBlue },
   container: { flex: 1 },
+  scrollContent: { flexGrow: 1 },
   staticContainer: { flex: 1, justifyContent: "flex-start" },
   headerContainer: { height: height * 0.25, width: "100%", backgroundColor: darkBlue, alignItems: "center", justifyContent: "center", position: 'relative' },
   backButton: { position: 'absolute', top: 20, left: 20, zIndex: 10, padding: 10 },
@@ -195,6 +236,7 @@ const styles = StyleSheet.create({
   passwordInput: { flex: 1, paddingVertical: 12, fontSize: 16, color: darkBlue, fontWeight: "500" },
 
   registerButton: { backgroundColor: darkBlue, borderRadius: 10, paddingVertical: 15, alignItems: "center", marginTop: 5, marginBottom: 20 },
+  registerButtonDisabled: { opacity: 0.7 },
   registerButtonText: { color: "#FFFFFF", fontSize: 18, fontWeight: "bold" },
   footerContainer: { flexDirection: 'row', justifyContent: 'center', marginBottom: 20 },
   footerText: { fontSize: 14, color: '#666' },

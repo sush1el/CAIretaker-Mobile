@@ -4,6 +4,8 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
+  Keyboard,
   StyleSheet,
   Dimensions,
   StatusBar,
@@ -11,10 +13,13 @@ import {
   Platform,
   Image,
   Alert,
+  ActivityIndicator,
+  ScrollView,
 } from "react-native";
 import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { Ionicons } from '@expo/vector-icons'; // Import Icon
+import { Ionicons } from '@expo/vector-icons';
+import api from '../services/api';
 
 const darkBlue = "#142237";
 const lightGreyInput = "#E5E7EB";
@@ -28,6 +33,7 @@ export default function ForgotPassword() {
   const [otp, setOtp] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
   
   // Toggles
   const [showPassword, setShowPassword] = useState(false);
@@ -38,13 +44,47 @@ export default function ForgotPassword() {
   const [strength, setStrength] = useState("Weak");
   const [strengthColor, setStrengthColor] = useState("red");
 
-  const handleSendOTP = () => {
-    if (!email) { Alert.alert("Error", "Please enter your email address."); return; }
-    setStep(2); setTimer(60); setCanResend(false);
+  const handleSendOTP = async () => {
+    if (!email) { 
+      Alert.alert("Error", "Please enter your email address."); 
+      return; 
+    }
+    
+    setIsLoading(true);
+    
+    try {
+      const result = await api.forgotPassword(email);
+      
+      if (result.ok && result.data.success) {
+        setStep(2); 
+        setTimer(60); 
+        setCanResend(false);
+        
+        // Show dev OTP if available (for development only)
+        if (result.data.dev_otp) {
+          Alert.alert("Development Mode", `OTP Code: ${result.data.dev_otp}\n\n(In production, this will be sent via email)`);
+        } else {
+          Alert.alert("Success", "OTP code sent to your email!");
+        }
+      } else {
+        Alert.alert("Error", result.data.error || "Failed to send OTP");
+      }
+    } catch (error) {
+      console.error("Send OTP error:", error);
+      Alert.alert("Error", "Unable to connect to server. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
   };
 
-  const handleVerifyOTP = () => {
-    if (otp.length < 4) { Alert.alert("Error", "Please enter a valid OTP."); return; }
+  const handleVerifyOTP = async () => {
+    if (otp.length < 4) { 
+      Alert.alert("Error", "Please enter a valid OTP."); 
+      return; 
+    }
+    
+    // Skip API verification here - OTP will be verified when resetting password
+    // This prevents the OTP from being marked as "used" before password reset
     setStep(3);
   };
 
@@ -61,10 +101,40 @@ export default function ForgotPassword() {
     else { setStrength("Strong"); setStrengthColor("green"); }
   };
 
-  const handleChangePassword = () => {
-    if (newPassword !== confirmPassword) { Alert.alert("Error", "Passwords do not match!"); return; }
-    if (strength === "Weak") { Alert.alert("Error", "Password is too weak."); return; }
-    Alert.alert("Success", "Change password success!", [{ text: "OK", onPress: () => router.back() }]);
+  const handleChangePassword = async () => {
+    if (newPassword !== confirmPassword) { 
+      Alert.alert("Error", "Passwords do not match!"); 
+      return; 
+    }
+    if (strength === "Weak") { 
+      Alert.alert("Error", "Password is too weak."); 
+      return; 
+    }
+    
+    setIsLoading(true);
+    
+    try {
+      const result = await api.resetPassword(email, otp, newPassword);
+      
+      if (result.ok && result.data.success) {
+        Alert.alert("Success", "Password changed successfully!", [
+          { text: "Log In", onPress: () => router.replace('/login') }
+        ]);
+      } else {
+        Alert.alert("Error", result.data.error || "Failed to reset password");
+      }
+    } catch (error) {
+      console.error("Reset password error:", error);
+      Alert.alert("Error", "Unable to reset password. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleResendOTP = async () => {
+    setTimer(60); 
+    setCanResend(false);
+    await handleSendOTP();
   };
 
   useEffect(() => {
@@ -88,7 +158,17 @@ export default function ForgotPassword() {
               <Text style={styles.label}>EMAIL ADDRESS</Text>
               <TextInput style={styles.inputField} placeholder="name@example.com" placeholderTextColor="#9CA3AF" value={email} onChangeText={setEmail} keyboardType="email-address" autoCapitalize="none" />
             </View>
-            <TouchableOpacity style={styles.mainButton} onPress={handleSendOTP}><Text style={styles.mainButtonText}>Send OTP Code</Text></TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.mainButton, isLoading && styles.mainButtonDisabled]} 
+              onPress={handleSendOTP}
+              disabled={isLoading}
+            >
+              {isLoading ? (
+                <ActivityIndicator color="#FFFFFF" />
+              ) : (
+                <Text style={styles.mainButtonText}>Send OTP Code</Text>
+              )}
+            </TouchableOpacity>
           </>
         );
       case 2:
@@ -100,10 +180,20 @@ export default function ForgotPassword() {
               <Text style={styles.label}>OTP CODE</Text>
               <TextInput style={styles.inputField} placeholder="123456" placeholderTextColor="#9CA3AF" value={otp} onChangeText={setOtp} keyboardType="number-pad" maxLength={6} />
             </View>
-            <TouchableOpacity style={styles.mainButton} onPress={handleVerifyOTP}><Text style={styles.mainButtonText}>Verify OTP</Text></TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.mainButton, isLoading && styles.mainButtonDisabled]} 
+              onPress={handleVerifyOTP}
+              disabled={isLoading}
+            >
+              {isLoading ? (
+                <ActivityIndicator color="#FFFFFF" />
+              ) : (
+                <Text style={styles.mainButtonText}>Verify OTP</Text>
+              )}
+            </TouchableOpacity>
             <View style={styles.resendContainer}>
               {canResend ? (
-                <TouchableOpacity onPress={() => { setTimer(60); setCanResend(false); }}><Text style={styles.resendLink}>Resend Code</Text></TouchableOpacity>
+                <TouchableOpacity onPress={handleResendOTP}><Text style={styles.resendLink}>Resend Code</Text></TouchableOpacity>
               ) : (
                 <Text style={styles.timerText}>Resend in {timer}s</Text>
               )}
@@ -164,7 +254,17 @@ export default function ForgotPassword() {
                 <Text style={styles.reqItem}>• A special character</Text>
             </View>
 
-            <TouchableOpacity style={styles.mainButton} onPress={handleChangePassword}><Text style={styles.mainButtonText}>Change Password</Text></TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.mainButton, isLoading && styles.mainButtonDisabled]} 
+              onPress={handleChangePassword}
+              disabled={isLoading}
+            >
+              {isLoading ? (
+                <ActivityIndicator color="#FFFFFF" />
+              ) : (
+                <Text style={styles.mainButtonText}>Change Password</Text>
+              )}
+            </TouchableOpacity>
           </>
         );
     }
@@ -173,7 +273,18 @@ export default function ForgotPassword() {
   return (
     <SafeAreaView edges={['top', 'left', 'right']} style={styles.safeArea}>
       <StatusBar barStyle="light-content" backgroundColor={darkBlue} />
-      <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={styles.container}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={styles.container}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
+      >
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          bounces={false}
+        >
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
         <View style={styles.staticContainer}>
           <View style={styles.headerContainer}>
             <TouchableOpacity onPress={() => router.back()} style={styles.backButton}><Text style={styles.backButtonText}>← Back</Text></TouchableOpacity>
@@ -181,6 +292,8 @@ export default function ForgotPassword() {
           </View>
           <View style={styles.formSection}>{renderContent()}</View>
         </View>
+        </TouchableWithoutFeedback>
+        </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -189,6 +302,7 @@ export default function ForgotPassword() {
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: darkBlue },
   container: { flex: 1 },
+  scrollContent: { flexGrow: 1 },
   staticContainer: { flex: 1, justifyContent: "flex-start" },
   headerContainer: { height: height * 0.25, width: "100%", backgroundColor: darkBlue, alignItems: "center", justifyContent: "center", position: 'relative' },
   backButton: { position: 'absolute', top: 20, left: 20, zIndex: 10, padding: 10 },
@@ -206,6 +320,7 @@ const styles = StyleSheet.create({
   passwordInput: { flex: 1, paddingVertical: 12, fontSize: 16, color: darkBlue, fontWeight: "500" },
 
   mainButton: { backgroundColor: darkBlue, borderRadius: 10, paddingVertical: 15, alignItems: "center", marginTop: 10 },
+  mainButtonDisabled: { opacity: 0.7 },
   mainButtonText: { color: "#FFFFFF", fontSize: 18, fontWeight: "bold" },
   resendContainer: { marginTop: 20, alignItems: 'center' },
   timerText: { color: '#666', fontSize: 14 },

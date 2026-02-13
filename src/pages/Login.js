@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import {
   Dimensions,
   Image,
@@ -9,12 +9,17 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
+  Keyboard,
   View,
   Alert,
+  ActivityIndicator,
+  ScrollView,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router"; 
 import { Ionicons } from '@expo/vector-icons';
+import api from '../services/api';
 
 const { height } = Dimensions.get("window");
 const darkBlue = "#142237";
@@ -22,29 +27,63 @@ const lightGreyInput = "#E5E7EB";
 
 export default function Login() {
   const router = useRouter();
-  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const scrollViewRef = useRef(null);
 
-  const handleLogin = () => {
-    console.log("Login attempt:", { name, password });
+  // Keyboard listeners to scroll form up/down
+  useEffect(() => {
+    const keyboardDidShow = Keyboard.addListener('keyboardDidShow', () => {
+      // Scroll to show the form at the top
+      scrollViewRef.current?.scrollTo({ y: height * 0.25, animated: true });
+    });
     
-    if (!name || !password) {
-      Alert.alert("Error", "Please enter both username and password");
+    const keyboardDidHide = Keyboard.addListener('keyboardDidHide', () => {
+      // Scroll back to top when keyboard hides
+      scrollViewRef.current?.scrollTo({ y: 0, animated: true });
+    });
+
+    return () => {
+      keyboardDidShow.remove();
+      keyboardDidHide.remove();
+    };
+  }, []);
+
+  const handleLogin = async () => {
+    console.log("Login attempt:", { email, password });
+    
+    if (!email || !password) {
+      Alert.alert("Error", "Please enter both email and password");
       return;
     }
 
-    // Simple validation - accept any credentials for development
-    Alert.alert(
-      "Login Successful", 
-      `Welcome ${name}!`,
-      [
-        {
-          text: "Continue",
-          onPress: () => router.replace('/(tabs)')
-        }
-      ]
-    );
+    setIsLoading(true);
+
+    try {
+      const result = await api.login(email, password);
+      
+      if (result.ok && result.data.success) {
+        Alert.alert(
+          "Login Successful", 
+          `Welcome ${result.data.user.full_name}!`,
+          [
+            {
+              text: "Continue",
+              onPress: () => router.replace('/(tabs)')
+            }
+          ]
+        );
+      } else {
+        Alert.alert("Login Failed", result.data.error || "Invalid credentials");
+      }
+    } catch (error) {
+      console.error("Login error:", error);
+      Alert.alert("Error", "Unable to connect to server. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   // Direct navigation bypass for developers
@@ -67,9 +106,18 @@ export default function Login() {
       </TouchableOpacity>
 
       <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         style={styles.container}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
       >
+        <ScrollView
+          ref={scrollViewRef}
+          contentContainerStyle={styles.scrollContent}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          bounces={false}
+        >
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
         <View style={styles.staticContainer}>
           
           <View style={styles.headerContainer}>
@@ -84,16 +132,17 @@ export default function Login() {
             <Text style={styles.loginHeading}>Login</Text>
             <Text style={styles.loginSubHeading}>Sign in to continue.</Text>
 
-            {/* Name Input */}
+            {/* Email Input */}
             <View style={styles.inputContainer}>
-              <Text style={styles.label}>NAME</Text>
+              <Text style={styles.label}>EMAIL</Text>
               <TextInput
                 style={styles.inputField}
-                placeholder="USERNAME OR EMAIL"
+                placeholder="your@email.com"
                 placeholderTextColor="#9CA3AF"
-                value={name}
-                onChangeText={setName}
+                value={email}
+                onChangeText={setEmail}
                 autoCapitalize="none"
+                keyboardType="email-address"
               />
             </View>
 
@@ -119,8 +168,16 @@ export default function Login() {
               </View>
             </View>
 
-            <TouchableOpacity style={styles.loginButton} onPress={handleLogin}>
-              <Text style={styles.loginButtonText}>Log in</Text>
+            <TouchableOpacity 
+              style={[styles.loginButton, isLoading && styles.loginButtonDisabled]} 
+              onPress={handleLogin}
+              disabled={isLoading}
+            >
+              {isLoading ? (
+                <ActivityIndicator color="#FFFFFF" />
+              ) : (
+                <Text style={styles.loginButtonText}>Log in</Text>
+              )}
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -147,6 +204,8 @@ export default function Login() {
 
           </View>
         </View>
+        </TouchableWithoutFeedback>
+        </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -155,6 +214,7 @@ export default function Login() {
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: darkBlue },
   container: { flex: 1 },
+  scrollContent: { flexGrow: 1 },
   staticContainer: { flex: 1, justifyContent: "flex-start" },
   
   // Developer Bypass Button
@@ -243,6 +303,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginTop: 15,
     marginBottom: 20,
+  },
+  loginButtonDisabled: {
+    opacity: 0.7,
   },
   loginButtonText: { color: "#FFFFFF", fontSize: 18, fontWeight: "bold" },
   forgotButton: { alignItems: "center" },

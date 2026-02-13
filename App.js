@@ -54,16 +54,6 @@ export default function App() {
 
   // Modals
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [logToDelete, setLogToDelete] = useState(null);
-
-  // Data
-  const [logs, setLogs] = useState([
-    { id: 1, residentId: 'R-001', time: '12:45', location: 'ROOM 1' },
-    { id: 2, residentId: 'R-005', time: '1:05', location: 'ROOM 2' },
-    { id: 3, residentId: 'R-012', time: '1:20', location: 'ROOM 1' },
-    { id: 4, residentId: 'R-009', time: '1:35', location: 'ROOM 3' },
-  ]);
 
   const residents = [
     { id: 'R-001', name: 'Juan Dela Cruz', age: 78, room: '1', risk: 'High' },
@@ -80,29 +70,15 @@ export default function App() {
   const handleLogout = () => {
     console.log('🚪 Logging out...');
     setShowLogoutConfirm(false);
-    setLogs([]);
     router.replace('/login');
-  };
-
-  const handleDeleteLog = () => {
-    setLogs(logs.filter(log => log.id !== logToDelete));
-    setShowDeleteConfirm(false);
-  };
-
-  const requestDeleteLog = (id) => {
-    setLogToDelete(id);
-    setShowDeleteConfirm(true);
   };
 
   const renderScreen = () => {
     switch (currentScreen) {
       case 'Home':
         return <Home
-          logs={logs}
           setScreen={setCurrentScreen}
           setMonitoringRoom={setMonitoringRoom}
-          requestDeleteLog={requestDeleteLog}
-          setLogs={setLogs} // For clearing logs
         />;
       case 'Cameras':
         return <Cameras setScreen={setCurrentScreen} setMonitoringRoom={setMonitoringRoom} />;
@@ -121,14 +97,11 @@ export default function App() {
         return <LiveView
           monitoringRoom={monitoringRoom}
           setMonitoringRoom={setMonitoringRoom}
-          logs={logs}
-          requestDeleteLog={requestDeleteLog}
-          setLogs={setLogs}
         />;
       case 'Logs':
-        return <Logs logs={logs} requestDeleteLog={requestDeleteLog} setLogs={setLogs} />;
+        return <Logs />;
       default:
-        return <Home logs={logs} setScreen={setCurrentScreen} setMonitoringRoom={setMonitoringRoom} requestDeleteLog={requestDeleteLog} setLogs={setLogs} />;
+        return <Home setScreen={setCurrentScreen} setMonitoringRoom={setMonitoringRoom} />;
     }
   };
 
@@ -167,12 +140,6 @@ export default function App() {
           title="Logout of CAIretaker?"
           onCancel={() => setShowLogoutConfirm(false)}
           onConfirm={handleLogout}
-        />
-        <ConfirmModal
-          isOpen={showDeleteConfirm}
-          title="Delete this log entry?"
-          onCancel={() => setShowDeleteConfirm(false)}
-          onConfirm={handleDeleteLog}
         />
       </SafeAreaView>
     </SafeAreaProvider>
