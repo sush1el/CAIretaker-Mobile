@@ -71,6 +71,7 @@ You need two model files:
 CAIretaker-Mobile/
 ├── cnn_model_fall.pth          <-- Fall detection model
 ├── backend/
+│   ├── .env                    <-- Environment variables (see below)
 │   ├── models/
 │   │   └── yolo11n-pose.pt     <-- YOLO pose model
 │   ├── app.py
@@ -79,7 +80,34 @@ CAIretaker-Mobile/
 └── ...
 ```
 
-### 5. Configure Network IP Address
+### 5. Configure Environment Variables
+
+Create a `.env` file in the `backend/` folder with the following content:
+
+```dotenv
+# Flask Configuration
+SECRET_KEY=cairetaker-dev-secret-key-2026
+JWT_SECRET_KEY=cairetaker-jwt-secret-key-2026
+
+# Gmail SMTP Configuration (for OTP emails)
+# Leave empty for development - OTP will be logged to console
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+SMTP_EMAIL=your-email@gmail.com
+SMTP_PASSWORD=your-app-password
+
+# Server Configuration
+HOST=0.0.0.0
+PORT=5001
+DEBUG=True
+```
+
+**Note:** For Gmail, you need to:
+1. Enable 2-Factor Authentication on your Google account
+2. Generate an "App Password" at https://myaccount.google.com/apppasswords
+3. Use the generated password for `SMTP_PASSWORD`
+
+### 6. Configure Network IP Address
 
 Find your computer's local IP address:
 - **Windows:** Run `ipconfig` in Command Prompt, look for "IPv4 Address"
@@ -92,7 +120,7 @@ const BACKEND_URL = 'http://YOUR_IP_HERE:5001';
 const CAMERA_URL = 'http://YOUR_IP_HERE:5002';
 ```
 
-### 6. (Optional) Configure Fall Detection Settings
+### 7. (Optional) Configure Fall Detection Settings
 
 Edit `backend/fall_detector_server.py` Config class if needed:
 ```python
@@ -204,5 +232,5 @@ npx expo start
 | File | What to Change |
 |------|----------------|
 | `src/services/api.js` | IP addresses (lines 11-12) |
+| `backend/.env` | Secret keys, SMTP credentials for email OTP |
 | `backend/fall_detector_server.py` | LOCATION_NAME, model paths |
-| `backend/app.py` | Email credentials for OTP (if using forgot password) |
