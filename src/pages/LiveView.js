@@ -156,7 +156,13 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
   const currentDetections = getCurrentDetections();
 
   // Build activity data: real-time detections (live status) + fall logs (persistent)
+  // Only show data for Room 1 since that's the only active camera
   const buildActivityData = () => {
+    // Room 2 and 3 don't have cameras yet, return empty
+    if (monitoringRoom !== 1) {
+      return [];
+    }
+    
     const now = new Date();
     const liveData = currentDetections.map(detection => ({
       id: detection.trackId,
