@@ -8,8 +8,8 @@
 // Run `ipconfig` (Windows) or `ifconfig` (Mac/Linux) to find your local IP
 
 // Current configuration for physical device testing via Expo Go
-const BACKEND_URL = 'http://192.168.100.7:5001';
-const CAMERA_URL = 'http://192.168.100.7:5002';  // Camera server
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
+const CAMERA_URL = process.env.EXPO_PUBLIC_CAMERA_URL;
 
 // For Android Emulator, use: 'http://10.0.2.2:5001'
 // For iOS Simulator, use: 'http://localhost:5001'
@@ -21,20 +21,20 @@ export const API_CONFIG = {
   ENDPOINTS: {
     // Health
     HEALTH: '/api/health',
-    
+
     // Auth
     REGISTER: '/api/auth/register',
     LOGIN: '/api/auth/login',
     FORGOT_PASSWORD: '/api/auth/forgot-password',
     VERIFY_OTP: '/api/auth/verify-otp',
     RESET_PASSWORD: '/api/auth/reset-password',
-    
+
     // User
     PROFILE: '/api/user/profile',
-    
+
     // Residents
     RESIDENTS: '/api/residents',
-    
+
     // Camera
     CAMERA_STATUS: '/api/camera/status',
     CAMERA_START: '/api/camera/start',
@@ -67,7 +67,7 @@ class APIService {
 
   async request(endpoint, options = {}) {
     const url = `${this.baseUrl}${endpoint}`;
-    
+
     const headers = {
       'Content-Type': 'application/json',
       ...options.headers,
@@ -90,7 +90,7 @@ class APIService {
       clearTimeout(timeoutId);
 
       const data = await response.json();
-      
+
       return {
         ok: response.ok,
         status: response.status,
@@ -104,7 +104,7 @@ class APIService {
           data: { success: false, error: 'Request timeout' },
         };
       }
-      
+
       return {
         ok: false,
         status: 0,
@@ -213,7 +213,7 @@ class APIService {
 
   async cameraRequest(endpoint, options = {}) {
     const url = `${API_CONFIG.CAMERA_URL}${endpoint}`;
-    
+
     const headers = {
       'Content-Type': 'application/json',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -236,7 +236,7 @@ class APIService {
       clearTimeout(timeoutId);
 
       const data = await response.json();
-      
+
       return {
         ok: response.ok,
         status: response.status,

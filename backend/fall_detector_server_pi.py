@@ -31,6 +31,7 @@ import time
 from collections import deque, defaultdict
 import warnings
 import os
+from picamera2 import Picamera2
 
 warnings.filterwarnings('ignore')
 
@@ -1048,48 +1049,51 @@ def initialize_detector():
 
 
 def initialize_camera(camera_index=0):
-    """Initialize camera with specified index"""
+    """Initialize Pi Camera V3 Wide via picamera2"""
     global camera, camera_initialized, current_camera_index
     
     with camera_lock:
         if camera is not None:
-            camera.release()
+            try:
+                camera.stop()
+                camera.close()
+            except:
+                pass
         
         try:
-            # Try DirectShow backend first (more reliable on Windows)
-            camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            print(f"Initializing Pi Camera V3 Wide...")
+            camera = Picamera2()
             
-            if not camera.isOpened():
-                print(f"⚠ DirectShow failed, trying default backend...")
-                camera = cv2.VideoCapture(camera_index)
+            config = camera.create_video_configuration(
+                main={"size": (1280, 720), "format": "RGB888"},
+                controls={"FrameRate": 30}
+            )
+            camera.configure(config)
+            camera.start()
             
-            if not camera.isOpened():
-                print(f"✗ Failed to open camera {camera_index}")
-                camera = None
-                camera_initialized = False
-                return False
+            # Give the camera time to warm up
+            import time as _time
+            _time.sleep(2)
             
-            # Set camera properties
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            camera.set(cv2.CAP_PROP_FPS, 30)
-            
-            # Test read
-            success, test_frame = camera.read()
-            if not success or test_frame is None:
-                print(f"✗ Camera {camera_index} opened but cannot read frames")
-                camera.release()
+            # Test capture
+            test_frame = camera.capture_array()
+            if test_frame is None:
+                print("Failed to capture from Pi Camera")
+                camera.stop()
+                camera.close()
                 camera = None
                 camera_initialized = False
                 return False
             
             current_camera_index = camera_index
             camera_initialized = True
-            print(f"✓ Camera {camera_index} initialized successfully")
+            print(f"Pi Camera V3 Wide initialized ({test_frame.shape[1]}x{test_frame.shape[0]})")
             return True
             
         except Exception as e:
-            print(f"✗ Error initializing camera {camera_index}: {e}")
+            print(f"Error initializing camera: {e}")
+            import traceback
+            traceback.print_exc()
             camera = None
             camera_initialized = False
             return False
@@ -1127,20 +1131,25 @@ def generate_frames():
     while True:
         try:
             with camera_lock:
-                if camera is None or not camera.isOpened():
-                    print("⚠ Camera lost, attempting to reconnect...")
+                if camera is None:
+                    print("Camera lost, attempting to reconnect...")
                     if not initialize_camera(current_camera_index):
                         time.sleep(1)
                         continue
                 
-                success, frame = camera.read()
+                try:
+                    frame = camera.capture_array()
+                    success = frame is not None
+                except Exception:
+                    success = False
+                    frame = None
             
             if not success or frame is None:
                 consecutive_failures += 1
-                print(f"⚠ Frame read failed (attempt {consecutive_failures})")
+                print(f"Frame read failed (attempt {consecutive_failures})")
                 
                 if consecutive_failures > 10:
-                    print("✗ Too many consecutive failures, reinitializing camera...")
+                    print("Too many consecutive failures, reinitializing camera...")
                     camera_initialized = False
                     if not initialize_camera(current_camera_index):
                         time.sleep(1)
@@ -1251,13 +1260,7 @@ def switch_camera():
 @app.route('/available_cameras', methods=['GET'])
 def get_available_cameras():
     """Get list of available camera indices"""
-    available = []
-    
-    for i in range(10):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            available.append(i)
-            cap.release()
+    available = [0]  # Pi Camera is always index 0
     
     return jsonify({
         'success': True,
@@ -1282,7 +1285,7 @@ def get_status():
 def health():
     """Health check endpoint"""
     with camera_lock:
-        cam_available = camera is not None and camera.isOpened()
+        cam_available = camera is not None
     
     return jsonify({
         'status': 'healthy',

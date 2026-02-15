@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faCamera, faTriangleExclamation, faExclamationCircle, faChevronDown } from '@fortawesome/free-solid-svg-icons';
+import { faCamera, faTriangleExclamation, faExclamationCircle, faChevronDown, faArrowLeft, faRefresh, faVideoCamera } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
 import api from '../services/api';
 
@@ -17,6 +17,12 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const [lastUpdate, setLastUpdate] = useState(Date.now()); // Force re-render on updates
   const isPolling = useRef(false);
 
+  // Inline camera feed state
+  const [selectedRoom, setSelectedRoom] = useState(null);
+  const [cameraStatus, setCameraStatus] = useState(null);
+  const [streamKey, setStreamKey] = useState(0);
+  const [isStreamLoading, setIsStreamLoading] = useState(false);
+
   // Fetch residents and fall events on mount
   useEffect(() => {
     fetchData();
@@ -25,16 +31,16 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   // Poll for active falls every 500ms for real-time updates
   useEffect(() => {
     let mounted = true;
-    
+
     const checkFalls = async () => {
       // Prevent overlapping requests
       if (isPolling.current) return;
       isPolling.current = true;
-      
+
       try {
         let hasLiveFall = false;
         let liveFallCount = 0;
-        
+
         // Check camera status for real-time detections - PRIMARY source for status
         const statusResult = await api.getCameraStatus();
         if (mounted && statusResult.ok) {
@@ -42,21 +48,21 @@ export default function Home({ setScreen, setMonitoringRoom }) {
           // Check both is_fall and is_fallen for compatibility
           hasLiveFall = detections.some(d => d.is_fall || d.is_fallen);
           liveFallCount = detections.filter(d => d.is_fall || d.is_fallen).length;
-          
+
           // Also check has_active_fall from status if available
           if (statusResult.data.has_active_fall) {
             hasLiveFall = true;
             liveFallCount = Math.max(liveFallCount, 1);
           }
         }
-        
+
         // The status indicator should ONLY reflect current camera detections
         if (mounted) {
           setHasActiveFall(hasLiveFall);
           setActiveFallCount(liveFallCount);
           setLastUpdate(Date.now()); // Force re-render
         }
-        
+
         // Refresh fall events for logs - this includes historical data from database
         const eventsResult = await api.getFallEvents();
         if (mounted && eventsResult.ok) {
@@ -72,12 +78,48 @@ export default function Home({ setScreen, setMonitoringRoom }) {
 
     checkFalls();
     const interval = setInterval(checkFalls, 500); // Poll every 500ms for real-time updates
-    
+
     return () => {
       mounted = false;
       clearInterval(interval);
     };
   }, []);
+
+  // Poll camera status when a room is selected for inline feed
+  useEffect(() => {
+    if (selectedRoom === null) {
+      setCameraStatus(null);
+      return;
+    }
+    let mounted = true;
+    setIsStreamLoading(true);
+    const checkCamera = async () => {
+      try {
+        const result = await api.getCameraStatus();
+        if (mounted) {
+          setCameraStatus(result.ok ? result.data : null);
+          setIsStreamLoading(false);
+        }
+      } catch (e) {
+        if (mounted) { setCameraStatus(null); setIsStreamLoading(false); }
+      }
+    };
+    checkCamera();
+    const interval = setInterval(checkCamera, 2000);
+    return () => { mounted = false; clearInterval(interval); };
+  }, [selectedRoom]);
+
+  const refreshStream = () => {
+    setStreamKey(prev => prev + 1);
+  };
+
+  const startCamera = async () => {
+    setIsStreamLoading(true);
+    await api.startCamera();
+    const result = await api.getCameraStatus();
+    if (result.ok) setCameraStatus(result.data);
+    setIsStreamLoading(false);
+  };
 
   const fetchData = async () => {
     setIsLoading(true);
@@ -87,7 +129,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       if (residentsResult.ok && residentsResult.data.residents) {
         setResidents(residentsResult.data.residents);
       }
-      
+
       // Fetch fall events
       const eventsResult = await api.getFallEvents();
       if (eventsResult.ok) {
@@ -115,20 +157,20 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       // Filter to only include fall events (not at-risk/abnormal gait until gait analysis is implemented)
       const isFall = event.class?.toLowerCase().includes('fall') || event.class?.toLowerCase().includes('fallen') || event.type === 'fall' || event.status === 'active';
       if (!isFall) return false;
-      
+
       // Apply room filter
       if (roomFilter !== null) {
         const roomNum = event.location ? event.location.replace(/\D/g, '') || '1' : '1';
         if (parseInt(roomNum) !== roomFilter) return false;
       }
-      
+
       return true;
     })
     .map((event, index) => {
       // Extract room number from location (e.g., "Room 1" -> "1")
       const roomNum = event.location ? event.location.replace(/\D/g, '') || '1' : '1';
       const eventDate = event.timestamp ? new Date(event.timestamp * 1000) : new Date();
-      
+
       return {
         incidentId: event.id || index,
         roomNo: `Room ${roomNum}`,
@@ -140,10 +182,10 @@ export default function Home({ setScreen, setMonitoringRoom }) {
           day: 'numeric',
           year: 'numeric'
         }),
-        time: eventDate.toLocaleTimeString('en-US', { 
-          hour: 'numeric', 
+        time: eventDate.toLocaleTimeString('en-US', {
+          hour: 'numeric',
           minute: '2-digit',
-          hour12: true 
+          hour12: true
         }),
       };
     })
@@ -151,7 +193,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       // Sort based on sortType
       const dateA = a.eventDate || new Date(0);
       const dateB = b.eventDate || new Date(0);
-      
+
       switch (sortType) {
         case 'latestDate':
           // Sort by date descending (newest first), then by time descending
@@ -193,26 +235,99 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     }
   };
 
+  // Render inline camera feed when a room is selected
+  const renderInlineCameraFeed = () => {
+    if (selectedRoom !== 1) {
+      return (
+        <View style={styles.videoPlaceholder}>
+          <FontAwesomeIcon icon={faVideoCamera} color="#555" size={40} />
+          <Text style={styles.placeholderStatusText}>Room {selectedRoom}</Text>
+          <Text style={styles.comingSoonText}>Coming Soon</Text>
+          <Text style={styles.expansionText}>Camera expansion planned</Text>
+        </View>
+      );
+    }
+    if (isStreamLoading) {
+      return (
+        <View style={styles.videoPlaceholder}>
+          <ActivityIndicator size="large" color="#FFF" />
+          <Text style={styles.placeholderStatusText}>Connecting to camera...</Text>
+        </View>
+      );
+    }
+    if (!cameraStatus || !cameraStatus.camera_running) {
+      return (
+        <View style={styles.videoPlaceholder}>
+          <FontAwesomeIcon icon={faVideoCamera} color="#666" size={40} />
+          <Text style={styles.placeholderStatusText}>Camera Offline</Text>
+          <TouchableOpacity style={styles.startButton} onPress={startCamera}>
+            <Text style={styles.startButtonText}>Start Camera</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+    return (
+      <View style={styles.videoContainer}>
+        <WebView
+          key={streamKey}
+          source={{ uri: api.getCameraStreamUrl() }}
+          style={styles.videoStream}
+          javaScriptEnabled={false}
+          scrollEnabled={false}
+          bounces={false}
+          onError={(e) => console.log('WebView error:', e.nativeEvent)}
+        />
+      </View>
+    );
+  };
+
   return (
     <View>
       <View style={styles.pillHeader}>
-        <Text style={styles.pillHeaderText}>SELECT CAMERA</Text>
-        <FontAwesomeIcon icon={faCamera} color="#1E3A5F" size={16}/>
+        <Text style={styles.pillHeaderText}>{selectedRoom ? 'LIVE MONITORING' : 'SELECT CAMERA'}</Text>
+        <FontAwesomeIcon icon={faCamera} color="#1E3A5F" size={16} />
       </View>
-      <View style={styles.roomGrid}>
-        {[1, 2, 3].map(r => (
-          <TouchableOpacity key={r} style={styles.roomBtn} onPress={() => { setMonitoringRoom(r); setScreen('LiveView'); }}>
-            <Text style={styles.roomBtnLabel}>ROOM</Text>
-            <Text style={styles.roomBtnNum}>{r}</Text>
-          </TouchableOpacity>
-        ))}
-      </View>
-      
+
+      {selectedRoom === null ? (
+        /* Room selection grid */
+        <View style={styles.roomGrid}>
+          {[1, 2, 3].map(r => (
+            <TouchableOpacity key={r} style={styles.roomBtn} onPress={() => { setSelectedRoom(r); setMonitoringRoom(r); }}>
+              <Text style={styles.roomBtnLabel}>ROOM</Text>
+              <Text style={styles.roomBtnNum}>{r}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      ) : (
+        /* Inline camera feed */
+        <View style={{ marginBottom: 20 }}>
+          <View style={styles.liveMetaRow}>
+            <TouchableOpacity style={styles.backBadge} onPress={() => setSelectedRoom(null)}>
+              <FontAwesomeIcon icon={faArrowLeft} color="#FFF" size={12} />
+            </TouchableOpacity>
+            <View style={styles.liveBadge}>
+              <View style={[styles.innerDot, { backgroundColor: cameraStatus?.camera_running ? '#4CAF50' : '#F44336' }]} />
+              <Text style={styles.liveBadgeText}>{cameraStatus?.camera_running ? 'LIVE' : 'OFFLINE'}</Text>
+            </View>
+            <View style={styles.metaBadge}>
+              <Text style={styles.metaText}>ROOM {selectedRoom}</Text>
+            </View>
+            <TouchableOpacity style={styles.refreshBadge} onPress={refreshStream}>
+              <FontAwesomeIcon icon={faRefresh} color="#1E3A5F" size={12} />
+            </TouchableOpacity>
+            <View style={styles.metaBadge}>
+              <Text style={styles.metaText}>FPS: 15</Text>
+            </View>
+          </View>
+          {renderInlineCameraFeed()}
+        </View>
+      )}
+
       <View style={styles.pillHeader}>
         <Text style={styles.pillHeaderText}>LIVE FALL ALERTS</Text>
-        <FontAwesomeIcon icon={faTriangleExclamation} color="#1E3A5F" size={16}/>
+        <FontAwesomeIcon icon={faTriangleExclamation} color="#1E3A5F" size={16} />
       </View>
-      
+
       {/* Fall Alert Status Card */}
       <View style={[styles.statusCard, hasActiveFall && styles.statusCardAlert]}>
         <View style={[styles.statusDot, hasActiveFall && styles.redDot]} />
@@ -220,7 +335,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
           {hasActiveFall ? `Active Fall${activeFallCount > 1 ? 's' : ''} Detected!` : 'No Active Falls'}
         </Text>
         {hasActiveFall && (
-          <FontAwesomeIcon icon={faExclamationCircle} color="#D32F2F" size={20} style={{marginLeft: 10}} />
+          <FontAwesomeIcon icon={faExclamationCircle} color="#D32F2F" size={20} style={{ marginLeft: 10 }} />
         )}
       </View>
 
@@ -228,14 +343,14 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       <View style={styles.pillHeader}>
         <Text style={styles.pillHeaderText}>RECENT LOGS</Text>
       </View>
-      
+
       {/* Filter Bar: Pagination on left, Sort dropdown on right */}
       <View style={styles.filterBar}>
         {/* Room Pagination */}
         <View style={styles.pagination}>
           {[1, 2, 3].map((room) => (
-            <TouchableOpacity 
-              key={room} 
+            <TouchableOpacity
+              key={room}
               style={[
                 styles.paginationItem,
                 room === 1 && styles.paginationFirst,
@@ -254,14 +369,14 @@ export default function Home({ setScreen, setMonitoringRoom }) {
 
         {/* Sort Dropdown */}
         <View style={styles.sortDropdownContainer}>
-          <TouchableOpacity 
+          <TouchableOpacity
             style={styles.sortDropdown}
             onPress={() => setShowSortDropdown(!showSortDropdown)}
           >
             <Text style={styles.sortDropdownText}>{currentSortLabel}</Text>
             <FontAwesomeIcon icon={faChevronDown} size={12} color="#1E3A5F" />
           </TouchableOpacity>
-          
+
           {showSortDropdown && (
             <View style={styles.sortDropdownMenu}>
               {sortOptions.map((option) => (
@@ -310,7 +425,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
               <Text style={styles.logHeaderText}>Time</Text>
             </View>
           </View>
-          
+
           {/* Log Rows */}
           {recentLogs.slice(0, 10).map((log, index) => (
             <View key={`log-${index}-${log.incidentId || 'no-id'}-${log.date}-${log.time}`} style={styles.logRow}>
@@ -337,7 +452,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
           <Text style={styles.emptyStateSubtext}>Fall events and Abnormal Gait will appear here</Text>
         </View>
       )}
-      
+
       {/* Hidden WebView to keep camera stream active for real-time detection */}
       <View style={styles.hiddenStream}>
         <WebView
@@ -364,6 +479,23 @@ const styles = StyleSheet.create({
   redDot: { backgroundColor: '#D32F2F' },
   statusCardText: { fontSize: 18, fontWeight: '700', color: '#7CB342' },
   statusCardTextAlert: { color: '#D32F2F' },
+  // Inline camera feed styles
+  liveMetaRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10, alignItems: 'center' },
+  backBadge: { backgroundColor: '#1E3A5F', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20 },
+  liveBadge: { backgroundColor: '#1E3A5F', paddingHorizontal: 15, paddingVertical: 5, borderRadius: 20, flexDirection: 'row', alignItems: 'center' },
+  innerDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
+  liveBadgeText: { color: '#FFF', fontWeight: 'bold', fontSize: 10 },
+  metaBadge: { backgroundColor: '#FFF', paddingHorizontal: 15, paddingVertical: 5, borderRadius: 20 },
+  refreshBadge: { backgroundColor: '#FFF', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20 },
+  metaText: { color: '#1E3A5F', fontWeight: 'bold', fontSize: 10 },
+  videoPlaceholder: { width: '100%', height: 220, backgroundColor: '#1a1a1a', borderRadius: 20, justifyContent: 'center', alignItems: 'center' },
+  videoContainer: { width: '100%', height: 220, borderRadius: 20, overflow: 'hidden', backgroundColor: '#000' },
+  videoStream: { flex: 1, backgroundColor: '#000' },
+  placeholderStatusText: { color: '#999', marginTop: 10, fontSize: 14 },
+  comingSoonText: { color: '#FFF', fontSize: 18, fontWeight: 'bold', marginTop: 8 },
+  expansionText: { color: '#666', fontSize: 12, marginTop: 4 },
+  startButton: { marginTop: 15, backgroundColor: '#1E3A5F', paddingHorizontal: 20, paddingVertical: 10, borderRadius: 20 },
+  startButtonText: { color: '#FFF', fontWeight: 'bold' },
   // Filter Bar
   filterBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 15 },
   // Pagination Style
