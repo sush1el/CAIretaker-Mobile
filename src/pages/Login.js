@@ -15,13 +15,15 @@ import {
   Alert,
   ActivityIndicator,
   ScrollView,
+  Animated,
+  Easing,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router"; 
 import { Ionicons } from '@expo/vector-icons';
 import api from '../services/api';
 
-const { height } = Dimensions.get("window");
+const { height, width } = Dimensions.get("window");
 const darkBlue = "#142237";
 const lightGreyInput = "#E5E7EB";
 
@@ -31,7 +33,95 @@ export default function Login() {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [splashComplete, setSplashComplete] = useState(false);
   const scrollViewRef = useRef(null);
+
+  // Animation values for splash screen
+  const splashOpacity = useRef(new Animated.Value(1)).current;
+  const logoScale = useRef(new Animated.Value(0.8)).current;
+  const logoOpacity = useRef(new Animated.Value(0)).current;
+  const loaderOpacity = useRef(new Animated.Value(0)).current;
+  const formTranslateY = useRef(new Animated.Value(height)).current;
+  const formOpacity = useRef(new Animated.Value(0)).current;
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  // Splash screen animation sequence
+  useEffect(() => {
+    // Start splash animation sequence
+    const startSplashAnimation = () => {
+      // Phase 1: Fade in and scale up logo
+      Animated.parallel([
+        Animated.timing(logoOpacity, {
+          toValue: 1,
+          duration: 600,
+          easing: Easing.out(Easing.cubic),
+          useNativeDriver: true,
+        }),
+        Animated.spring(logoScale, {
+          toValue: 1,
+          friction: 8,
+          tension: 40,
+          useNativeDriver: true,
+        }),
+      ]).start(() => {
+        // Phase 2: Show loader with pulse animation
+        Animated.timing(loaderOpacity, {
+          toValue: 1,
+          duration: 300,
+          useNativeDriver: true,
+        }).start();
+
+        // Start pulse animation for loader
+        const pulseAnimation = Animated.loop(
+          Animated.sequence([
+            Animated.timing(pulseAnim, {
+              toValue: 1.1,
+              duration: 800,
+              easing: Easing.inOut(Easing.ease),
+              useNativeDriver: true,
+            }),
+            Animated.timing(pulseAnim, {
+              toValue: 1,
+              duration: 800,
+              easing: Easing.inOut(Easing.ease),
+              useNativeDriver: true,
+            }),
+          ])
+        );
+        pulseAnimation.start();
+
+        // Phase 3: After loading delay, transition to login form
+        setTimeout(() => {
+          pulseAnimation.stop();
+          
+          // Fade out splash and slide in form
+          Animated.parallel([
+            Animated.timing(splashOpacity, {
+              toValue: 0,
+              duration: 400,
+              useNativeDriver: true,
+            }),
+            Animated.timing(formOpacity, {
+              toValue: 1,
+              duration: 500,
+              delay: 200,
+              useNativeDriver: true,
+            }),
+            Animated.spring(formTranslateY, {
+              toValue: 0,
+              friction: 8,
+              tension: 40,
+              useNativeDriver: true,
+            }),
+          ]).start(() => {
+            setSplashComplete(true);
+          });
+        }, 2000); // 2 second loading time
+      });
+    };
+
+    startSplashAnimation();
+  }, []);
 
   // Keyboard listeners to scroll form up/down
   useEffect(() => {
@@ -96,39 +186,72 @@ export default function Login() {
     <SafeAreaView edges={['top', 'left', 'right']} style={styles.safeArea}>
       <StatusBar barStyle="light-content" backgroundColor={darkBlue} />
 
-      {/* DEVELOPER BYPASS BUTTON - Top Right */}
-      <TouchableOpacity 
-        style={styles.devBypassButton}
-        onPress={handleDevBypass}
-        activeOpacity={0.7}
-      >
-        <Ionicons name="arrow-forward-circle" size={50} color="#FFD700" />
-      </TouchableOpacity>
+      {/* Splash Screen Overlay */}
+      {!splashComplete && (
+        <Animated.View style={[styles.splashContainer, { opacity: splashOpacity }]}>
+          <Animated.Image
+            source={require("../../assets/login_header_v2.png")}
+            style={[
+              styles.splashLogo,
+              {
+                opacity: logoOpacity,
+                transform: [{ scale: logoScale }],
+              },
+            ]}
+            resizeMode="contain"
+          />
+          <Animated.View style={[styles.loaderContainer, { opacity: loaderOpacity }]}>
+            <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
+              <ActivityIndicator size="large" color="#FFFFFF" />
+            </Animated.View>
+            <Text style={styles.loadingText}>Loading...</Text>
+          </Animated.View>
+        </Animated.View>
+      )}
 
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        style={styles.container}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
+      {/* Main Login Content - Animated */}
+      <Animated.View 
+        style={[
+          styles.mainContent,
+          {
+            opacity: formOpacity,
+            transform: [{ translateY: formTranslateY }],
+          },
+        ]}
       >
-        <ScrollView
-          ref={scrollViewRef}
-          contentContainerStyle={styles.scrollContent}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
-          bounces={false}
+        {/* DEVELOPER BYPASS BUTTON - Top Right */}
+        <TouchableOpacity 
+          style={styles.devBypassButton}
+          onPress={handleDevBypass}
+          activeOpacity={0.7}
         >
-        <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
-        <View style={styles.staticContainer}>
-          
-          <View style={styles.headerContainer}>
-            <Image
-              source={require("../../assets/login_header_v2.png")}
-              style={styles.headerImage}
-              resizeMode="contain"
-            />
-          </View>
+          <Ionicons name="arrow-forward-circle" size={50} color="#FFD700" />
+        </TouchableOpacity>
 
-          <View style={styles.formSection}>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          style={styles.container}
+          keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
+        >
+          <ScrollView
+            ref={scrollViewRef}
+            contentContainerStyle={styles.scrollContent}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+            bounces={false}
+          >
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+          <View style={styles.staticContainer}>
+            
+            <View style={styles.headerContainer}>
+              <Image
+                source={require("../../assets/login_header_v2.png")}
+                style={styles.headerImage}
+                resizeMode="contain"
+              />
+            </View>
+
+            <View style={styles.formSection}>
             <Text style={styles.loginHeading}>Login</Text>
             <Text style={styles.loginSubHeading}>Sign in to continue.</Text>
 
@@ -207,6 +330,7 @@ export default function Login() {
         </TouchableWithoutFeedback>
         </ScrollView>
       </KeyboardAvoidingView>
+      </Animated.View>
     </SafeAreaView>
   );
 }
@@ -216,6 +340,37 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   scrollContent: { flexGrow: 1 },
   staticContainer: { flex: 1, justifyContent: "flex-start" },
+  
+  // Splash Screen Styles
+  splashContainer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: darkBlue,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 1000,
+  },
+  splashLogo: {
+    width: width * 2.4,
+    height: height * 0.55,
+  },
+  loaderContainer: {
+    alignItems: 'center',
+    marginTop: 30,
+  },
+  loadingText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '500',
+    marginTop: 15,
+    letterSpacing: 1,
+  },
+  mainContent: {
+    flex: 1,
+  },
   
   // Developer Bypass Button
   devBypassButton: {
