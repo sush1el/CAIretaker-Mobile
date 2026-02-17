@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { View, Text, Switch, TouchableOpacity, StyleSheet, Alert, ActivityIndicator } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faGear, faBrain, faMicrochip, faRotateRight, faPowerOff } from '@fortawesome/free-solid-svg-icons';
@@ -9,7 +9,32 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
   const [isRebooting, setIsRebooting] = useState(false);
   const [isShuttingDown, setIsShuttingDown] = useState(false);
   const { theme } = useTheme();
-  
+  const [piStatus, setPiStatus] = useState('Checking...');
+
+  // Poll Pi health status every 3 seconds
+  useEffect(() => {
+    let mounted = true;
+    const checkHealth = async () => {
+      try {
+        const result = await api.healthCheck();
+        if (mounted) {
+          if (result.ok) {
+            setPiStatus('Active');
+            setIsRebooting(false);
+            setIsShuttingDown(false);
+          } else {
+            setPiStatus(isRebooting ? 'Rebooting...' : isShuttingDown ? 'Shut Down' : 'Offline');
+          }
+        }
+      } catch (e) {
+        if (mounted) setPiStatus(isRebooting ? 'Rebooting...' : isShuttingDown ? 'Shut Down' : 'Offline');
+      }
+    };
+    checkHealth();
+    const interval = setInterval(checkHealth, 3000);
+    return () => { mounted = false; clearInterval(interval); };
+  }, [isRebooting, isShuttingDown]);
+
   const dynamicStyles = {
     pillHeader: { backgroundColor: theme.card, padding: 12, borderRadius: 30, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
     pillHeaderText: { fontWeight: '800', color: theme.text, marginRight: 10, fontSize: 15 },
@@ -32,6 +57,7 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
             try {
               const result = await api.rebootSystem();
               if (result.ok) {
+                setPiStatus('Rebooting...');
                 Alert.alert('Rebooting', 'The system is rebooting. It will be available again in about 1-2 minutes.');
               } else {
                 Alert.alert('Error', result.data?.error || 'Failed to reboot the system.');
@@ -61,6 +87,7 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
             try {
               const result = await api.shutdownSystem();
               if (result.ok) {
+                setPiStatus('Shut Down');
                 Alert.alert('Shutting Down', 'The system is shutting down. You will need to physically power it back on.');
               } else {
                 Alert.alert('Error', result.data?.error || 'Failed to shut down the system.');
@@ -80,26 +107,8 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
     <View>
       <View style={dynamicStyles.pillHeader}>
         <Text style={dynamicStyles.pillHeaderText}>SETTINGS</Text>
-        <FontAwesomeIcon icon={faGear} color={theme.text} size={18}/>
+        <FontAwesomeIcon icon={faGear} color={theme.text} size={18} />
       </View>
-
-      <View style={styles.settingsGroup}>
-        <View style={styles.settingsGroupHeader}>
-          <FontAwesomeIcon icon={faBrain} color="#1E3A5F" size={14} />
-          <Text style={styles.settingsGroupTitle}>AI Engine</Text>
-        </View>
-        <View style={styles.settingsCard}>
-          <View style={styles.settingsRow}>
-            <Text style={styles.settingsLabel}>High Sensitivity</Text>
-            <Switch value={highSensitivity} onValueChange={setHighSensitivity} trackColor={{ true: '#A8D5E2' }} thumbColor="#1E3A5F" />
-          </View>
-          <View style={[styles.settingsRow, { borderBottomWidth: 0 }]}>
-            <Text style={styles.settingsLabel}>Privacy Masking</Text>
-            <Switch value={privacyMask} onValueChange={setPrivacyMask} trackColor={{ true: '#A8D5E2' }} thumbColor="#1E3A5F" />
-          </View>
-        </View>
-      </View>
-
       <View style={styles.settingsGroup}>
         <View style={styles.settingsGroupHeader}>
           <FontAwesomeIcon icon={faMicrochip} color="#1E3A5F" size={14} />
@@ -108,7 +117,10 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
         <View style={styles.settingsCard}>
           <View style={styles.settingsRow}>
             <Text style={styles.settingsLabel}>System Health</Text>
-            <Text style={{ color: '#7CB342', fontWeight: 'bold' }}>Optimal</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: piStatus === 'Active' ? '#7CB342' : piStatus === 'Rebooting...' ? '#FF9800' : '#D32F2F', marginRight: 8 }} />
+              <Text style={{ color: piStatus === 'Active' ? '#7CB342' : piStatus === 'Rebooting...' ? '#FF9800' : '#D32F2F', fontWeight: 'bold' }}>{piStatus}</Text>
+            </View>
           </View>
           <TouchableOpacity
             style={styles.settingsRow}
