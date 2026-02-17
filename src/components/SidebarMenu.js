@@ -2,26 +2,43 @@ import React from 'react';
 import { View, Text, TouchableOpacity, Modal, ScrollView, Image, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faHouse, faChartBar, faCamera, faUserGear, faPersonWalking, faCircleQuestion, faGear, faRightFromBracket } from '@fortawesome/free-solid-svg-icons';
+import { faHouse, faChartBar, faCamera, faCircleQuestion, faGear, faRightFromBracket, faUsers } from '@fortawesome/free-solid-svg-icons';
+import { useTheme } from '../context/ThemeContext';
 
-const SidebarMenu = ({ isOpen, onClose, setScreen, onLogoutPress }) => {
-  const menuItems = [
+const SidebarMenu = ({ isOpen, onClose, setScreen, onLogoutPress, userRole = 'user' }) => {
+  const { isDarkMode, theme } = useTheme();
+  
+  // Base menu items for all users
+  const baseMenuItems = [
     { id: 1, icon: faHouse, label: 'Home', screen: 'Home' },
     { id: 2, icon: faChartBar, label: 'System Logs', screen: 'Logs' },
     { id: 3, icon: faCamera, label: 'Cameras', screen: 'Cameras' },
-    { id: 4, icon: faUserGear, label: 'Resident Info', screen: 'Resident' },
-    { id: 5, icon: faPersonWalking, label: 'Gait Analysis', screen: 'Gait' },
-    { id: 6, icon: faCircleQuestion, label: 'FAQs', screen: 'FAQs' },
-    { id: 7, icon: faGear, label: 'Settings', screen: 'Settings' },
+    { id: 4, icon: faCircleQuestion, label: 'FAQs', screen: 'FAQs' },
+    { id: 5, icon: faGear, label: 'Settings', screen: 'Settings' },
   ];
+  
+  // Additional menu items for super admin
+  const adminMenuItems = [
+    { id: 6, icon: faUsers, label: 'User Management', screen: 'UserManagement' },
+  ];
+  
+  // Combine menu items based on user role
+  const menuItems = userRole === 'super_admin' 
+    ? [...baseMenuItems.slice(0, 4), ...adminMenuItems, baseMenuItems[4]] 
+    : baseMenuItems;
 
   return (
     <Modal visible={isOpen} transparent animationType="fade" onRequestClose={onClose}>
       <View style={styles.overlay}>
-        <View style={styles.sidebar}>
+        <View style={[styles.sidebar, { backgroundColor: theme.sidebarBg }]}>
           <SafeAreaView edges={['top', 'bottom']} style={{ flex: 1 }}>
             <View style={styles.sidebarHeader}>
-              <Image source={require('../../assets/sidebarlogo.png')} style={styles.sidebarLogo} resizeMode="contain" fadeDuration={0} />
+              <Image 
+                source={require('../../assets/sidebarlogo.png')} 
+                style={{ width: 200, height: 200 }} 
+                resizeMode="contain" 
+                fadeDuration={0} 
+              />
             </View>
             <ScrollView style={styles.menuContainer}>
               {menuItems.map((item) => (
@@ -47,7 +64,7 @@ const styles = StyleSheet.create({
   overlay: { flex: 1, flexDirection: 'row', backgroundColor: 'rgba(0,0,0,0.5)' },
   sidebar: { width: 260, backgroundColor: '#1E3A5F' },
   sidebarHeader: { padding: 40, alignItems: 'center' },
-  sidebarLogo: { width: 150, height: 150 },
+  sidebarLogo: { width: 200, height: 200 },
   menuItem: { flexDirection: 'row', padding: 18, alignItems: 'center' },
   menuLabel: { color: '#FFF', marginLeft: 15, fontWeight: '600' },
   logoutButton: { backgroundColor: '#FFF', margin: 20, padding: 12, borderRadius: 20, flexDirection: 'row', justifyContent: 'center', alignItems: 'center' },

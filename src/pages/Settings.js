@@ -3,10 +3,24 @@ import { View, Text, Switch, TouchableOpacity, StyleSheet, Alert, ActivityIndica
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faGear, faBrain, faMicrochip, faRotateRight, faPowerOff } from '@fortawesome/free-solid-svg-icons';
 import api from '../services/api';
+import React from 'react';
+import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
+import { faGear, faMicrochip, faRotateRight } from '@fortawesome/free-solid-svg-icons';
+import { useTheme } from '../context/ThemeContext';
 
 export default function Settings({ highSensitivity, setHighSensitivity, privacyMask, setPrivacyMask }) {
   const [isRebooting, setIsRebooting] = useState(false);
   const [isShuttingDown, setIsShuttingDown] = useState(false);
+  const { theme } = useTheme();
+  
+  const dynamicStyles = {
+    pillHeader: { backgroundColor: theme.card, padding: 12, borderRadius: 30, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
+    pillHeaderText: { fontWeight: '800', color: theme.text, marginRight: 10, fontSize: 15 },
+    settingsGroupTitle: { fontWeight: 'bold', color: theme.text, marginLeft: 8, fontSize: 12 },
+    settingsCard: { backgroundColor: theme.card, borderRadius: 20, paddingHorizontal: 20 },
+    settingsLabel: { color: theme.text, fontWeight: 'bold' },
+  };
 
   const handleReboot = () => {
     Alert.alert(
@@ -68,9 +82,9 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
 
   return (
     <View>
-      <View style={styles.pillHeader}>
-        <Text style={styles.pillHeaderText}>SETTINGS</Text>
-        <FontAwesomeIcon icon={faGear} color="#1E3A5F" size={18} />
+      <View style={dynamicStyles.pillHeader}>
+        <Text style={dynamicStyles.pillHeaderText}>SETTINGS</Text>
+        <FontAwesomeIcon icon={faGear} color={theme.text} size={18}/>
       </View>
 
       <View style={styles.settingsGroup}>
@@ -139,4 +153,7 @@ const styles = StyleSheet.create({
   settingsCard: { backgroundColor: '#FFF', borderRadius: 20, paddingHorizontal: 20 },
   settingsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15 },
   settingsLabel: { color: '#1E3A5F', fontWeight: 'bold' },
+  settingsGroup: { marginBottom: 20 },
+  settingsGroupHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8, marginLeft: 10 },
+  settingsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 15 },
 });

@@ -16,14 +16,16 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Users table
+    # Users table with role field       
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             full_name TEXT NOT NULL,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'user',
             is_verified INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -55,21 +57,16 @@ def init_db():
         )
     ''')
     
-    # Residents table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS residents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            resident_id TEXT UNIQUE NOT NULL,
-            full_name TEXT NOT NULL,
-            age INTEGER NOT NULL,
-            room_number TEXT NOT NULL,
-            risk_level TEXT DEFAULT 'Low',
-            notes TEXT,
-            is_active INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    # Create default Super Admin if not exists
+    cursor.execute('SELECT id FROM users WHERE role = ?', ('super_admin',))
+    if not cursor.fetchone():
+        # Default Super Admin account
+        password_hash = bcrypt.hashpw('Admin@123'.encode('utf-8'), bcrypt.gensalt())
+        cursor.execute('''
+            INSERT INTO users (full_name, email, password_hash, role, is_verified, is_active)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', ('Super Admin', 'admin@cairetaker.com', password_hash.decode('utf-8'), 'super_admin', 1, 1))
+        print("✅ Default Super Admin created (email: admin@cairetaker.com, password: Admin@123)")
     
     conn.commit()
     conn.close()
@@ -77,7 +74,7 @@ def init_db():
 
 # ==================== USER OPERATIONS ====================
 
-def create_user(full_name: str, email: str, password: str) -> dict:
+def create_user(full_name: str, email: str, password: str, role: str = 'user') -> dict:
     """Create a new user account"""
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -93,9 +90,9 @@ def create_user(full_name: str, email: str, password: str) -> dict:
         
         # Insert user
         cursor.execute('''
-            INSERT INTO users (full_name, email, password_hash)
-            VALUES (?, ?, ?)
-        ''', (full_name, email.lower(), password_hash.decode('utf-8')))
+            INSERT INTO users (full_name, email, password_hash, role, is_active)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (full_name, email.lower(), password_hash.decode('utf-8'), role, 1))
         
         conn.commit()
         user_id = cursor.lastrowid
@@ -118,7 +115,7 @@ def verify_user(email: str, password: str) -> dict:
     
     try:
         cursor.execute('''
-            SELECT id, full_name, email, password_hash, is_verified
+            SELECT id, full_name, email, password_hash, role, is_verified, is_active
             FROM users WHERE email = ?
         ''', (email.lower(),))
         
@@ -126,6 +123,10 @@ def verify_user(email: str, password: str) -> dict:
         
         if not user:
             return {'success': False, 'error': 'Invalid email or password'}
+        
+        # Check if account is active
+        if not user['is_active']:
+            return {'success': False, 'error': 'Account is disabled. Contact administrator.'}
         
         # Verify password
         if bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
@@ -135,7 +136,9 @@ def verify_user(email: str, password: str) -> dict:
                     'id': user['id'],
                     'full_name': user['full_name'],
                     'email': user['email'],
-                    'is_verified': bool(user['is_verified'])
+                    'role': user['role'],
+                    'is_verified': bool(user['is_verified']),
+                    'is_active': bool(user['is_active'])
                 }
             }
         else:
@@ -153,7 +156,7 @@ def get_user_by_email(email: str) -> dict:
     
     try:
         cursor.execute('''
-            SELECT id, full_name, email, is_verified, created_at
+            SELECT id, full_name, email, role, is_verified, is_active, created_at
             FROM users WHERE email = ?
         ''', (email.lower(),))
         
@@ -165,6 +168,121 @@ def get_user_by_email(email: str) -> dict:
                 'user': dict(user)
             }
         return {'success': False, 'error': 'User not found'}
+        
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+def get_all_users() -> dict:
+    """Get all users (for admin)"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            SELECT id, full_name, email, role, is_verified, is_active, created_at
+            FROM users ORDER BY created_at DESC
+        ''')
+        
+        users = [dict(row) for row in cursor.fetchall()]
+        
+        return {
+            'success': True,
+            'users': users,
+            'count': len(users)
+        }
+        
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+def update_user(user_id: int, **kwargs) -> dict:
+    """Update user information"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Build update query dynamically
+        allowed_fields = ['full_name', 'email', 'role', 'is_verified', 'is_active']
+        updates = []
+        values = []
+        
+        for field in allowed_fields:
+            if field in kwargs:
+                updates.append(f'{field} = ?')
+                values.append(kwargs[field])
+        
+        if not updates:
+            return {'success': False, 'error': 'No fields to update'}
+        
+        updates.append('updated_at = CURRENT_TIMESTAMP')
+        values.append(user_id)
+        
+        query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
+        cursor.execute(query, values)
+        
+        if cursor.rowcount == 0:
+            return {'success': False, 'error': 'User not found'}
+        
+        conn.commit()
+        return {'success': True, 'message': 'User updated successfully'}
+        
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+def delete_user(user_id: int) -> dict:
+    """Delete a user account"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Don't allow deleting super_admin
+        cursor.execute('SELECT role FROM users WHERE id = ?', (user_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            return {'success': False, 'error': 'User not found'}
+        
+        if user['role'] == 'super_admin':
+            return {'success': False, 'error': 'Cannot delete Super Admin account'}
+        
+        cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
+        
+        conn.commit()
+        return {'success': True, 'message': 'User deleted successfully'}
+        
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+    finally:
+        conn.close()
+
+def toggle_user_status(user_id: int, is_active: bool) -> dict:
+    """Enable or disable a user account"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Don't allow disabling super_admin
+        cursor.execute('SELECT role FROM users WHERE id = ?', (user_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            return {'success': False, 'error': 'User not found'}
+        
+        if user['role'] == 'super_admin':
+            return {'success': False, 'error': 'Cannot disable Super Admin account'}
+        
+        cursor.execute('''
+            UPDATE users SET is_active = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        ''', (1 if is_active else 0, user_id))
+        
+        conn.commit()
+        return {'success': True, 'message': f'User {"enabled" if is_active else "disabled"} successfully'}
         
     except Exception as e:
         return {'success': False, 'error': str(e)}
@@ -266,155 +384,6 @@ def verify_otp(email: str, otp_code: str, purpose: str = 'password_reset') -> di
         conn.commit()
         
         return {'success': True, 'message': 'OTP verified successfully'}
-        
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
-    finally:
-        conn.close()
-
-# ==================== RESIDENT OPERATIONS ====================
-
-def create_resident(resident_id: str, full_name: str, age: int, room_number: str, 
-                    risk_level: str = 'Low', notes: str = '') -> dict:
-    """Create a new resident"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Check if resident_id already exists
-        cursor.execute('SELECT id FROM residents WHERE resident_id = ?', (resident_id,))
-        if cursor.fetchone():
-            return {'success': False, 'error': 'Resident ID already exists'}
-        
-        cursor.execute('''
-            INSERT INTO residents (resident_id, full_name, age, room_number, risk_level, notes)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (resident_id, full_name, age, room_number, risk_level, notes))
-        
-        conn.commit()
-        
-        return {
-            'success': True,
-            'id': cursor.lastrowid,
-            'message': 'Resident enrolled successfully'
-        }
-        
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
-    finally:
-        conn.close()
-
-def get_all_residents(include_inactive: bool = False) -> dict:
-    """Get all residents"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        if include_inactive:
-            cursor.execute('''
-                SELECT id, resident_id, full_name, age, room_number, risk_level, notes, is_active, created_at
-                FROM residents ORDER BY created_at DESC
-            ''')
-        else:
-            cursor.execute('''
-                SELECT id, resident_id, full_name, age, room_number, risk_level, notes, is_active, created_at
-                FROM residents WHERE is_active = 1 ORDER BY created_at DESC
-            ''')
-        
-        residents = [dict(row) for row in cursor.fetchall()]
-        
-        return {
-            'success': True,
-            'residents': residents,
-            'count': len(residents)
-        }
-        
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
-    finally:
-        conn.close()
-
-def get_resident_by_id(resident_id: str) -> dict:
-    """Get a resident by their resident_id"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('''
-            SELECT id, resident_id, full_name, age, room_number, risk_level, notes, is_active, created_at
-            FROM residents WHERE resident_id = ?
-        ''', (resident_id,))
-        
-        resident = cursor.fetchone()
-        
-        if resident:
-            return {
-                'success': True,
-                'resident': dict(resident)
-            }
-        return {'success': False, 'error': 'Resident not found'}
-        
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
-    finally:
-        conn.close()
-
-def update_resident(resident_id: str, **kwargs) -> dict:
-    """Update resident information"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Build update query dynamically
-        allowed_fields = ['full_name', 'age', 'room_number', 'risk_level', 'notes', 'is_active']
-        updates = []
-        values = []
-        
-        for field in allowed_fields:
-            if field in kwargs:
-                updates.append(f'{field} = ?')
-                values.append(kwargs[field])
-        
-        if not updates:
-            return {'success': False, 'error': 'No fields to update'}
-        
-        updates.append('updated_at = CURRENT_TIMESTAMP')
-        values.append(resident_id)
-        
-        query = f"UPDATE residents SET {', '.join(updates)} WHERE resident_id = ?"
-        cursor.execute(query, values)
-        
-        if cursor.rowcount == 0:
-            return {'success': False, 'error': 'Resident not found'}
-        
-        conn.commit()
-        return {'success': True, 'message': 'Resident updated successfully'}
-        
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
-    finally:
-        conn.close()
-
-def delete_resident(resident_id: str, hard_delete: bool = False) -> dict:
-    """Delete a resident (soft delete by default)"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        if hard_delete:
-            cursor.execute('DELETE FROM residents WHERE resident_id = ?', (resident_id,))
-        else:
-            # Soft delete - just mark as inactive
-            cursor.execute('''
-                UPDATE residents SET is_active = 0, updated_at = CURRENT_TIMESTAMP
-                WHERE resident_id = ?
-            ''', (resident_id,))
-        
-        if cursor.rowcount == 0:
-            return {'success': False, 'error': 'Resident not found'}
-        
-        conn.commit()
-        return {'success': True, 'message': 'Resident deleted successfully'}
         
     except Exception as e:
         return {'success': False, 'error': str(e)}

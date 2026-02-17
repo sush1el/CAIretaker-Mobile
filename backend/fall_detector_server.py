@@ -31,11 +31,46 @@ import time
 from collections import deque, defaultdict
 import warnings
 import os
+import requests
 
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
 CORS(app)
+
+# ============== EXPO PUSH NOTIFICATIONS ==============
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+push_tokens = set()  # Store registered push tokens
+
+def send_expo_push_notification(title, body):
+    """Send push notification to all registered devices via Expo Push API"""
+    if not push_tokens:
+        print("📱 No push tokens registered, skipping notification")
+        return
+    
+    for token in push_tokens:
+        message = {
+            "to": token,
+            "sound": "default",
+            "title": title,
+            "body": body,
+            "data": {"type": "fall_alert"},
+            "priority": "high",
+            "channelId": "fall_alerts",
+        }
+        
+        try:
+            response = requests.post(
+                EXPO_PUSH_URL,
+                json=message,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                }
+            )
+            print(f"📱 Push notification sent: {response.status_code}")
+        except Exception as e:
+            print(f"📱 Push notification error: {e}")
 
 # Configuration
 class Config:
@@ -48,7 +83,7 @@ class Config:
     #   - yolo11n-pose.pt in backend/models/ folder
     
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    CNN_MODEL_PATH = os.path.join(BASE_DIR, "..", "backend/cnn_model_fall.pth")
+    CNN_MODEL_PATH = os.path.join(BASE_DIR, "..", "cnn_model_fall.pth")
     YOLO_MODEL = os.path.join(BASE_DIR, "models", "yolo11n-pose.pt")
     # ===========================================================================
     
@@ -74,7 +109,21 @@ class Config:
     NUM_KEYPOINTS = 17
     NUM_COORDS = 3
     NUM_SPATIAL_FEATURES = 7
-    LOCATION_NAME = "UAC - Exhibit"
+    
+    # Camera to Room Name Mapping
+    # Add more entries as you add more cameras
+    CAMERA_ROOMS = {
+        0: "Room 1",
+        1: "Room 2",
+        2: "Room 3",
+        3: "Room 4",
+        4: "Room 5",
+    }
+    
+    @staticmethod
+    def get_room_name(camera_index):
+        """Get room name based on camera index"""
+        return Config.CAMERA_ROOMS.get(camera_index, f"Camera {camera_index}")
 
 
 # ============================================================================
@@ -543,10 +592,15 @@ class SimpleDatabase:
     
     def resolve_fall_for_person(self, person_id):
         """Resolve active falls for a person"""
+        resolved_count = 0
         for incident in self.incidents:
             if incident['person_id'] == person_id and incident['status'] == 'active':
                 incident['status'] = 'resolved'
                 incident['resolved_at'] = time.time()
+                resolved_count += 1
+                print(f"📱 DB: Incident {incident['id']} for person {person_id} resolved")
+        if resolved_count == 0:
+            print(f"📱 DB: No active incidents found for person {person_id}")
     
     def resolve_fall_incident(self, incident_id):
         """Resolve a specific incident"""
@@ -658,9 +712,17 @@ class FallDetector:
                 keypoints_data = result.keypoints.data.cpu().numpy()
                 boxes = result.boxes
                 
+                # Safety check: ensure boxes has data
+                if boxes.xyxy is None or len(boxes.xyxy) == 0:
+                    return detections
+                
                 track_ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
                 
                 for idx, keypoints in enumerate(keypoints_data):
+                    # Skip if idx exceeds available boxes
+                    if idx >= len(boxes.xyxy):
+                        continue
+                    
                     box = boxes.xyxy[idx].cpu().numpy()
                     box_conf = boxes.conf[idx].cpu().numpy()
                     track_id = int(track_ids[idx]) if track_ids is not None else idx
@@ -825,8 +887,9 @@ class FallDetector:
                                         print(f"\n{'='*70}")
                                         print(f"🚨🚨🚨 CONFIRMED FALL ALERT 🚨🚨🚨")
                                         print(f"{'='*70}")
+                                        room_name = Config.get_room_name(current_camera_index)
                                         print(f"Person ID: {track_id}")
-                                        print(f"Location: {Config.LOCATION_NAME}")
+                                        print(f"Location: {room_name}")
                                         print(f"Fallen Confidence: {fallen_confidence:.2%}")
                                         print(f"Time Fallen: {elapsed_time:.2f}s")
                                         print(f"")
@@ -834,7 +897,7 @@ class FallDetector:
                                         incident_id = db.log_fall_incident(
                                             person_id=track_id,
                                             confidence=fallen_confidence,
-                                            location=Config.LOCATION_NAME
+                                            location=room_name
                                         )
                                         
                                         self.fall_states[track_id]['is_fallen'] = True
@@ -843,6 +906,12 @@ class FallDetector:
                                         print(f"📝 Incident logged (ID: {incident_id})")
                                         print(f"🚨 ALERT TRIGGERED - Caregivers must respond")
                                         print(f"{'='*70}\n")
+                                        
+                                        # Send push notification to registered devices
+                                        send_expo_push_notification(
+                                            "🚨 Fall Detected!",
+                                            f"Person ID {track_id} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
+                                        )
                                     else:
                                         print(f"ℹ️ Person ID {track_id}: Fall already confirmed")
                                 else:
@@ -1331,6 +1400,35 @@ def get_incidents():
             'success': False,
             'error': str(e)
         }), 500
+
+
+@app.route('/api/push-token', methods=['POST'])
+def register_push_token():
+    """Register an Expo Push Token for notifications"""
+    data = request.get_json()
+    token = data.get('token')
+    
+    if not token:
+        return jsonify({'success': False, 'message': 'Token required'}), 400
+    
+    if not token.startswith('ExponentPushToken'):
+        return jsonify({'success': False, 'message': 'Invalid Expo Push Token'}), 400
+    
+    push_tokens.add(token)
+    print(f"📱 Push token registered: {token[:30]}... (Total: {len(push_tokens)})")
+    return jsonify({'success': True, 'message': 'Token registered', 'total_devices': len(push_tokens)})
+
+
+@app.route('/api/push-token', methods=['DELETE'])
+def unregister_push_token():
+    """Unregister a push token"""
+    data = request.get_json()
+    token = data.get('token')
+    
+    if token in push_tokens:
+        push_tokens.remove(token)
+        return jsonify({'success': True, 'message': 'Token removed'})
+    return jsonify({'success': False, 'message': 'Token not found'}), 404
 
 
 @app.route('/incidents/statistics', methods=['GET'])

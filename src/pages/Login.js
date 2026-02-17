@@ -310,13 +310,6 @@ export default function Login() {
               <Text style={styles.forgotButtonText}>Forgot Password?</Text>
             </TouchableOpacity>
 
-            <View style={styles.footerContainer}>
-                <Text style={styles.footerText}>Don't have an account? </Text>
-                <TouchableOpacity onPress={() => router.push("/register")}>
-                  <Text style={styles.footerLink}>Sign up</Text>
-                </TouchableOpacity>
-            </View>
-
             {/* Developer Note */}
             <View style={styles.devNoteContainer}>
               <Ionicons name="information-circle" size={16} color="#999" />

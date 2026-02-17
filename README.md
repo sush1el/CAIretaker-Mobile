@@ -2,13 +2,21 @@
 
 ---
 
-## � App Features
+## 📱 App Features
 
 ### Real-Time Fall Detection
 - **Continuous Monitoring** - Falls detected with 500ms polling interval
 - **Live Status Indicator** - "No Active Falls" (green) / "Active Falls Detected!" (red) on Home page
 - **Background Stream** - Hidden WebView keeps camera stream active for real-time detection
 - **Persistent Logs** - Fall events logged with Room No, Status, Date, Time
+
+### Fall Alert System
+- **Real-Time Detection** - Alerts trigger ONLY when camera actively detects a fall (`is_fall === true`)
+- **Continuous Vibration** - Pattern `[0, 500, 200, 500, 200, 500]` loops while fall is active
+- **Push Notifications** - Sent every 3 seconds with high priority during active falls
+- **Auto-Stop** - Vibration and notifications stop immediately when person recovers (status returns to "Tracking")
+- **In-App Stop Button** - Manual "STOP ALERT" button available in LiveView
+- **Background Monitoring** - Falls detected and alerts triggered even when app is minimized
 
 ### Architecture
 - **Frontend**: React Native + Expo

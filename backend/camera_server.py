@@ -14,6 +14,41 @@ from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import threading
 import os
+import requests
+
+# Expo Push Notifications
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+push_tokens = set()  # Store registered push tokens
+
+def send_expo_push_notification(title, body):
+    """Send push notification to all registered devices via Expo Push API"""
+    if not push_tokens:
+        print("⚠️  No push tokens registered")
+        return
+    
+    messages = []
+    for token in push_tokens:
+        messages.append({
+            "to": token,
+            "title": title,
+            "body": body,
+            "sound": "default",
+            "priority": "high",
+            "channelId": "fall_alerts"
+        })
+    
+    try:
+        response = requests.post(
+            EXPO_PUSH_URL,
+            json=messages,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
+        )
+        print(f"📱 Push notification sent to {len(push_tokens)} devices: {response.status_code}")
+    except Exception as e:
+        print(f"❌ Push notification failed: {e}")
 
 # YOLOv11 will be imported when model is loaded
 try:
@@ -172,7 +207,7 @@ class FallDetector:
             return frame, []
     
     def log_fall_event(self, class_name, confidence):
-        """Log a fall detection event"""
+        """Log a fall detection event and send push notification"""
         event = {
             'timestamp': datetime.now().isoformat(),
             'class': class_name,
@@ -181,9 +216,15 @@ class FallDetector:
         }
         fall_events.append(event)
         
-        # Emit alert to all connected clients
+        # Emit alert to all connected clients (WebSocket - for app in foreground)
         socketio.emit('fall_detected', event)
         print(f"🚨 FALL DETECTED: {class_name} ({confidence:.2f})")
+        
+        # Send Expo Push notification (for app in background/closed)
+        send_expo_push_notification(
+            title="🚨 Fall Detected!",
+            body=f"{class_name} in {event['room']} - {confidence:.0%} confidence"
+        )
 
 
 class CameraStream:
@@ -327,6 +368,37 @@ def clear_fall_events():
     """Clear fall events"""
     fall_events.clear()
     return jsonify({'success': True, 'message': 'Fall events cleared'})
+
+
+# Push Token Registration
+@app.route('/api/push-token', methods=['POST'])
+def register_push_token():
+    """Register an Expo Push Token for notifications"""
+    data = request.get_json()
+    token = data.get('token')
+    
+    if not token:
+        return jsonify({'success': False, 'message': 'Token is required'}), 400
+    
+    if not token.startswith('ExponentPushToken'):
+        return jsonify({'success': False, 'message': 'Invalid Expo Push Token'}), 400
+    
+    push_tokens.add(token)
+    print(f"📱 Push token registered: {token[:30]}... (Total: {len(push_tokens)})")
+    return jsonify({'success': True, 'message': 'Push token registered'})
+
+
+@app.route('/api/push-token', methods=['DELETE'])
+def unregister_push_token():
+    """Unregister a push token"""
+    data = request.get_json()
+    token = data.get('token')
+    
+    if token in push_tokens:
+        push_tokens.remove(token)
+        return jsonify({'success': True, 'message': 'Push token removed'})
+    
+    return jsonify({'success': False, 'message': 'Token not found'}), 404
 
 
 # MJPEG Streaming endpoint (alternative to WebSocket)

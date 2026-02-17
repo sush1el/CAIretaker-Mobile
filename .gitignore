@@ -87,3 +87,4 @@ Thumbs.db
 yolo11n-pose.pt
 yolo11m-pose.pt
 backend/spatial_branch_output/*.pth
+.agent

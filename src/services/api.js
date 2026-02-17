@@ -21,20 +21,20 @@ export const API_CONFIG = {
   ENDPOINTS: {
     // Health
     HEALTH: '/api/health',
-
+    
     // Auth
     REGISTER: '/api/auth/register',
     LOGIN: '/api/auth/login',
     FORGOT_PASSWORD: '/api/auth/forgot-password',
     VERIFY_OTP: '/api/auth/verify-otp',
     RESET_PASSWORD: '/api/auth/reset-password',
-
+    
     // User
     PROFILE: '/api/user/profile',
-
-    // Residents
-    RESIDENTS: '/api/residents',
-
+    
+    // Users Management (Super Admin)
+    USERS: '/api/users',
+    
     // Camera
     CAMERA_STATUS: '/api/camera/status',
     CAMERA_START: '/api/camera/start',
@@ -59,6 +59,8 @@ class APIService {
   constructor() {
     this.baseUrl = API_CONFIG.BASE_URL;
     this.token = null;
+    this.userRole = 'user';
+    this.userName = '';
   }
 
   setToken(token) {
@@ -67,11 +69,21 @@ class APIService {
 
   clearToken() {
     this.token = null;
+    this.userRole = 'user';
+    this.userName = '';
+  }
+
+  getUserRole() {
+    return this.userRole;
+  }
+
+  getUserName() {
+    return this.userName;
   }
 
   async request(endpoint, options = {}) {
     const url = `${this.baseUrl}${endpoint}`;
-
+    
     const headers = {
       'Content-Type': 'application/json',
       ...options.headers,
@@ -94,7 +106,7 @@ class APIService {
       clearTimeout(timeoutId);
 
       const data = await response.json();
-
+      
       return {
         ok: response.ok,
         status: response.status,
@@ -108,7 +120,7 @@ class APIService {
           data: { success: false, error: 'Request timeout' },
         };
       }
-
+      
       return {
         ok: false,
         status: 0,
@@ -134,6 +146,11 @@ class APIService {
 
     if (result.ok && result.data.access_token) {
       this.setToken(result.data.access_token);
+      // Store user role and name from response
+      if (result.data.user) {
+        this.userRole = result.data.user.role || 'user';
+        this.userName = result.data.user.full_name || '';
+      }
     }
 
     return result;
@@ -177,39 +194,48 @@ class APIService {
     this.clearToken();
   }
 
-  // ==================== RESIDENT METHODS ====================
+  // ==================== PUSH NOTIFICATIONS ====================
 
-  async getResidents(includeInactive = false) {
-    const query = includeInactive ? '?include_inactive=true' : '';
-    return this.request(`${API_CONFIG.ENDPOINTS.RESIDENTS}${query}`, {
-      method: 'GET',
-    });
-  }
-
-  async enrollResident(residentData) {
-    return this.request(API_CONFIG.ENDPOINTS.RESIDENTS, {
+  async registerPushToken(token) {
+    // Register with camera server (which handles fall detection)
+    return this.cameraRequest('/api/push-token', {
       method: 'POST',
-      body: JSON.stringify(residentData),
+      body: JSON.stringify({ token }),
     });
   }
 
-  async getResident(residentId) {
-    return this.request(`${API_CONFIG.ENDPOINTS.RESIDENTS}/${residentId}`, {
+  // ==================== USER MANAGEMENT METHODS (Super Admin) ====================
+
+  async getUsers() {
+    return this.request(API_CONFIG.ENDPOINTS.USERS, {
       method: 'GET',
     });
   }
 
-  async updateResident(residentId, updateData) {
-    return this.request(`${API_CONFIG.ENDPOINTS.RESIDENTS}/${residentId}`, {
+  async createUser(userData) {
+    return this.request(API_CONFIG.ENDPOINTS.USERS, {
+      method: 'POST',
+      body: JSON.stringify(userData),
+    });
+  }
+
+  async updateUser(userId, updateData) {
+    return this.request(`${API_CONFIG.ENDPOINTS.USERS}/${userId}`, {
       method: 'PUT',
       body: JSON.stringify(updateData),
     });
   }
 
-  async deleteResident(residentId, hardDelete = false) {
-    const query = hardDelete ? '?hard=true' : '';
-    return this.request(`${API_CONFIG.ENDPOINTS.RESIDENTS}/${residentId}${query}`, {
+  async deleteUser(userId) {
+    return this.request(`${API_CONFIG.ENDPOINTS.USERS}/${userId}`, {
       method: 'DELETE',
+    });
+  }
+
+  async toggleUserStatus(userId, isActive) {
+    return this.request(`${API_CONFIG.ENDPOINTS.USERS}/${userId}/status`, {
+      method: 'PUT',
+      body: JSON.stringify({ is_active: isActive }),
     });
   }
 
@@ -217,7 +243,7 @@ class APIService {
 
   async cameraRequest(endpoint, options = {}) {
     const url = `${API_CONFIG.CAMERA_URL}${endpoint}`;
-
+    
     const headers = {
       'Content-Type': 'application/json',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -240,7 +266,7 @@ class APIService {
       clearTimeout(timeoutId);
 
       const data = await response.json();
-
+      
       return {
         ok: response.ok,
         status: response.status,
@@ -296,7 +322,8 @@ class APIService {
   }
 
   async getActiveFalls() {
-    return this.cameraRequest(API_CONFIG.ENDPOINTS.ACTIVE_FALLS, {
+    // Add timestamp to prevent caching and ensure fresh data
+    return this.cameraRequest(`${API_CONFIG.ENDPOINTS.ACTIVE_FALLS}?_t=${Date.now()}`, {
       method: 'GET',
     });
   }

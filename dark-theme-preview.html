@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CAIretaker Dark Mode Preview</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0F1825;
+      color: #F0F4F8;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    
+    /* Color Variables */
+    :root {
+      --bg: #0F1825;
+      --surface: #172435;
+      --card: #1E3145;
+      --primary: #5BA3E6;
+      --text-primary: #F0F4F8;
+      --text-secondary: #9EB3C8;
+      --border: #2A4060;
+      --success: #66D9A0;
+      --warning: #FFB84D;
+      --danger: #FF6B6B;
+    }
+
+    .container { max-width: 400px; margin: 0 auto; }
+    
+    /* Header */
+    .header {
+      background: var(--bg);
+      padding: 15px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-radius: 12px 12px 0 0;
+      margin-bottom: 0;
+    }
+    .header h1 { font-size: 18px; color: var(--primary); }
+    .header-icon { width: 24px; height: 24px; background: var(--text-secondary); border-radius: 4px; }
+
+    /* Main Content */
+    .main {
+      background: var(--surface);
+      padding: 20px;
+      border-radius: 0 0 12px 12px;
+    }
+
+    /* Cards */
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 16px;
+      border: 1px solid var(--border);
+    }
+    .card-title { 
+      font-size: 16px; 
+      font-weight: 600; 
+      margin-bottom: 8px;
+      color: var(--text-primary);
+    }
+    .card-text { 
+      font-size: 14px; 
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    /* Status Cards */
+    .status-row {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .status-card {
+      flex: 1;
+      background: var(--card);
+      border-radius: 10px;
+      padding: 14px;
+      text-align: center;
+      border: 1px solid var(--border);
+    }
+    .status-card.success { border-left: 4px solid var(--success); }
+    .status-card.warning { border-left: 4px solid var(--warning); }
+    .status-card.danger { border-left: 4px solid var(--danger); }
+    .status-number { font-size: 24px; font-weight: bold; }
+    .status-label { font-size: 12px; color: var(--text-secondary); }
+
+    /* Buttons */
+    .btn {
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+      width: 100%;
+      margin-bottom: 10px;
+    }
+    .btn-primary {
+      background: var(--primary);
+      color: #FFFFFF;
+    }
+    .btn-secondary {
+      background: var(--card);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+    }
+
+    /* Input */
+    .input-group { margin-bottom: 16px; }
+    .input-label { 
+      font-size: 12px; 
+      color: var(--text-secondary); 
+      margin-bottom: 6px;
+      display: block;
+    }
+    .input {
+      width: 100%;
+      padding: 12px 16px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-primary);
+      font-size: 14px;
+    }
+    .input::placeholder { color: var(--text-secondary); }
+
+    /* Color Palette Display */
+    .palette {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      margin-top: 20px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+    }
+    .color-swatch {
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 11px;
+      text-align: center;
+    }
+    .color-name { font-weight: 600; margin-bottom: 4px; }
+    .color-hex { opacity: 0.8; font-family: monospace; }
+
+    h2 { 
+      font-size: 14px; 
+      color: var(--text-secondary); 
+      margin: 20px 0 12px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header Preview -->
+    <div class="header">
+      <div class="header-icon"></div>
+      <h1>CAIretaker</h1>
+      <div class="header-icon"></div>
+    </div>
+
+    <div class="main">
+      <!-- Status Cards -->
+      <h2>Dashboard Stats</h2>
+      <div class="status-row">
+        <div class="status-card success">
+          <div class="status-number" style="color: var(--success)">12</div>
+          <div class="status-label">Active</div>
+        </div>
+        <div class="status-card warning">
+          <div class="status-number" style="color: var(--warning)">3</div>
+          <div class="status-label">Alerts</div>
+        </div>
+        <div class="status-card danger">
+          <div class="status-number" style="color: var(--danger)">1</div>
+          <div class="status-label">Critical</div>
+        </div>
+      </div>
+
+      <!-- Card Preview -->
+      <div class="card">
+        <div class="card-title">Resident Status</div>
+        <div class="card-text">All residents are currently being monitored. No incidents detected in the last 24 hours.</div>
+      </div>
+
+      <!-- Input Preview -->
+      <h2>Form Elements</h2>
+      <div class="input-group">
+        <label class="input-label">Search Residents</label>
+        <input type="text" class="input" placeholder="Enter name or ID...">
+      </div>
+
+      <!-- Button Preview -->
+      <button class="btn btn-primary">Primary Action</button>
+      <button class="btn btn-secondary">Secondary Action</button>
+
+      <!-- Color Palette -->
+      <h2>Color Palette</h2>
+      <div class="palette">
+        <div class="color-swatch" style="background: #0F1825; color: #F0F4F8;">
+          <div class="color-name">Background</div>
+          <div class="color-hex">#0F1825</div>
+        </div>
+        <div class="color-swatch" style="background: #172435; color: #F0F4F8;">
+          <div class="color-name">Surface</div>
+          <div class="color-hex">#172435</div>
+        </div>
+        <div class="color-swatch" style="background: #1E3145; color: #F0F4F8;">
+          <div class="color-name">Card</div>
+          <div class="color-hex">#1E3145</div>
+        </div>
+        <div class="color-swatch" style="background: #5BA3E6; color: #FFFFFF;">
+          <div class="color-name">Primary</div>
+          <div class="color-hex">#5BA3E6</div>
+        </div>
+        <div class="color-swatch" style="background: #66D9A0; color: #0F1825;">
+          <div class="color-name">Success</div>
+          <div class="color-hex">#66D9A0</div>
+        </div>
+        <div class="color-swatch" style="background: #FFB84D; color: #0F1825;">
+          <div class="color-name">Warning</div>
+          <div class="color-hex">#FFB84D</div>
+        </div>
+        <div class="color-swatch" style="background: #FF6B6B; color: #FFFFFF;">
+          <div class="color-name">Danger</div>
+          <div class="color-hex">#FF6B6B</div>
+        </div>
+        <div class="color-swatch" style="background: #2A4060; color: #F0F4F8;">
+          <div class="color-name">Border</div>
+          <div class="color-hex">#2A4060</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
