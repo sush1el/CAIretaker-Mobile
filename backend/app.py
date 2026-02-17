@@ -35,6 +35,8 @@ jwt = JWTManager(app)
 # Initialize SocketIO (for future real-time features)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+import subprocess
+
 # ==================== HEALTH CHECK ====================
 
 @app.route('/api/health', methods=['GET'])
@@ -45,6 +47,43 @@ def health_check():
         'service': 'CAIretaker Backend',
         'version': '1.0.0'
     })
+
+# ==================== SYSTEM ENDPOINTS ====================
+
+@app.route('/api/system/reboot', methods=['POST'])
+def reboot_system():
+    """Reboot the Raspberry Pi"""
+    try:
+        # Schedule reboot after a short delay so the response can be sent
+        subprocess.Popen(['sudo', 'shutdown', '-r', '+0'], 
+                        stdout=subprocess.DEVNULL, 
+                        stderr=subprocess.DEVNULL)
+        return jsonify({
+            'success': True,
+            'message': 'System is rebooting...'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'Failed to reboot: {str(e)}'
+        }), 500
+
+@app.route('/api/system/shutdown', methods=['POST'])
+def shutdown_system():
+    """Shutdown the Raspberry Pi"""
+    try:
+        subprocess.Popen(['sudo', 'shutdown', '-h', '+0'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+        return jsonify({
+            'success': True,
+            'message': 'System is shutting down...'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'Failed to shutdown: {str(e)}'
+        }), 500
 
 # ==================== AUTH ENDPOINTS ====================
 
@@ -441,5 +480,6 @@ if __name__ == '__main__':
         app,
         host=Config.HOST,
         port=Config.PORT,
-        debug=Config.DEBUG
+        debug=Config.DEBUG,
+        allow_unsafe_werkzeug=True
     )

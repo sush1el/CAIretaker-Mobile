@@ -1,46 +1,128 @@
-import React from 'react';
-import { View, Text, Switch, TouchableOpacity, StyleSheet } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, Switch, TouchableOpacity, StyleSheet, Alert, ActivityIndicator } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faGear, faBrain, faMicrochip, faRotateRight } from '@fortawesome/free-solid-svg-icons';
+import { faGear, faBrain, faMicrochip, faRotateRight, faPowerOff } from '@fortawesome/free-solid-svg-icons';
+import api from '../services/api';
 
 export default function Settings({ highSensitivity, setHighSensitivity, privacyMask, setPrivacyMask }) {
+  const [isRebooting, setIsRebooting] = useState(false);
+  const [isShuttingDown, setIsShuttingDown] = useState(false);
+
+  const handleReboot = () => {
+    Alert.alert(
+      'Reboot Hub',
+      'Are you sure you want to reboot the Raspberry Pi? The system will be temporarily unavailable.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reboot',
+          style: 'destructive',
+          onPress: async () => {
+            setIsRebooting(true);
+            try {
+              const result = await api.rebootSystem();
+              if (result.ok) {
+                Alert.alert('Rebooting', 'The system is rebooting. It will be available again in about 1-2 minutes.');
+              } else {
+                Alert.alert('Error', result.data?.error || 'Failed to reboot the system.');
+              }
+            } catch (error) {
+              Alert.alert('Error', 'Could not connect to the server.');
+            } finally {
+              setIsRebooting(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const handleShutdown = () => {
+    Alert.alert(
+      'Shutdown Hub',
+      'Are you sure you want to shut down the Raspberry Pi? You will need to physically turn it back on.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Shut Down',
+          style: 'destructive',
+          onPress: async () => {
+            setIsShuttingDown(true);
+            try {
+              const result = await api.shutdownSystem();
+              if (result.ok) {
+                Alert.alert('Shutting Down', 'The system is shutting down. You will need to physically power it back on.');
+              } else {
+                Alert.alert('Error', result.data?.error || 'Failed to shut down the system.');
+              }
+            } catch (error) {
+              Alert.alert('Error', 'Could not connect to the server.');
+            } finally {
+              setIsShuttingDown(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
   return (
     <View>
       <View style={styles.pillHeader}>
         <Text style={styles.pillHeaderText}>SETTINGS</Text>
-        <FontAwesomeIcon icon={faGear} color="#1E3A5F" size={18}/>
+        <FontAwesomeIcon icon={faGear} color="#1E3A5F" size={18} />
       </View>
-      
+
       <View style={styles.settingsGroup}>
         <View style={styles.settingsGroupHeader}>
-            <FontAwesomeIcon icon={faBrain} color="#1E3A5F" size={14}/>
-            <Text style={styles.settingsGroupTitle}>AI Engine</Text>
+          <FontAwesomeIcon icon={faBrain} color="#1E3A5F" size={14} />
+          <Text style={styles.settingsGroupTitle}>AI Engine</Text>
         </View>
         <View style={styles.settingsCard}>
           <View style={styles.settingsRow}>
             <Text style={styles.settingsLabel}>High Sensitivity</Text>
-            <Switch value={highSensitivity} onValueChange={setHighSensitivity} trackColor={{true: '#A8D5E2'}} thumbColor="#1E3A5F" />
+            <Switch value={highSensitivity} onValueChange={setHighSensitivity} trackColor={{ true: '#A8D5E2' }} thumbColor="#1E3A5F" />
           </View>
-          <View style={[styles.settingsRow, {borderBottomWidth: 0}]}>
+          <View style={[styles.settingsRow, { borderBottomWidth: 0 }]}>
             <Text style={styles.settingsLabel}>Privacy Masking</Text>
-            <Switch value={privacyMask} onValueChange={setPrivacyMask} trackColor={{true: '#A8D5E2'}} thumbColor="#1E3A5F" />
+            <Switch value={privacyMask} onValueChange={setPrivacyMask} trackColor={{ true: '#A8D5E2' }} thumbColor="#1E3A5F" />
           </View>
         </View>
       </View>
 
       <View style={styles.settingsGroup}>
         <View style={styles.settingsGroupHeader}>
-            <FontAwesomeIcon icon={faMicrochip} color="#1E3A5F" size={14}/>
-            <Text style={styles.settingsGroupTitle}>Hardware (Pi 5)</Text>
+          <FontAwesomeIcon icon={faMicrochip} color="#1E3A5F" size={14} />
+          <Text style={styles.settingsGroupTitle}>Hardware (Pi 5)</Text>
         </View>
         <View style={styles.settingsCard}>
           <View style={styles.settingsRow}>
             <Text style={styles.settingsLabel}>System Health</Text>
-            <Text style={{color: '#7CB342', fontWeight: 'bold'}}>Optimal</Text>
+            <Text style={{ color: '#7CB342', fontWeight: 'bold' }}>Optimal</Text>
           </View>
-          <TouchableOpacity style={[styles.settingsRow, {borderBottomWidth: 0}]}>
+          <TouchableOpacity
+            style={styles.settingsRow}
+            onPress={handleReboot}
+            disabled={isRebooting}
+          >
             <Text style={styles.settingsLabel}>Reboot Hub</Text>
-            <FontAwesomeIcon icon={faRotateRight} color="#1E3A5F" size={14}/>
+            {isRebooting ? (
+              <ActivityIndicator size="small" color="#1E3A5F" />
+            ) : (
+              <FontAwesomeIcon icon={faRotateRight} color="#1E3A5F" size={14} />
+            )}
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.settingsRow, { borderBottomWidth: 0 }]}
+            onPress={handleShutdown}
+            disabled={isShuttingDown}
+          >
+            <Text style={[styles.settingsLabel, { color: '#D32F2F' }]}>Shutdown Hub</Text>
+            {isShuttingDown ? (
+              <ActivityIndicator size="small" color="#D32F2F" />
+            ) : (
+              <FontAwesomeIcon icon={faPowerOff} color="#D32F2F" size={14} />
+            )}
           </TouchableOpacity>
         </View>
       </View>

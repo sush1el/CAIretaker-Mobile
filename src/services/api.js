@@ -43,6 +43,10 @@ export const API_CONFIG = {
     CAMERA_STREAM: '/api/camera/stream',
     FALL_EVENTS: '/api/fall-events',
     ACTIVE_FALLS: '/api/active-falls',
+
+    // System
+    REBOOT: '/api/system/reboot',
+    SHUTDOWN: '/api/system/shutdown',
   },
   TIMEOUT: 10000, // 10 seconds
 };
@@ -294,6 +298,20 @@ class APIService {
   async getActiveFalls() {
     return this.cameraRequest(API_CONFIG.ENDPOINTS.ACTIVE_FALLS, {
       method: 'GET',
+    });
+  }
+
+  // ==================== SYSTEM METHODS ====================
+
+  async rebootSystem() {
+    return this.request(API_CONFIG.ENDPOINTS.REBOOT, {
+      method: 'POST',
+    });
+  }
+
+  async shutdownSystem() {
+    return this.request(API_CONFIG.ENDPOINTS.SHUTDOWN, {
+      method: 'POST',
     });
   }
 }
