@@ -3,10 +3,6 @@ import { View, Text, Switch, TouchableOpacity, StyleSheet, Alert, ActivityIndica
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faGear, faBrain, faMicrochip, faRotateRight, faPowerOff } from '@fortawesome/free-solid-svg-icons';
 import api from '../services/api';
-import React from 'react';
-import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
-import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faGear, faMicrochip, faRotateRight } from '@fortawesome/free-solid-svg-icons';
 import { useTheme } from '../context/ThemeContext';
 
 export default function Settings({ highSensitivity, setHighSensitivity, privacyMask, setPrivacyMask }) {
