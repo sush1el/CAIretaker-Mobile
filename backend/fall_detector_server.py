@@ -658,9 +658,17 @@ class FallDetector:
                 keypoints_data = result.keypoints.data.cpu().numpy()
                 boxes = result.boxes
                 
+                # Safety check: ensure boxes has data
+                if boxes.xyxy is None or len(boxes.xyxy) == 0:
+                    return detections
+                
                 track_ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
                 
                 for idx, keypoints in enumerate(keypoints_data):
+                    # Skip if idx exceeds available boxes
+                    if idx >= len(boxes.xyxy):
+                        continue
+                    
                     box = boxes.xyxy[idx].cpu().numpy()
                     box_conf = boxes.conf[idx].cpu().numpy()
                     track_id = int(track_ids[idx]) if track_ids is not None else idx

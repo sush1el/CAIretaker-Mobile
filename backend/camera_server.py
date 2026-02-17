@@ -14,25 +14,41 @@ from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import threading
 import os
+import requests
 
-# Firebase Cloud Messaging for push notifications
-try:
-    import firebase_admin
-    from firebase_admin import credentials, messaging
+# Expo Push Notifications
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+push_tokens = set()  # Store registered push tokens
+
+def send_expo_push_notification(title, body):
+    """Send push notification to all registered devices via Expo Push API"""
+    if not push_tokens:
+        print("⚠️  No push tokens registered")
+        return
     
-    # Initialize Firebase Admin SDK
-    FIREBASE_CRED_PATH = os.path.join(os.path.dirname(__file__), "serviceAccountKey.json")
-    if os.path.exists(FIREBASE_CRED_PATH):
-        cred = credentials.Certificate(FIREBASE_CRED_PATH)
-        firebase_admin.initialize_app(cred)
-        FCM_AVAILABLE = True
-        print("✅ Firebase Cloud Messaging initialized")
-    else:
-        FCM_AVAILABLE = False
-        print("⚠️  serviceAccountKey.json not found. Push notifications disabled.")
-except ImportError:
-    FCM_AVAILABLE = False
-    print("⚠️  firebase-admin not installed. Run: pip install firebase-admin")
+    messages = []
+    for token in push_tokens:
+        messages.append({
+            "to": token,
+            "title": title,
+            "body": body,
+            "sound": "default",
+            "priority": "high",
+            "channelId": "fall_alerts"
+        })
+    
+    try:
+        response = requests.post(
+            EXPO_PUSH_URL,
+            json=messages,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
+        )
+        print(f"📱 Push notification sent to {len(push_tokens)} devices: {response.status_code}")
+    except Exception as e:
+        print(f"❌ Push notification failed: {e}")
 
 # YOLOv11 will be imported when model is loaded
 try:
@@ -204,37 +220,11 @@ class FallDetector:
         socketio.emit('fall_detected', event)
         print(f"🚨 FALL DETECTED: {class_name} ({confidence:.2f})")
         
-        # Send FCM push notification (for app in background/closed)
-        if FCM_AVAILABLE:
-            try:
-                message = messaging.Message(
-                    notification=messaging.Notification(
-                        title="🚨 Fall Detected!",
-                        body=f"{class_name} in {event['room']} - {confidence:.0%} confidence"
-                    ),
-                    android=messaging.AndroidConfig(
-                        priority='high',
-                        notification=messaging.AndroidNotification(
-                            channel_id='fall_alerts',
-                            priority='max',
-                            default_vibrate_timings=False,
-                            vibrate_timings_millis=[0, 500, 200, 500, 200, 500]
-                        )
-                    ),
-                    apns=messaging.APNSConfig(
-                        payload=messaging.APNSPayload(
-                            aps=messaging.Aps(
-                                sound='default',
-                                badge=1
-                            )
-                        )
-                    ),
-                    topic='fall_alerts'
-                )
-                response = messaging.send(message)
-                print(f"📱 FCM notification sent: {response}")
-            except Exception as e:
-                print(f"❌ FCM notification failed: {e}")
+        # Send Expo Push notification (for app in background/closed)
+        send_expo_push_notification(
+            title="🚨 Fall Detected!",
+            body=f"{class_name} in {event['room']} - {confidence:.0%} confidence"
+        )
 
 
 class CameraStream:
@@ -378,6 +368,37 @@ def clear_fall_events():
     """Clear fall events"""
     fall_events.clear()
     return jsonify({'success': True, 'message': 'Fall events cleared'})
+
+
+# Push Token Registration
+@app.route('/api/push-token', methods=['POST'])
+def register_push_token():
+    """Register an Expo Push Token for notifications"""
+    data = request.get_json()
+    token = data.get('token')
+    
+    if not token:
+        return jsonify({'success': False, 'message': 'Token is required'}), 400
+    
+    if not token.startswith('ExponentPushToken'):
+        return jsonify({'success': False, 'message': 'Invalid Expo Push Token'}), 400
+    
+    push_tokens.add(token)
+    print(f"📱 Push token registered: {token[:30]}... (Total: {len(push_tokens)})")
+    return jsonify({'success': True, 'message': 'Push token registered'})
+
+
+@app.route('/api/push-token', methods=['DELETE'])
+def unregister_push_token():
+    """Unregister a push token"""
+    data = request.get_json()
+    token = data.get('token')
+    
+    if token in push_tokens:
+        push_tokens.remove(token)
+        return jsonify({'success': True, 'message': 'Push token removed'})
+    
+    return jsonify({'success': False, 'message': 'Token not found'}), 404
 
 
 # MJPEG Streaming endpoint (alternative to WebSocket)
