@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'expo-router';
 import {
   View,
@@ -10,6 +10,7 @@ import {
   Image,
 
   StatusBar,
+  Alert,
 
 } from 'react-native';
 
@@ -44,6 +45,7 @@ import UserManagement from './src/pages/UserManagement';
 
 // Services
 import api from './src/services/api';
+import pushNotifications from './src/services/pushNotifications';
 
 export default function App() {
   return (
@@ -63,11 +65,102 @@ function MainApp() {
 
   // User State (role will be set after login)
   const [userRole, setUserRole] = useState('user'); // Default role
+  
+  // Push notification state
+  const [expoPushToken, setExpoPushToken] = useState('');
+  const notificationListener = useRef();
+  const responseListener = useRef();
+  const fallAlarmRef = useRef(false); // Track if alarm is running
 
-  // Read user role from api service on mount
+  // Global fall monitoring - poll for active falls regardless of current screen
+  useEffect(() => {
+    const checkForActiveFalls = async () => {
+      try {
+        const result = await api.getActiveFalls();
+        if (result.ok) {
+          // Use REAL-TIME detections (current_detections) instead of database incidents (active_falls)
+          // This ensures alarm stops immediately when person recovers, not based on stale DB data
+          const currentDetections = result.data.current_detections || [];
+          const hasRealTimeFall = currentDetections.some(d => d.is_fall === true);
+          
+          if (hasRealTimeFall && !fallAlarmRef.current) {
+            // Found an active fall in real-time detection - start alarm
+            const fallDetection = currentDetections.find(d => d.is_fall === true);
+            // Also get location from database incidents if available
+            const activeFalls = result.data.active_falls || [];
+            const dbIncident = activeFalls.find(f => f.status === 'active' && f.type === 'fall');
+            pushNotifications.startFallAlarm(
+              fallDetection?.id || dbIncident?.person_id || 'Unknown',
+              dbIncident?.location || 'Room 1'
+            );
+            fallAlarmRef.current = true;
+          } else if (!hasRealTimeFall && fallAlarmRef.current) {
+            // No active falls in real-time - stop alarm immediately
+            pushNotifications.stopFallAlarm();
+            fallAlarmRef.current = false;
+          }
+        }
+      } catch (error) {
+        console.log('Fall check error:', error);
+      }
+    };
+
+    // Poll every 3 seconds for active falls
+    const intervalId = setInterval(checkForActiveFalls, 3000);
+    
+    // Initial check
+    checkForActiveFalls();
+    
+    return () => {
+      clearInterval(intervalId);
+      if (fallAlarmRef.current) {
+        pushNotifications.stopFallAlarm();
+      }
+    };
+  }, []);
+
+  // Read user role and setup push notifications on mount
   useEffect(() => {
     const role = api.getUserRole();
     setUserRole(role);
+
+    // Register for push notifications
+    pushNotifications.registerForPushNotificationsAsync().then(token => {
+      if (token) {
+        setExpoPushToken(token);
+        console.log('Push token registered:', token);
+        // Send token to backend
+        api.registerPushToken(token).catch(err => 
+          console.log('Could not register token with backend:', err.message)
+        );
+      }
+    });
+
+    // Listen for notifications received while app is foregrounded
+    notificationListener.current = pushNotifications.addNotificationReceivedListener(notification => {
+      const { title, body } = notification.request.content;
+      // Show alert for fall detection
+      Alert.alert(title || 'Alert', body, [
+        { text: 'View', onPress: () => setCurrentScreen('LiveView') },
+        { text: 'Dismiss', style: 'cancel' }
+      ]);
+    });
+
+    // Listen for notification taps (app in background)
+    responseListener.current = pushNotifications.addNotificationResponseListener(response => {
+      // Navigate to LiveView when notification is tapped
+      setCurrentScreen('LiveView');
+    });
+
+    // Cleanup listeners on unmount
+    return () => {
+      if (notificationListener.current) {
+        notificationListener.current.remove();
+      }
+      if (responseListener.current) {
+        responseListener.current.remove();
+      }
+    };
   }, []);
 
   // Global App Data & State

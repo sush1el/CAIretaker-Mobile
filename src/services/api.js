@@ -190,6 +190,16 @@ class APIService {
     this.clearToken();
   }
 
+  // ==================== PUSH NOTIFICATIONS ====================
+
+  async registerPushToken(token) {
+    // Register with camera server (which handles fall detection)
+    return this.cameraRequest('/api/push-token', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    });
+  }
+
   // ==================== USER MANAGEMENT METHODS (Super Admin) ====================
 
   async getUsers() {
@@ -308,7 +318,8 @@ class APIService {
   }
 
   async getActiveFalls() {
-    return this.cameraRequest(API_CONFIG.ENDPOINTS.ACTIVE_FALLS, {
+    // Add timestamp to prevent caching and ensure fresh data
+    return this.cameraRequest(`${API_CONFIG.ENDPOINTS.ACTIVE_FALLS}?_t=${Date.now()}`, {
       method: 'GET',
     });
   }

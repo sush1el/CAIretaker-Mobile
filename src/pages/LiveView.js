@@ -1,10 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView, Vibration } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faCamera, faChevronLeft, faChevronRight, faRefresh, faVideoCamera, faExclamationTriangle, faChartBar } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
 import api from '../services/api';
 import { useTheme } from '../context/ThemeContext';
+
+// Vibration pattern: vibrate 500ms, pause 500ms (repeats)
+const FALL_VIBRATION_PATTERN = [0, 500, 500];
 
 export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
   const { theme, isDarkMode } = useTheme();
@@ -14,6 +17,49 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
   const [activeFalls, setActiveFalls] = useState([]);
   const [currentTime, setCurrentTime] = useState(new Date());
   const [fallLogs, setFallLogs] = useState([]); // Persistent fall event logs
+  const [isVibrating, setIsVibrating] = useState(false);
+  const vibrationActiveRef = useRef(false);
+
+  // Stop vibration (can be called manually or automatically)
+  const stopVibration = () => {
+    Vibration.cancel();
+    vibrationActiveRef.current = false;
+    setIsVibrating(false);
+  };
+
+  // Continuous vibration when fall is detected
+  useEffect(() => {
+    // ONLY vibrate when camera is actively detecting AND there's a fall
+    const liveDetections = cameraStatus?.detections || [];
+    
+    // Must have at least one detection AND one of them must be a fall
+    const hasDetections = liveDetections.length > 0;
+    const hasLiveFallDetection = hasDetections && liveDetections.some(d => d.is_fall === true);
+    
+    console.log('Vibration check:', { 
+      hasDetections, 
+      hasLiveFallDetection, 
+      detectionsCount: liveDetections.length,
+      isVibrating: vibrationActiveRef.current 
+    });
+    
+    if (hasLiveFallDetection && !vibrationActiveRef.current) {
+      vibrationActiveRef.current = true;
+      setIsVibrating(true);
+      Vibration.vibrate(FALL_VIBRATION_PATTERN, true);
+      console.log('🔔 Fall alert: vibration started');
+    } else if (!hasLiveFallDetection && vibrationActiveRef.current) {
+      stopVibration();
+      console.log('🔕 Fall cleared: vibration stopped');
+    }
+
+    return () => {
+      if (vibrationActiveRef.current) {
+        Vibration.cancel();
+        vibrationActiveRef.current = false;
+      }
+    };
+  }, [cameraStatus, activeFalls]);
 
   // Initial data fetch
   useEffect(() => {
@@ -233,6 +279,15 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
             <Text style={styles.modelWarningText}>Model not loaded</Text>
           </View>
         )}
+        {isVibrating && (
+          <TouchableOpacity 
+            style={styles.stopAlertButton} 
+            onPress={stopVibration}
+          >
+            <FontAwesomeIcon icon={faExclamationTriangle} color="#FFF" size={16} />
+            <Text style={styles.stopAlertText}>STOP ALERT</Text>
+          </TouchableOpacity>
+        )}
       </View>
     );
   };
@@ -362,6 +417,8 @@ const styles = StyleSheet.create({
   startButtonText: { color: '#FFF', fontWeight: 'bold' },
   modelWarning: { position: 'absolute', bottom: 10, left: 10, flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.7)', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 10 },
   modelWarningText: { color: '#FFA000', fontSize: 10, marginLeft: 5 },
+  stopAlertButton: { position: 'absolute', top: 10, right: 10, flexDirection: 'row', alignItems: 'center', backgroundColor: '#D32F2F', paddingHorizontal: 15, paddingVertical: 10, borderRadius: 20 },
+  stopAlertText: { color: '#FFF', fontWeight: 'bold', fontSize: 12, marginLeft: 8 },
   liveMetaRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15, alignItems: 'center' },
   liveBadge: { backgroundColor: '#1E3A5F', paddingHorizontal: 15, paddingVertical: 5, borderRadius: 20, flexDirection: 'row', alignItems: 'center' },
   innerDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },

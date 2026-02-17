@@ -25,6 +25,12 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "a573b37d-1182-4654-8693-5acbee532cc9"
+      }
+    },
+    "owner": "kyeldlpz"
   }
 }

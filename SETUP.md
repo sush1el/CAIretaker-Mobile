@@ -4,9 +4,11 @@
 
 - **Real-Time Fall Detection** - Continuous monitoring with instant alerts
 - **Live Status Updates** - "No Active Falls" / "Active Falls Detected!" status indicator on Home page
+- **Fall Alert System** - Vibration + Push notifications triggered ONLY during active falls
 - **Multi-Room Support** - Monitor multiple rooms (Room 1 active, Rooms 2-3 coming soon)
 - **Fall Event Logging** - Persistent logs with Room No, Status, Date, and Time
 - **Background Detection** - Hidden camera stream keeps detection active even on Home page
+- **Smart Alert Behavior** - Alerts stop automatically when person recovers (status changes from "Fall" to "Tracking")
 
 ## Prerequisites
 
@@ -178,6 +180,18 @@ The app includes a **hidden camera stream** on the Home page that keeps fall det
 - Real-time status updates (polls every 500ms)
 - Falls are detected even when not viewing the Room 1 camera
 - Logs are updated immediately when a fall occurs
+
+### Fall Alert Behavior
+
+The alert system is designed to prevent overwhelming/spamming:
+- **Triggered ONLY** when camera detects `is_fall === true` (real-time)
+- **NOT triggered** by stale database incidents or "Tracking" status
+- **Vibration** - Continuous pattern `[0, 500, 200, 500, 200, 500]` while fall is active
+- **Notifications** - Push notifications every 3 seconds with high priority
+- **Auto-Stop** - Both vibration and notifications stop immediately when:
+  - Person recovers (stands up)
+  - User taps "STOP ALERT" button in LiveView
+- **Background Support** - Alerts work even when app is minimized
 
 ---
 
