@@ -4,19 +4,19 @@ import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faCamera, faChevronLeft, faChevronRight, faRefresh, faVideoCamera, faExclamationTriangle, faChartBar } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
 import api from '../services/api';
+import { useTheme } from '../context/ThemeContext';
 
 export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
+  const { theme, isDarkMode } = useTheme();
   const [cameraStatus, setCameraStatus] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [streamKey, setStreamKey] = useState(0);
-  const [residents, setResidents] = useState([]);
   const [activeFalls, setActiveFalls] = useState([]);
   const [currentTime, setCurrentTime] = useState(new Date());
   const [fallLogs, setFallLogs] = useState([]); // Persistent fall event logs
 
   // Initial data fetch
   useEffect(() => {
-    fetchResidents();
     checkCameraStatus();
   }, []);
 
@@ -34,17 +34,6 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
     }, 1000); // Poll every second for real-time updates
     return () => clearInterval(interval);
   }, []);
-
-  const fetchResidents = async () => {
-    try {
-      const result = await api.getResidents();
-      if (result.ok && result.data.residents) {
-        setResidents(result.data.residents);
-      }
-    } catch (error) {
-      console.log('Error fetching residents:', error);
-    }
-  };
 
   const fetchActiveFalls = async () => {
     try {
@@ -109,7 +98,6 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
   const refreshStream = () => {
     setStreamKey(prev => prev + 1);
     checkCameraStatus();
-    fetchResidents();
     fetchActiveFalls();
   };
 
@@ -118,11 +106,6 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
     await api.startCamera();
     checkCameraStatus();
   };
-
-  // Get residents for current room
-  const roomResidents = residents.filter(r => 
-    r.room_number === monitoringRoom || r.room_number === String(monitoringRoom)
-  );
 
   // Get current detections with all people tracked
   const getCurrentDetections = () => {

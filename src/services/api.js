@@ -32,8 +32,8 @@ export const API_CONFIG = {
     // User
     PROFILE: '/api/user/profile',
     
-    // Residents
-    RESIDENTS: '/api/residents',
+    // Users Management (Super Admin)
+    USERS: '/api/users',
     
     // Camera
     CAMERA_STATUS: '/api/camera/status',
@@ -55,6 +55,8 @@ class APIService {
   constructor() {
     this.baseUrl = API_CONFIG.BASE_URL;
     this.token = null;
+    this.userRole = 'user';
+    this.userName = '';
   }
 
   setToken(token) {
@@ -63,6 +65,16 @@ class APIService {
 
   clearToken() {
     this.token = null;
+    this.userRole = 'user';
+    this.userName = '';
+  }
+
+  getUserRole() {
+    return this.userRole;
+  }
+
+  getUserName() {
+    return this.userName;
   }
 
   async request(endpoint, options = {}) {
@@ -130,6 +142,11 @@ class APIService {
 
     if (result.ok && result.data.access_token) {
       this.setToken(result.data.access_token);
+      // Store user role and name from response
+      if (result.data.user) {
+        this.userRole = result.data.user.role || 'user';
+        this.userName = result.data.user.full_name || '';
+      }
     }
 
     return result;
@@ -173,39 +190,38 @@ class APIService {
     this.clearToken();
   }
 
-  // ==================== RESIDENT METHODS ====================
+  // ==================== USER MANAGEMENT METHODS (Super Admin) ====================
 
-  async getResidents(includeInactive = false) {
-    const query = includeInactive ? '?include_inactive=true' : '';
-    return this.request(`${API_CONFIG.ENDPOINTS.RESIDENTS}${query}`, {
+  async getUsers() {
+    return this.request(API_CONFIG.ENDPOINTS.USERS, {
       method: 'GET',
     });
   }
 
-  async enrollResident(residentData) {
-    return this.request(API_CONFIG.ENDPOINTS.RESIDENTS, {
+  async createUser(userData) {
+    return this.request(API_CONFIG.ENDPOINTS.USERS, {
       method: 'POST',
-      body: JSON.stringify(residentData),
+      body: JSON.stringify(userData),
     });
   }
 
-  async getResident(residentId) {
-    return this.request(`${API_CONFIG.ENDPOINTS.RESIDENTS}/${residentId}`, {
-      method: 'GET',
-    });
-  }
-
-  async updateResident(residentId, updateData) {
-    return this.request(`${API_CONFIG.ENDPOINTS.RESIDENTS}/${residentId}`, {
+  async updateUser(userId, updateData) {
+    return this.request(`${API_CONFIG.ENDPOINTS.USERS}/${userId}`, {
       method: 'PUT',
       body: JSON.stringify(updateData),
     });
   }
 
-  async deleteResident(residentId, hardDelete = false) {
-    const query = hardDelete ? '?hard=true' : '';
-    return this.request(`${API_CONFIG.ENDPOINTS.RESIDENTS}/${residentId}${query}`, {
+  async deleteUser(userId) {
+    return this.request(`${API_CONFIG.ENDPOINTS.USERS}/${userId}`, {
       method: 'DELETE',
+    });
+  }
+
+  async toggleUserStatus(userId, isActive) {
+    return this.request(`${API_CONFIG.ENDPOINTS.USERS}/${userId}/status`, {
+      method: 'PUT',
+      body: JSON.stringify({ is_active: isActive }),
     });
   }
 

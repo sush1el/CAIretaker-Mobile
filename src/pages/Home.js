@@ -1,14 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faCamera, faTriangleExclamation, faExclamationCircle, faChevronDown } from '@fortawesome/free-solid-svg-icons';
+import { faCamera, faTriangleExclamation, faExclamationCircle, faChevronDown, faPersonWalking } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
 import api from '../services/api';
+import { useTheme } from '../context/ThemeContext';
 
 export default function Home({ setScreen, setMonitoringRoom }) {
+  const { theme, isDarkMode } = useTheme();
   const [hasActiveFall, setHasActiveFall] = useState(false);
   const [activeFallCount, setActiveFallCount] = useState(0);
-  const [residents, setResidents] = useState([]);
   const [fallEvents, setFallEvents] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [roomFilter, setRoomFilter] = useState(null); // null = all rooms, 1/2/3 = specific room
@@ -82,12 +83,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const fetchData = async () => {
     setIsLoading(true);
     try {
-      // Fetch residents from database
-      const residentsResult = await api.getResidents();
-      if (residentsResult.ok && residentsResult.data.residents) {
-        setResidents(residentsResult.data.residents);
-      }
-      
       // Fetch fall events
       const eventsResult = await api.getFallEvents();
       if (eventsResult.ok) {
@@ -99,14 +94,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       setIsLoading(false);
     }
   };
-
-  // Group residents by room for easy lookup
-  const residentsByRoom = residents.reduce((acc, resident) => {
-    const roomNum = resident.room_number;
-    if (!acc[roomNum]) acc[roomNum] = [];
-    acc[roomNum].push(resident);
-    return acc;
-  }, {});
 
   // Create logs from fall events - ONLY include confirmed Fall events
   // Columns: ID, Room No, Status, Date, Time
@@ -193,30 +180,58 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     }
   };
 
+  // Dynamic styles based on theme
+  const dynamicStyles = {
+    pillHeader: { backgroundColor: theme.card, padding: 12, borderRadius: 30, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
+    pillHeaderText: { fontWeight: '800', color: theme.text, marginRight: 10, fontSize: 15 },
+    roomGrid: { flexDirection: 'row', justifyContent: 'space-between', backgroundColor: theme.primary, padding: 12, borderRadius: 20, marginBottom: 20 },
+    roomBtn: { backgroundColor: theme.card, padding: 15, borderRadius: 15, flex: 1, marginHorizontal: 5, alignItems: 'center' },
+    roomBtnLabel: { fontSize: 10, color: theme.text, fontWeight: 'bold' },
+    roomBtnNum: { fontSize: 24, fontWeight: '900', color: theme.text },
+    statusCard: { backgroundColor: theme.card, padding: 20, borderRadius: 15, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 20 },
+    statusCardText: { fontSize: 18, fontWeight: '700', color: '#7CB342' },
+    gaitStatusCard: { backgroundColor: theme.card, padding: 20, borderRadius: 15, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 20, borderWidth: 1, borderColor: isDarkMode ? '#3a4a5a' : '#E8F4F8', borderStyle: 'dashed' },
+    pagination: { flexDirection: 'row', backgroundColor: isDarkMode ? theme.card : '#E0E0E0', borderRadius: 8, overflow: 'hidden' },
+    paginationText: { color: theme.text, fontWeight: '600', fontSize: 11 },
+    sortDropdown: { flexDirection: 'row', alignItems: 'center', backgroundColor: isDarkMode ? theme.card : '#E0E0E0', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 },
+    sortDropdownText: { color: theme.primary, fontWeight: '600', fontSize: 11, marginRight: 6 },
+    sortDropdownMenu: { position: 'absolute', top: '100%', right: 0, backgroundColor: theme.card, borderRadius: 8, marginTop: 4, elevation: 5, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 4, minWidth: 140 },
+    sortDropdownItemText: { color: theme.text, fontSize: 11 },
+    logsContainer: { backgroundColor: theme.card, borderRadius: 15, overflow: 'hidden' },
+    logHeaderRow: { flexDirection: 'row', backgroundColor: theme.primary, padding: 12, alignItems: 'center' },
+    logRow: { flexDirection: 'row', padding: 12, borderBottomWidth: 1, borderBottomColor: isDarkMode ? '#3a4a5a' : '#EEE', alignItems: 'center' },
+    logText: { color: theme.text, fontSize: 11 },
+    loadingContainer: { backgroundColor: theme.card, padding: 20, borderRadius: 15, alignItems: 'center' },
+    loadingText: { color: theme.textSecondary, marginTop: 10 },
+    emptyState: { backgroundColor: theme.card, padding: 30, borderRadius: 15, alignItems: 'center' },
+    emptyStateText: { color: theme.textSecondary, fontWeight: '600', fontSize: 16 },
+    emptyStateSubtext: { color: theme.textSecondary, marginTop: 5, fontSize: 12 },
+  };
+
   return (
     <View>
-      <View style={styles.pillHeader}>
-        <Text style={styles.pillHeaderText}>SELECT CAMERA</Text>
-        <FontAwesomeIcon icon={faCamera} color="#1E3A5F" size={16}/>
+      <View style={dynamicStyles.pillHeader}>
+        <Text style={dynamicStyles.pillHeaderText}>SELECT CAMERA</Text>
+        <FontAwesomeIcon icon={faCamera} color={theme.text} size={16}/>
       </View>
-      <View style={styles.roomGrid}>
+      <View style={dynamicStyles.roomGrid}>
         {[1, 2, 3].map(r => (
-          <TouchableOpacity key={r} style={styles.roomBtn} onPress={() => { setMonitoringRoom(r); setScreen('LiveView'); }}>
-            <Text style={styles.roomBtnLabel}>ROOM</Text>
-            <Text style={styles.roomBtnNum}>{r}</Text>
+          <TouchableOpacity key={r} style={dynamicStyles.roomBtn} onPress={() => { setMonitoringRoom(r); setScreen('LiveView'); }}>
+            <Text style={dynamicStyles.roomBtnLabel}>ROOM</Text>
+            <Text style={dynamicStyles.roomBtnNum}>{r}</Text>
           </TouchableOpacity>
         ))}
       </View>
       
-      <View style={styles.pillHeader}>
-        <Text style={styles.pillHeaderText}>LIVE FALL ALERTS</Text>
-        <FontAwesomeIcon icon={faTriangleExclamation} color="#1E3A5F" size={16}/>
+      <View style={dynamicStyles.pillHeader}>
+        <Text style={dynamicStyles.pillHeaderText}>LIVE FALL ALERTS</Text>
+        <FontAwesomeIcon icon={faTriangleExclamation} color={theme.text} size={16}/>
       </View>
       
       {/* Fall Alert Status Card */}
-      <View style={[styles.statusCard, hasActiveFall && styles.statusCardAlert]}>
+      <View style={[dynamicStyles.statusCard, hasActiveFall && styles.statusCardAlert]}>
         <View style={[styles.statusDot, hasActiveFall && styles.redDot]} />
-        <Text style={[styles.statusCardText, hasActiveFall && styles.statusCardTextAlert]}>
+        <Text style={[dynamicStyles.statusCardText, hasActiveFall && styles.statusCardTextAlert]}>
           {hasActiveFall ? `Active Fall${activeFallCount > 1 ? 's' : ''} Detected!` : 'No Active Falls'}
         </Text>
         {hasActiveFall && (
@@ -224,15 +239,27 @@ export default function Home({ setScreen, setMonitoringRoom }) {
         )}
       </View>
 
+      {/* Live Gait Alerts Placeholder */}
+      <View style={dynamicStyles.pillHeader}>
+        <Text style={dynamicStyles.pillHeaderText}>LIVE GAIT ALERTS</Text>
+        <FontAwesomeIcon icon={faPersonWalking} color={theme.text} size={16}/>
+      </View>
+      
+      {/* Gait Alert Status Card - Placeholder */}
+      <View style={dynamicStyles.gaitStatusCard}>
+        <View style={styles.gaitStatusDot} />
+        <Text style={styles.gaitStatusCardText}>No Bad Gait Alerts</Text>
+      </View>
+
       {/* Recent Logs Section */}
-      <View style={styles.pillHeader}>
-        <Text style={styles.pillHeaderText}>RECENT LOGS</Text>
+      <View style={dynamicStyles.pillHeader}>
+        <Text style={dynamicStyles.pillHeaderText}>RECENT LOGS</Text>
       </View>
       
       {/* Filter Bar: Pagination on left, Sort dropdown on right */}
       <View style={styles.filterBar}>
         {/* Room Pagination */}
-        <View style={styles.pagination}>
+        <View style={dynamicStyles.pagination}>
           {[1, 2, 3].map((room) => (
             <TouchableOpacity 
               key={room} 
@@ -240,12 +267,12 @@ export default function Home({ setScreen, setMonitoringRoom }) {
                 styles.paginationItem,
                 room === 1 && styles.paginationFirst,
                 room === 3 && styles.paginationLast,
-                roomFilter === room && styles.paginationActive
+                roomFilter === room && { backgroundColor: theme.primary }
               ]}
               onPress={() => handleRoomFilter(room)}
             >
               <Text style={[
-                styles.paginationText,
+                dynamicStyles.paginationText,
                 roomFilter === room && styles.paginationTextActive
               ]}>Room {room}</Text>
             </TouchableOpacity>
@@ -255,21 +282,21 @@ export default function Home({ setScreen, setMonitoringRoom }) {
         {/* Sort Dropdown */}
         <View style={styles.sortDropdownContainer}>
           <TouchableOpacity 
-            style={styles.sortDropdown}
+            style={dynamicStyles.sortDropdown}
             onPress={() => setShowSortDropdown(!showSortDropdown)}
           >
-            <Text style={styles.sortDropdownText}>{currentSortLabel}</Text>
-            <FontAwesomeIcon icon={faChevronDown} size={12} color="#1E3A5F" />
+            <Text style={dynamicStyles.sortDropdownText}>{currentSortLabel}</Text>
+            <FontAwesomeIcon icon={faChevronDown} size={12} color={theme.primary} />
           </TouchableOpacity>
           
           {showSortDropdown && (
-            <View style={styles.sortDropdownMenu}>
+            <View style={dynamicStyles.sortDropdownMenu}>
               {sortOptions.map((option) => (
                 <TouchableOpacity
                   key={option.value}
                   style={[
                     styles.sortDropdownItem,
-                    sortType === option.value && styles.sortDropdownItemActive
+                    sortType === option.value && { backgroundColor: isDarkMode ? '#1a3a5a' : '#E8F4FD' }
                   ]}
                   onPress={() => {
                     setSortType(option.value);
@@ -277,8 +304,8 @@ export default function Home({ setScreen, setMonitoringRoom }) {
                   }}
                 >
                   <Text style={[
-                    styles.sortDropdownItemText,
-                    sortType === option.value && styles.sortDropdownItemTextActive
+                    dynamicStyles.sortDropdownItemText,
+                    sortType === option.value && { color: theme.primary, fontWeight: '600' }
                   ]}>{option.label}</Text>
                 </TouchableOpacity>
               ))}
@@ -289,14 +316,14 @@ export default function Home({ setScreen, setMonitoringRoom }) {
 
       {/* Recent Logs List - Room No, Status, Date, Time */}
       {isLoading ? (
-        <View style={styles.loadingContainer}>
-          <ActivityIndicator size="small" color="#1E3A5F" />
-          <Text style={styles.loadingText}>Loading logs...</Text>
+        <View style={dynamicStyles.loadingContainer}>
+          <ActivityIndicator size="small" color={theme.primary} />
+          <Text style={dynamicStyles.loadingText}>Loading logs...</Text>
         </View>
       ) : recentLogs.length > 0 ? (
-        <View style={styles.logsContainer}>
+        <View style={dynamicStyles.logsContainer}>
           {/* Header Row */}
-          <View style={styles.logHeaderRow}>
+          <View style={dynamicStyles.logHeaderRow}>
             <View style={styles.columnCenter}>
               <Text style={styles.logHeaderText}>Room No</Text>
             </View>
@@ -313,9 +340,9 @@ export default function Home({ setScreen, setMonitoringRoom }) {
           
           {/* Log Rows */}
           {recentLogs.slice(0, 10).map((log, index) => (
-            <View key={`log-${index}-${log.incidentId || 'no-id'}-${log.date}-${log.time}`} style={styles.logRow}>
+            <View key={`log-${index}-${log.incidentId || 'no-id'}-${log.date}-${log.time}`} style={dynamicStyles.logRow}>
               <View style={styles.columnCenter}>
-                <Text style={styles.logText}>{log.roomNo}</Text>
+                <Text style={dynamicStyles.logText}>{log.roomNo}</Text>
               </View>
               <View style={styles.columnCenter}>
                 <View style={[styles.tagBadge, styles.tagFall]}>
@@ -323,18 +350,18 @@ export default function Home({ setScreen, setMonitoringRoom }) {
                 </View>
               </View>
               <View style={styles.columnCenter}>
-                <Text style={styles.logText}>{log.date}</Text>
+                <Text style={dynamicStyles.logText}>{log.date}</Text>
               </View>
               <View style={styles.columnCenter}>
-                <Text style={styles.logText}>{log.time}</Text>
+                <Text style={dynamicStyles.logText}>{log.time}</Text>
               </View>
             </View>
           ))}
         </View>
       ) : (
-        <View style={styles.emptyState}>
-          <Text style={styles.emptyStateText}>No recent logs</Text>
-          <Text style={styles.emptyStateSubtext}>Fall events and Abnormal Gait will appear here</Text>
+        <View style={dynamicStyles.emptyState}>
+          <Text style={dynamicStyles.emptyStateText}>No recent logs</Text>
+          <Text style={dynamicStyles.emptyStateSubtext}>Fall events and Abnormal Gait will appear here</Text>
         </View>
       )}
       
@@ -364,6 +391,10 @@ const styles = StyleSheet.create({
   redDot: { backgroundColor: '#D32F2F' },
   statusCardText: { fontSize: 18, fontWeight: '700', color: '#7CB342' },
   statusCardTextAlert: { color: '#D32F2F' },
+  // Gait Status Card (Placeholder)
+  gaitStatusCard: { backgroundColor: '#FFF', padding: 20, borderRadius: 15, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 20, borderWidth: 1, borderColor: '#E8F4F8', borderStyle: 'dashed' },
+  gaitStatusDot: { width: 12, height: 12, borderRadius: 6, backgroundColor: '#7CB342', marginRight: 10 },
+  gaitStatusCardText: { fontSize: 18, fontWeight: '700', color: '#7CB342' },
   // Filter Bar
   filterBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 15 },
   // Pagination Style

@@ -92,6 +92,7 @@ export default function ForgotPassword() {
     setNewPassword(pass);
     let score = 0;
     if (pass.length >= 8) score++;
+    if (/[a-z]/.test(pass)) score++; // lowercase letter
     if (/[A-Z]/.test(pass)) score++;
     if (/[0-9]/.test(pass)) score++;
     if (/[^A-Za-z0-9]/.test(pass)) score++;
@@ -105,6 +106,10 @@ export default function ForgotPassword() {
     if (newPassword !== confirmPassword) { 
       Alert.alert("Error", "Passwords do not match!"); 
       return; 
+    }
+    if (!/[a-z]/.test(newPassword)) {
+      Alert.alert("Error", "Password must contain at least one lowercase letter.");
+      return;
     }
     if (strength === "Weak") { 
       Alert.alert("Error", "Password is too weak."); 

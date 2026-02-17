@@ -3,8 +3,10 @@ import { View, ActivityIndicator, Text, StyleSheet, ScrollView, TouchableOpacity
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faChevronDown } from '@fortawesome/free-solid-svg-icons';
 import api from '../services/api';
+import { useTheme } from '../context/ThemeContext';
 
 export default function Logs() {
+  const { theme, isDarkMode } = useTheme();
   const [allLogs, setAllLogs] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [roomFilter, setRoomFilter] = useState(null); // null = all rooms, 1/2/3 = specific room
@@ -109,23 +111,109 @@ export default function Logs() {
   if (isLoading) {
     return (
       <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#1E3A5F" />
-        <Text style={styles.loadingText}>Loading logs...</Text>
+        <ActivityIndicator size="large" color={theme.primary} />
+        <Text style={[styles.loadingText, { color: theme.textSecondary }]}>Loading logs...</Text>
       </View>
     );
   }
 
+  // Dynamic styles based on theme
+  const dynamicStyles = {
+    titleContainer: {
+      backgroundColor: theme.primary,
+      paddingVertical: 12,
+      paddingHorizontal: 20,
+      borderRadius: 25,
+      marginBottom: 15,
+      alignItems: 'center',
+    },
+    pagination: {
+      flexDirection: 'row',
+      backgroundColor: isDarkMode ? theme.card : '#E0E0E0',
+      borderRadius: 8,
+      overflow: 'hidden',
+    },
+    paginationText: {
+      color: theme.text,
+      fontWeight: '600',
+      fontSize: 11,
+    },
+    sortDropdown: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      backgroundColor: isDarkMode ? theme.card : '#E0E0E0',
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderRadius: 8,
+    },
+    sortDropdownText: {
+      color: theme.primary,
+      fontWeight: '600',
+      fontSize: 11,
+      marginRight: 6,
+    },
+    sortDropdownMenu: {
+      position: 'absolute',
+      top: '100%',
+      right: 0,
+      backgroundColor: theme.card,
+      borderRadius: 8,
+      marginTop: 4,
+      elevation: 5,
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 2 },
+      shadowOpacity: 0.25,
+      shadowRadius: 4,
+      minWidth: 140,
+    },
+    sortDropdownItemText: {
+      color: theme.text,
+      fontSize: 11,
+    },
+    tableContainer: {
+      backgroundColor: theme.card,
+      borderRadius: 12,
+      overflow: 'hidden',
+      elevation: 2,
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 2 },
+      shadowOpacity: 0.1,
+      shadowRadius: 4,
+    },
+    headerRow: {
+      flexDirection: 'row',
+      backgroundColor: theme.primary,
+      paddingVertical: 12,
+      paddingHorizontal: 10,
+    },
+    row: {
+      flexDirection: 'row',
+      paddingVertical: 12,
+      paddingHorizontal: 10,
+      borderBottomWidth: 1,
+      borderBottomColor: isDarkMode ? '#3a4a5a' : '#E0E0E0',
+      alignItems: 'center',
+    },
+    rowEven: {
+      backgroundColor: isDarkMode ? '#1a2a3a' : '#F8F9FA',
+    },
+    cellText: {
+      fontSize: 12,
+      color: theme.text,
+    },
+  };
+
   return (
     <View style={styles.container}>
       {/* Title */}
-      <View style={styles.titleContainer}>
+      <View style={dynamicStyles.titleContainer}>
         <Text style={styles.title}>FULL SYSTEM LOGS</Text>
       </View>
 
       {/* Filter Bar: Pagination on left, Sort dropdown on right */}
       <View style={styles.filterBar}>
         {/* Room Pagination */}
-        <View style={styles.pagination}>
+        <View style={dynamicStyles.pagination}>
           {[1, 2, 3].map((room) => (
             <TouchableOpacity 
               key={room} 
@@ -133,12 +221,12 @@ export default function Logs() {
                 styles.paginationItem,
                 room === 1 && styles.paginationFirst,
                 room === 3 && styles.paginationLast,
-                roomFilter === room && styles.paginationActive
+                roomFilter === room && { backgroundColor: theme.primary }
               ]}
               onPress={() => handleRoomFilter(room)}
             >
               <Text style={[
-                styles.paginationText,
+                dynamicStyles.paginationText,
                 roomFilter === room && styles.paginationTextActive
               ]}>Room {room}</Text>
             </TouchableOpacity>
@@ -148,21 +236,21 @@ export default function Logs() {
         {/* Sort Dropdown */}
         <View style={styles.sortDropdownContainer}>
           <TouchableOpacity 
-            style={styles.sortDropdown}
+            style={dynamicStyles.sortDropdown}
             onPress={() => setShowSortDropdown(!showSortDropdown)}
           >
-            <Text style={styles.sortDropdownText}>{currentSortLabel}</Text>
-            <FontAwesomeIcon icon={faChevronDown} size={12} color="#1E3A5F" />
+            <Text style={dynamicStyles.sortDropdownText}>{currentSortLabel}</Text>
+            <FontAwesomeIcon icon={faChevronDown} size={12} color={theme.primary} />
           </TouchableOpacity>
           
           {showSortDropdown && (
-            <View style={styles.sortDropdownMenu}>
+            <View style={dynamicStyles.sortDropdownMenu}>
               {sortOptions.map((option) => (
                 <TouchableOpacity
                   key={option.value}
                   style={[
                     styles.sortDropdownItem,
-                    sortType === option.value && styles.sortDropdownItemActive
+                    sortType === option.value && { backgroundColor: isDarkMode ? '#1a3a5a' : '#E8F4FD' }
                   ]}
                   onPress={() => {
                     setSortType(option.value);
@@ -170,8 +258,8 @@ export default function Logs() {
                   }}
                 >
                   <Text style={[
-                    styles.sortDropdownItemText,
-                    sortType === option.value && styles.sortDropdownItemTextActive
+                    dynamicStyles.sortDropdownItemText,
+                    sortType === option.value && { color: theme.primary, fontWeight: '600' }
                   ]}>{option.label}</Text>
                 </TouchableOpacity>
               ))}
@@ -181,9 +269,9 @@ export default function Logs() {
       </View>
 
       {/* Table */}
-      <View style={styles.tableContainer}>
+      <View style={dynamicStyles.tableContainer}>
         {/* Header Row */}
-        <View style={styles.headerRow}>
+        <View style={dynamicStyles.headerRow}>
           <View style={styles.columnCenter}>
             <Text style={styles.headerText}>Room No</Text>
           </View>
@@ -202,9 +290,9 @@ export default function Logs() {
         <ScrollView style={styles.scrollContainer}>
           {logs.length > 0 ? (
             logs.map((log, index) => (
-              <View key={index} style={[styles.row, index % 2 === 0 && styles.rowEven]}>
+              <View key={index} style={[dynamicStyles.row, index % 2 === 0 && dynamicStyles.rowEven]}>
                 <View style={styles.columnCenter}>
-                  <Text style={styles.cellText}>{log.roomNo}</Text>
+                  <Text style={dynamicStyles.cellText}>{log.roomNo}</Text>
                 </View>
                 <View style={styles.columnCenter}>
                   <View style={styles.statusBadge}>
@@ -212,17 +300,17 @@ export default function Logs() {
                   </View>
                 </View>
                 <View style={styles.columnCenter}>
-                  <Text style={styles.cellText}>{log.date}</Text>
+                  <Text style={dynamicStyles.cellText}>{log.date}</Text>
                 </View>
                 <View style={styles.columnCenter}>
-                  <Text style={styles.cellText}>{log.time}</Text>
+                  <Text style={dynamicStyles.cellText}>{log.time}</Text>
                 </View>
               </View>
             ))
           ) : (
             <View style={styles.emptyState}>
-              <Text style={styles.emptyText}>No fall events logged</Text>
-              <Text style={styles.emptySubtext}>Fall events will appear here when detected</Text>
+              <Text style={[styles.emptyText, { color: theme.textSecondary }]}>No fall events logged</Text>
+              <Text style={[styles.emptySubtext, { color: theme.textSecondary }]}>Fall events will appear here when detected</Text>
             </View>
           )}
         </ScrollView>

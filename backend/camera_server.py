@@ -15,6 +15,25 @@ from flask_cors import CORS
 import threading
 import os
 
+# Firebase Cloud Messaging for push notifications
+try:
+    import firebase_admin
+    from firebase_admin import credentials, messaging
+    
+    # Initialize Firebase Admin SDK
+    FIREBASE_CRED_PATH = os.path.join(os.path.dirname(__file__), "serviceAccountKey.json")
+    if os.path.exists(FIREBASE_CRED_PATH):
+        cred = credentials.Certificate(FIREBASE_CRED_PATH)
+        firebase_admin.initialize_app(cred)
+        FCM_AVAILABLE = True
+        print("✅ Firebase Cloud Messaging initialized")
+    else:
+        FCM_AVAILABLE = False
+        print("⚠️  serviceAccountKey.json not found. Push notifications disabled.")
+except ImportError:
+    FCM_AVAILABLE = False
+    print("⚠️  firebase-admin not installed. Run: pip install firebase-admin")
+
 # YOLOv11 will be imported when model is loaded
 try:
     from ultralytics import YOLO
@@ -172,7 +191,7 @@ class FallDetector:
             return frame, []
     
     def log_fall_event(self, class_name, confidence):
-        """Log a fall detection event"""
+        """Log a fall detection event and send push notification"""
         event = {
             'timestamp': datetime.now().isoformat(),
             'class': class_name,
@@ -181,9 +200,41 @@ class FallDetector:
         }
         fall_events.append(event)
         
-        # Emit alert to all connected clients
+        # Emit alert to all connected clients (WebSocket - for app in foreground)
         socketio.emit('fall_detected', event)
         print(f"🚨 FALL DETECTED: {class_name} ({confidence:.2f})")
+        
+        # Send FCM push notification (for app in background/closed)
+        if FCM_AVAILABLE:
+            try:
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title="🚨 Fall Detected!",
+                        body=f"{class_name} in {event['room']} - {confidence:.0%} confidence"
+                    ),
+                    android=messaging.AndroidConfig(
+                        priority='high',
+                        notification=messaging.AndroidNotification(
+                            channel_id='fall_alerts',
+                            priority='max',
+                            default_vibrate_timings=False,
+                            vibrate_timings_millis=[0, 500, 200, 500, 200, 500]
+                        )
+                    ),
+                    apns=messaging.APNSConfig(
+                        payload=messaging.APNSPayload(
+                            aps=messaging.Aps(
+                                sound='default',
+                                badge=1
+                            )
+                        )
+                    ),
+                    topic='fall_alerts'
+                )
+                response = messaging.send(message)
+                print(f"📱 FCM notification sent: {response}")
+            except Exception as e:
+                print(f"❌ FCM notification failed: {e}")
 
 
 class CameraStream:

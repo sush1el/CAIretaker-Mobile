@@ -16,7 +16,7 @@ from config import Config
 from database import (
     init_db, create_user, verify_user, get_user_by_email,
     update_password, create_otp, verify_otp,
-    create_resident, get_all_residents, get_resident_by_id, update_resident, delete_resident
+    get_all_users, update_user, delete_user, toggle_user_status
 )
 from email_service import send_otp_email
 
@@ -51,51 +51,13 @@ def health_check():
 @app.route('/api/auth/register', methods=['POST'])
 def register():
     """
-    Register a new user
-    
-    Request Body:
-    {
-        "full_name": "John Doe",
-        "email": "john@example.com",
-        "password": "SecurePass123!"
-    }
+    Register a new user (restricted - only Super Admin can create accounts via /api/users)
+    This endpoint is kept for backward compatibility but returns an error.
     """
-    data = request.get_json()
-    
-    # Validate input
-    required_fields = ['full_name', 'email', 'password']
-    for field in required_fields:
-        if not data.get(field):
-            return jsonify({'success': False, 'error': f'{field} is required'}), 400
-    
-    full_name = data['full_name'].strip()
-    email = data['email'].strip().lower()
-    password = data['password']
-    
-    # Validate email format
-    if '@' not in email or '.' not in email:
-        return jsonify({'success': False, 'error': 'Invalid email format'}), 400
-    
-    # Validate password strength
-    if len(password) < 8:
-        return jsonify({'success': False, 'error': 'Password must be at least 8 characters'}), 400
-    
-    # Create user
-    result = create_user(full_name, email, password)
-    
-    if result['success']:
-        # Optionally send verification email
-        # otp_result = create_otp(email, 'email_verification')
-        # if otp_result['success']:
-        #     send_otp_email(email, otp_result['otp'], 'email_verification')
-        
-        return jsonify({
-            'success': True,
-            'message': 'Account created successfully',
-            'user_id': result['user_id']
-        }), 201
-    else:
-        return jsonify(result), 400
+    return jsonify({
+        'success': False, 
+        'error': 'Self-registration is disabled. Please contact the administrator to create an account.'
+    }), 403
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
@@ -127,7 +89,8 @@ def login():
             identity=user['email'],
             additional_claims={
                 'user_id': user['id'],
-                'full_name': user['full_name']
+                'full_name': user['full_name'],
+                'role': user['role']
             }
         )
         
@@ -138,7 +101,9 @@ def login():
             'user': {
                 'id': user['id'],
                 'full_name': user['full_name'],
-                'email': user['email']
+                'email': user['email'],
+                'role': user['role'],
+                'is_active': user.get('is_active', True)
             }
         })
     else:
@@ -164,11 +129,11 @@ def forgot_password():
     user_result = get_user_by_email(email)
     
     if not user_result['success']:
-        # Don't reveal if email exists or not (security)
+        # Explicitly reject non-registered emails
         return jsonify({
-            'success': True,
-            'message': 'If this email is registered, you will receive a reset code'
-        })
+            'success': False,
+            'error': 'This email is not registered in the system'
+        }), 404
     
     # Generate OTP
     otp_result = create_otp(email, 'password_reset')
@@ -253,6 +218,14 @@ def reset_password():
             'error': 'Password must be at least 8 characters'
         }), 400
     
+    # Check for lowercase letter
+    import re
+    if not re.search(r'[a-z]', new_password):
+        return jsonify({
+            'success': False,
+            'error': 'Password must contain at least one lowercase letter'
+        }), 400
+    
     # Verify OTP first
     otp_result = verify_otp(email, otp_code, 'password_reset')
     
@@ -287,135 +260,180 @@ def get_profile():
     else:
         return jsonify(result), 404
 
-# ==================== RESIDENT ENDPOINTS ====================
+# ==================== USER MANAGEMENT ENDPOINTS (Super Admin Only) ====================
 
-@app.route('/api/residents', methods=['GET'])
-def get_residents():
+def require_super_admin():
+    """Helper decorator to check if user is super admin"""
+    from functools import wraps
+    def decorator(f):
+        @wraps(f)
+        @jwt_required()
+        def decorated_function(*args, **kwargs):
+            from flask_jwt_extended import get_jwt
+            claims = get_jwt()
+            if claims.get('role') != 'super_admin':
+                return jsonify({'success': False, 'error': 'Access denied. Super Admin privileges required.'}), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+@app.route('/api/users', methods=['GET'])
+@jwt_required()
+def get_users():
     """
-    Get all residents
+    Get all users (Super Admin only)
+    """
+    from flask_jwt_extended import get_jwt
+    claims = get_jwt()
+    if claims.get('role') != 'super_admin':
+        return jsonify({'success': False, 'error': 'Access denied. Super Admin privileges required.'}), 403
     
-    Query Parameters:
-    - include_inactive: true/false (default: false)
-    """
-    include_inactive = request.args.get('include_inactive', 'false').lower() == 'true'
-    result = get_all_residents(include_inactive)
+    result = get_all_users()
     
     if result['success']:
         return jsonify(result)
     else:
         return jsonify(result), 500
 
-@app.route('/api/residents', methods=['POST'])
-def enroll_resident():
+@app.route('/api/users', methods=['POST'])
+@jwt_required()
+def create_user_endpoint():
     """
-    Enroll a new resident
+    Create a new user (Super Admin only)
     
     Request Body:
     {
-        "resident_id": "R-001",
-        "full_name": "Juan Dela Cruz",
-        "age": 78,
-        "room_number": "1",
-        "risk_level": "High",  // optional: Low, Medium, High
-        "notes": "..."         // optional
+        "full_name": "John Doe",
+        "email": "john@example.com",
+        "password": "SecurePass123!",
+        "role": "user"  // optional: "user" (default) or "super_admin"
     }
     """
+    from flask_jwt_extended import get_jwt
+    claims = get_jwt()
+    if claims.get('role') != 'super_admin':
+        return jsonify({'success': False, 'error': 'Access denied. Super Admin privileges required.'}), 403
+    
     data = request.get_json()
     
     # Validate required fields
-    required_fields = ['resident_id', 'full_name', 'age', 'room_number']
+    required_fields = ['full_name', 'email', 'password']
     for field in required_fields:
         if not data.get(field):
             return jsonify({'success': False, 'error': f'{field} is required'}), 400
     
-    # Validate age
-    try:
-        age = int(data['age'])
-        if age < 0 or age > 150:
-            return jsonify({'success': False, 'error': 'Invalid age'}), 400
-    except ValueError:
-        return jsonify({'success': False, 'error': 'Age must be a number'}), 400
+    full_name = data['full_name'].strip()
+    email = data['email'].strip().lower()
+    password = data['password']
+    role = data.get('role', 'user')
     
-    result = create_resident(
-        resident_id=data['resident_id'].strip(),
-        full_name=data['full_name'].strip(),
-        age=age,
-        room_number=str(data['room_number']).strip(),
-        risk_level=data.get('risk_level', 'Low'),
-        notes=data.get('notes', '')
-    )
+    # Validate email format
+    if '@' not in email or '.' not in email:
+        return jsonify({'success': False, 'error': 'Invalid email format'}), 400
+    
+    # Validate password strength
+    if len(password) < 8:
+        return jsonify({'success': False, 'error': 'Password must be at least 8 characters'}), 400
+    
+    # Check for lowercase letter
+    import re
+    if not re.search(r'[a-z]', password):
+        return jsonify({'success': False, 'error': 'Password must contain at least one lowercase letter'}), 400
+    
+    # Validate role
+    if role not in ['user', 'super_admin']:
+        return jsonify({'success': False, 'error': 'Invalid role. Must be "user" or "super_admin"'}), 400
+    
+    result = create_user(full_name, email, password, role)
     
     if result['success']:
-        return jsonify(result), 201
+        return jsonify({
+            'success': True,
+            'message': 'User created successfully',
+            'user_id': result['user_id']
+        }), 201
     else:
         return jsonify(result), 400
 
-@app.route('/api/residents/<resident_id>', methods=['GET'])
-def get_resident(resident_id):
-    """Get a specific resident by ID"""
-    result = get_resident_by_id(resident_id)
-    
-    if result['success']:
-        return jsonify(result)
-    else:
-        return jsonify(result), 404
-
-@app.route('/api/residents/<resident_id>', methods=['PUT'])
-def update_resident_endpoint(resident_id):
+@app.route('/api/users/<int:user_id>', methods=['PUT'])
+@jwt_required()
+def update_user_endpoint(user_id):
     """
-    Update a resident's information
+    Update a user's information (Super Admin only)
     
     Request Body (all fields optional):
     {
         "full_name": "...",
-        "age": 80,
-        "room_number": "2",
-        "risk_level": "Medium",
-        "notes": "..."
+        "email": "...",
+        "role": "user"
     }
     """
+    from flask_jwt_extended import get_jwt
+    claims = get_jwt()
+    if claims.get('role') != 'super_admin':
+        return jsonify({'success': False, 'error': 'Access denied. Super Admin privileges required.'}), 403
+    
     data = request.get_json()
     
     # Prepare update data
     update_data = {}
     if 'full_name' in data:
         update_data['full_name'] = data['full_name'].strip()
-    if 'age' in data:
-        try:
-            update_data['age'] = int(data['age'])
-        except ValueError:
-            return jsonify({'success': False, 'error': 'Age must be a number'}), 400
-    if 'room_number' in data:
-        update_data['room_number'] = str(data['room_number']).strip()
-    if 'risk_level' in data:
-        if data['risk_level'] not in ['Low', 'Medium', 'High']:
-            return jsonify({'success': False, 'error': 'Invalid risk level'}), 400
-        update_data['risk_level'] = data['risk_level']
-    if 'notes' in data:
-        update_data['notes'] = data['notes']
+    if 'email' in data:
+        update_data['email'] = data['email'].strip().lower()
+    if 'role' in data:
+        if data['role'] not in ['user', 'super_admin']:
+            return jsonify({'success': False, 'error': 'Invalid role'}), 400
+        update_data['role'] = data['role']
     
-    result = update_resident(resident_id, **update_data)
+    result = update_user(user_id, **update_data)
     
     if result['success']:
         return jsonify(result)
     else:
         return jsonify(result), 400
 
-@app.route('/api/residents/<resident_id>', methods=['DELETE'])
-def delete_resident_endpoint(resident_id):
-    """
-    Delete a resident
+@app.route('/api/users/<int:user_id>', methods=['DELETE'])
+@jwt_required()
+def delete_user_endpoint(user_id):
+    """Delete a user (Super Admin only)"""
+    from flask_jwt_extended import get_jwt
+    claims = get_jwt()
+    if claims.get('role') != 'super_admin':
+        return jsonify({'success': False, 'error': 'Access denied. Super Admin privileges required.'}), 403
     
-    Query Parameters:
-    - hard: true/false (default: false for soft delete)
-    """
-    hard_delete = request.args.get('hard', 'false').lower() == 'true'
-    result = delete_resident(resident_id, hard_delete)
+    result = delete_user(user_id)
     
     if result['success']:
         return jsonify(result)
     else:
-        return jsonify(result), 404
+        return jsonify(result), 400
+
+@app.route('/api/users/<int:user_id>/status', methods=['PUT'])
+@jwt_required()
+def toggle_user_status_endpoint(user_id):
+    """
+    Enable or disable a user account (Super Admin only)
+    
+    Request Body:
+    {
+        "is_active": true/false
+    }
+    """
+    from flask_jwt_extended import get_jwt
+    claims = get_jwt()
+    if claims.get('role') != 'super_admin':
+        return jsonify({'success': False, 'error': 'Access denied. Super Admin privileges required.'}), 403
+    
+    data = request.get_json()
+    is_active = data.get('is_active', True)
+    
+    result = toggle_user_status(user_id, is_active)
+    
+    if result['success']:
+        return jsonify(result)
+    else:
+        return jsonify(result), 400
 
 # ==================== SOCKET.IO EVENTS ====================
 

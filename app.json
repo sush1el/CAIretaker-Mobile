@@ -3,7 +3,7 @@
     "name": "CAIretaker-Mobile",
     "slug": "CAIretaker-Mobile",
     "version": "1.0.0",
-    "scheme": "cairetakerapp",  
+    "scheme": "cairetakerapp",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
