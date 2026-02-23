@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView, Vibration } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView, Vibration, Modal, Dimensions, StatusBar } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faCamera, faChevronLeft, faChevronRight, faRefresh, faVideoCamera, faExclamationTriangle, faChartBar } from '@fortawesome/free-solid-svg-icons';
+import { faCamera, faChevronLeft, faChevronRight, faRefresh, faVideoCamera, faExclamationTriangle, faChartBar, faExpand, faCompress } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
 import api from '../services/api';
 import { useTheme } from '../context/ThemeContext';
@@ -18,6 +18,7 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [fallLogs, setFallLogs] = useState([]); // Persistent fall event logs
   const [isVibrating, setIsVibrating] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const vibrationActiveRef = useRef(false);
 
   // Stop vibration (can be called manually or automatically)
@@ -288,6 +289,12 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
             <Text style={styles.stopAlertText}>STOP ALERT</Text>
           </TouchableOpacity>
         )}
+        <TouchableOpacity 
+          style={styles.fullscreenButton} 
+          onPress={() => setIsFullscreen(true)}
+        >
+          <FontAwesomeIcon icon={faExpand} color="#FFF" size={16} />
+        </TouchableOpacity>
       </View>
     );
   };
@@ -310,8 +317,63 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
     }
   };
 
+  // Fullscreen modal
+  const renderFullscreenModal = () => {
+    const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
+    return (
+      <Modal
+        visible={isFullscreen}
+        animationType="fade"
+        supportedOrientations={['portrait', 'landscape']}
+        statusBarTranslucent
+        onRequestClose={() => setIsFullscreen(false)}
+      >
+        <StatusBar hidden={isFullscreen} />
+        <View style={styles.fullscreenOverlay}>
+          <View style={[
+            styles.fullscreenStreamContainer,
+            { width: screenHeight, height: screenWidth, transform: [{ rotate: '90deg' }] }
+          ]}>
+            <WebView
+              key={`fs-${streamKey}`}
+              source={{ uri: api.getCameraStreamUrl() }}
+              style={styles.fullscreenStream}
+              javaScriptEnabled={false}
+              scrollEnabled={false}
+              bounces={false}
+              onError={(e) => console.log('Fullscreen WebView error:', e.nativeEvent)}
+            />
+            <View style={styles.fullscreenTopBar}>
+              <View style={styles.fullscreenLiveBadge}>
+                <View style={[styles.innerDot, { backgroundColor: '#4CAF50' }]} />
+                <Text style={styles.fullscreenLiveText}>LIVE</Text>
+              </View>
+              <Text style={styles.fullscreenRoomText}>ROOM {monitoringRoom}</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.fullscreenCloseButton}
+              onPress={() => setIsFullscreen(false)}
+            >
+              <FontAwesomeIcon icon={faCompress} color="#FFF" size={20} />
+            </TouchableOpacity>
+            {isVibrating && (
+              <TouchableOpacity 
+                style={styles.fullscreenStopAlert} 
+                onPress={stopVibration}
+              >
+                <FontAwesomeIcon icon={faExclamationTriangle} color="#FFF" size={16} />
+                <Text style={styles.stopAlertText}>STOP ALERT</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
   return (
     <View>
+      {renderFullscreenModal()}
       <View style={styles.liveMetaRow}>
         <View style={styles.liveBadge}>
           <View style={[styles.innerDot, { backgroundColor: cameraStatus?.camera_running ? '#4CAF50' : '#F44336' }]} />
@@ -419,6 +481,16 @@ const styles = StyleSheet.create({
   modelWarningText: { color: '#FFA000', fontSize: 10, marginLeft: 5 },
   stopAlertButton: { position: 'absolute', top: 10, right: 10, flexDirection: 'row', alignItems: 'center', backgroundColor: '#D32F2F', paddingHorizontal: 15, paddingVertical: 10, borderRadius: 20 },
   stopAlertText: { color: '#FFF', fontWeight: 'bold', fontSize: 12, marginLeft: 8 },
+  fullscreenButton: { position: 'absolute', bottom: 10, right: 10, backgroundColor: 'rgba(0,0,0,0.6)', padding: 10, borderRadius: 12 },
+  fullscreenOverlay: { flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' },
+  fullscreenStreamContainer: { position: 'relative' },
+  fullscreenStream: { flex: 1, backgroundColor: '#000' },
+  fullscreenTopBar: { position: 'absolute', top: 15, left: 15, flexDirection: 'row', alignItems: 'center' },
+  fullscreenLiveBadge: { backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, flexDirection: 'row', alignItems: 'center', marginRight: 10 },
+  fullscreenLiveText: { color: '#FFF', fontWeight: 'bold', fontSize: 12 },
+  fullscreenRoomText: { color: '#FFF', fontWeight: 'bold', fontSize: 14, textShadowColor: 'rgba(0,0,0,0.8)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
+  fullscreenCloseButton: { position: 'absolute', bottom: 15, right: 15, backgroundColor: 'rgba(0,0,0,0.6)', padding: 12, borderRadius: 14 },
+  fullscreenStopAlert: { position: 'absolute', top: 15, right: 15, flexDirection: 'row', alignItems: 'center', backgroundColor: '#D32F2F', paddingHorizontal: 15, paddingVertical: 10, borderRadius: 20 },
   liveMetaRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15, alignItems: 'center' },
   liveBadge: { backgroundColor: '#1E3A5F', paddingHorizontal: 15, paddingVertical: 5, borderRadius: 20, flexDirection: 'row', alignItems: 'center' },
   innerDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },

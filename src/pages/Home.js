@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Modal, Dimensions, StatusBar } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faCamera, faTriangleExclamation, faExclamationCircle, faChevronDown, faPersonWalking, faArrowLeft, faRefresh, faVideoCamera } from '@fortawesome/free-solid-svg-icons';
+import { faCamera, faTriangleExclamation, faExclamationCircle, faChevronDown, faPersonWalking, faArrowLeft, faRefresh, faVideoCamera, faExpand, faCompress } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
 import api from '../services/api';
 import { useTheme } from '../context/ThemeContext';
@@ -23,6 +23,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const [cameraStatus, setCameraStatus] = useState(null);
   const [streamKey, setStreamKey] = useState(0);
   const [isStreamLoading, setIsStreamLoading] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   // Fetch residents and fall events on mount
   useEffect(() => {
@@ -264,7 +265,57 @@ export default function Home({ setScreen, setMonitoringRoom }) {
           bounces={false}
           onError={(e) => console.log('WebView error:', e.nativeEvent)}
         />
+        <TouchableOpacity 
+          style={styles.fullscreenButton} 
+          onPress={() => setIsFullscreen(true)}
+        >
+          <FontAwesomeIcon icon={faExpand} color="#FFF" size={16} />
+        </TouchableOpacity>
       </View>
+    );
+  };
+
+  const renderFullscreenModal = () => {
+    const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
+    return (
+      <Modal
+        visible={isFullscreen}
+        animationType="fade"
+        supportedOrientations={['portrait', 'landscape']}
+        statusBarTranslucent
+        onRequestClose={() => setIsFullscreen(false)}
+      >
+        <StatusBar hidden={isFullscreen} />
+        <View style={styles.fullscreenOverlay}>
+          <View style={[
+            styles.fullscreenStreamContainer,
+            { width: screenHeight, height: screenWidth, transform: [{ rotate: '90deg' }] }
+          ]}>
+            <WebView
+              key={`fs-${streamKey}`}
+              source={{ uri: api.getCameraStreamUrl() }}
+              style={styles.fullscreenStream}
+              javaScriptEnabled={false}
+              scrollEnabled={false}
+              bounces={false}
+              onError={(e) => console.log('Fullscreen WebView error:', e.nativeEvent)}
+            />
+            <View style={styles.fullscreenTopBar}>
+              <View style={styles.fullscreenLiveBadge}>
+                <View style={[styles.innerDot, { backgroundColor: '#4CAF50' }]} />
+                <Text style={styles.fullscreenLiveText}>LIVE</Text>
+              </View>
+              <Text style={styles.fullscreenRoomText}>ROOM {selectedRoom}</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.fullscreenCloseButton}
+              onPress={() => setIsFullscreen(false)}
+            >
+              <FontAwesomeIcon icon={faCompress} color="#FFF" size={20} />
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     );
   };
 
@@ -304,6 +355,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
 
   return (
     <View>
+      {renderFullscreenModal()}
       <View style={dynamicStyles.pillHeader}>
         <Text style={dynamicStyles.pillHeaderText}>{selectedRoom ? 'LIVE MONITORING' : 'SELECT CAMERA'}</Text>
         <FontAwesomeIcon icon={faCamera} color={theme.text} size={16} />
@@ -528,6 +580,15 @@ const styles = StyleSheet.create({
   expansionText: { color: '#666', fontSize: 12, marginTop: 4 },
   startButton: { marginTop: 15, backgroundColor: '#1E3A5F', paddingHorizontal: 20, paddingVertical: 10, borderRadius: 20 },
   startButtonText: { color: '#FFF', fontWeight: 'bold' },
+  fullscreenButton: { position: 'absolute', bottom: 10, right: 10, backgroundColor: 'rgba(0,0,0,0.6)', padding: 10, borderRadius: 12 },
+  fullscreenOverlay: { flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' },
+  fullscreenStreamContainer: { position: 'relative' },
+  fullscreenStream: { flex: 1, backgroundColor: '#000' },
+  fullscreenTopBar: { position: 'absolute', top: 15, left: 15, flexDirection: 'row', alignItems: 'center' },
+  fullscreenLiveBadge: { backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, flexDirection: 'row', alignItems: 'center', marginRight: 10 },
+  fullscreenLiveText: { color: '#FFF', fontWeight: 'bold', fontSize: 12 },
+  fullscreenRoomText: { color: '#FFF', fontWeight: 'bold', fontSize: 14, textShadowColor: 'rgba(0,0,0,0.8)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
+  fullscreenCloseButton: { position: 'absolute', bottom: 15, right: 15, backgroundColor: 'rgba(0,0,0,0.6)', padding: 12, borderRadius: 14 },
   // Filter Bar
   filterBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 15 },
   // Pagination Style
