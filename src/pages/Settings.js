@@ -1,15 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import { View, Text, Switch, TouchableOpacity, StyleSheet, Alert, ActivityIndicator } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faGear, faBrain, faMicrochip, faRotateRight, faPowerOff } from '@fortawesome/free-solid-svg-icons';
+import { faGear, faBrain, faMicrochip, faRotateRight, faPowerOff, faArrowsRotate } from '@fortawesome/free-solid-svg-icons';
 import api from '../services/api';
 import { useTheme } from '../context/ThemeContext';
 
 export default function Settings({ highSensitivity, setHighSensitivity, privacyMask, setPrivacyMask }) {
   const [isRebooting, setIsRebooting] = useState(false);
   const [isShuttingDown, setIsShuttingDown] = useState(false);
+  const [isRestarting, setIsRestarting] = useState(false);
   const { theme } = useTheme();
   const [piStatus, setPiStatus] = useState('Checking...');
+  const [systemStats, setSystemStats] = useState(null);
 
   // Poll Pi health status every 3 seconds
   useEffect(() => {
@@ -22,8 +24,14 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
             setPiStatus('Active');
             setIsRebooting(false);
             setIsShuttingDown(false);
+
+            const statsResult = await api.getSystemStats();
+            if (statsResult.ok && statsResult.data && statsResult.data.success) {
+              setSystemStats(statsResult.data.stats);
+            }
           } else {
             setPiStatus(isRebooting ? 'Rebooting...' : isShuttingDown ? 'Shut Down' : 'Offline');
+            setSystemStats(null);
           }
         }
       } catch (e) {
@@ -103,6 +111,36 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
     );
   };
 
+  const handleRestartServices = () => {
+    Alert.alert(
+      'Restart Services',
+      'This will restart the backend services to apply code changes. The system will be briefly unavailable.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Restart',
+          style: 'destructive',
+          onPress: async () => {
+            setIsRestarting(true);
+            try {
+              const result = await api.restartServices();
+              if (result.ok) {
+                setPiStatus('Restarting...');
+                Alert.alert('Restarting', 'Services are restarting. They will be available again in a few seconds.');
+              } else {
+                Alert.alert('Error', result.data?.error || 'Failed to restart services.');
+              }
+            } catch (error) {
+              Alert.alert('Error', 'Could not connect to the server.');
+            } finally {
+              setIsRestarting(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
   return (
     <View>
       <View style={dynamicStyles.pillHeader}>
@@ -135,6 +173,18 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
             )}
           </TouchableOpacity>
           <TouchableOpacity
+            style={styles.settingsRow}
+            onPress={handleRestartServices}
+            disabled={isRestarting}
+          >
+            <Text style={styles.settingsLabel}>Restart Services</Text>
+            {isRestarting ? (
+              <ActivityIndicator size="small" color="#FF9800" />
+            ) : (
+              <FontAwesomeIcon icon={faArrowsRotate} color="#FF9800" size={14} />
+            )}
+          </TouchableOpacity>
+          <TouchableOpacity
             style={[styles.settingsRow, { borderBottomWidth: 0 }]}
             onPress={handleShutdown}
             disabled={isShuttingDown}
@@ -147,6 +197,27 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
             )}
           </TouchableOpacity>
         </View>
+
+        {systemStats && (
+          <View style={[styles.settingsCard, { marginTop: 15, paddingVertical: 10, paddingHorizontal: 20 }]}>
+            <View style={[styles.settingsRow, { marginBottom: 10 }]}>
+              <Text style={styles.settingsLabel}>CPU Usage</Text>
+              <Text style={{ fontWeight: '600', color: '#1E3A5F' }}>{systemStats.cpu_usage}%</Text>
+            </View>
+            <View style={[styles.settingsRow, { marginBottom: 10 }]}>
+              <Text style={styles.settingsLabel}>Memory Usage</Text>
+              <Text style={{ fontWeight: '600', color: '#1E3A5F' }}>{systemStats.memory_percent}%</Text>
+            </View>
+            <View style={[styles.settingsRow, { marginBottom: 10 }]}>
+              <Text style={styles.settingsLabel}>CPU Temp</Text>
+              <Text style={{ fontWeight: '600', color: '#1E3A5F' }}>{systemStats.temperature}{systemStats.temperature !== 'N/A' ? '°C' : ''}</Text>
+            </View>
+            <View style={[styles.settingsRow, { marginBottom: 0, borderBottomWidth: 0 }]}>
+              <Text style={styles.settingsLabel}>Input Voltage</Text>
+              <Text style={{ fontWeight: '600', color: '#1E3A5F' }}>{systemStats.voltage}</Text>
+            </View>
+          </View>
+        )}
       </View>
     </View>
   );

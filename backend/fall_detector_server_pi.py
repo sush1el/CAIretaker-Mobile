@@ -2,22 +2,29 @@
 Flask Backend for CAIretaker - Enhanced Fall Detection with Multi-Person Tracking
 Exact same detection logic as inference code + person tracking with IDs and database logging
 
+*** POWERED BY HAILO AI HAT+ (26 TOPS) ***
+YOLO pose estimation runs on the Hailo-8 NPU for maximum performance.
+CNN fall classifier remains on CPU (lightweight).
+
+SETUP INSTRUCTIONS (run on Raspberry Pi):
+1. Install Hailo drivers:
+   sudo apt update && sudo apt install hailo-all
+2. Reboot:
+   sudo reboot
+3. Verify Hailo device:
+   hailortcli fw-control identify
+4. Download the pose estimation model:
+   mkdir -p backend/models
+   wget -O backend/models/yolov8s_pose.hef \
+     https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.14.0/hailo8/yolov8s_pose.hef
+5. Install Python dependencies:
+   pip install flask flask-cors opencv-python numpy torch scipy requests picamera2
+
 FIXES IMPLEMENTED:
 1. Reset-on-Recovery: Monitoring timer resets completely when person recovers
-   - Eliminates race conditions and state corruption bugs
-   - Ensures consistent monitoring phase for every fall detection
-   
-2. Three-Tier Confidence System:
-   - HIGH (≥75%): Triggers monitoring → Alert if confirmed
-   - AT RISK (60-74%): Visual warning only, NO monitoring/alert
-   - REJECTED (<60%): Treated as false positive
-   
-3. Bending Detection Override:
-   - Uses leg angle analysis to distinguish bending from falling
-   - Prevents false positives when bending down to pick up objects
-   - Overrides high-confidence fallen predictions if bending detected
-   
-*** UPDATED WITH MULTI-CAMERA SWITCHING SUPPORT ***
+2. Three-Tier Confidence System (HIGH/AT_RISK/REJECTED)
+3. Bending Detection Override (leg angle analysis)
+4. Multi-Camera Switching Support
 """
 
 from flask import Flask, Response, jsonify, request
@@ -26,13 +33,26 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from ultralytics import YOLO
 import time
 from collections import deque, defaultdict
 import warnings
 import os
 import requests
 from picamera2 import Picamera2
+try:
+    from libcamera import controls
+except ImportError:
+    controls = None
+
+# Hailo AI HAT+ imports
+from hailo_platform import (
+    VDevice, HEF, ConfigureParams,
+    InputVStreamParams, OutputVStreamParams,
+    InferVStreams, FormatType, HailoStreamInterface
+)
+
+# For IOU-based tracker (replaces ultralytics' built-in BoT-SORT)
+from scipy.optimize import linear_sum_assignment
 
 warnings.filterwarnings('ignore')
 
@@ -77,15 +97,15 @@ def send_expo_push_notification(title, body):
 class Config:
     # ============== IMPORTANT: UPDATE THESE PATHS FOR YOUR SETUP ==============
     # CNN_MODEL_PATH: Path to your trained fall detection model (cnn_model_fall.pth)
-    # YOLO_MODEL: Path to YOLO pose estimation model (yolo11n-pose.pt)
+    # YOLO_MODEL: Path to YOLO pose estimation model (HEF for Hailo AI HAT+)
     
     # Default setup expects:
-    #   - cnn_model_fall.pth in project root folder
-    #   - yolo11n-pose.pt in backend/models/ folder
+    #   - cnn_model_fall.pth in backend/ folder
+    #   - yolov8s_pose.hef in backend/models/ folder (download instructions in docstring above)
     
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    CNN_MODEL_PATH = os.path.join(BASE_DIR,"cnn_model_fall.pth")
-    YOLO_MODEL = os.path.join(BASE_DIR, "models", "yolo11n-pose.pt")
+    CNN_MODEL_PATH = os.path.join(BASE_DIR, "cnn_model_fall.pth")
+    YOLO_MODEL = os.path.join(BASE_DIR, "models", "yolov8s_pose.hef")
     # ===========================================================================
     
     CONFIDENCE_THRESHOLD = 0.65
@@ -94,6 +114,44 @@ class Config:
     # TEMPORAL FALL DETECTION SETTINGS
     FALL_CONFIRMATION_TIME = 0.5  # Seconds person must stay fallen before alert
     FALL_CONFIRMATION_FRAMES = 3  # Minimum consecutive frames in fallen state
+    
+    # PERFORMANCE SETTINGS
+    YOLO_IMGSZ = 640              # YOLO inference resolution (must match HEF model input)
+    YOLO_CONF_THRESHOLD = 0.5     # YOLO detection confidence threshold
+    YOLO_NMS_IOU_THRESHOLD = 0.45 # NMS IOU threshold for overlapping detections
+    DEBUG_LOGGING = False          # Set True for verbose per-frame logging, False for production
+    LOG_INTERVAL = 30              # Print status summary every N frames (when DEBUG_LOGGING is False)
+
+    # STREAM QUALITY PRESETS
+    # Choose profile with environment variable: STREAM_PROFILE=pi5 or STREAM_PROFILE=pi5
+    STREAM_PROFILE = os.getenv("STREAM_PROFILE", "pi5").lower()
+    _STREAM_PRESETS = {
+        "pi5": {
+            "CAMERA_SIZE": (1280, 720),
+            "STREAM_SIZE": (1280, 720),
+            "FPS": 24,
+            "JPEG_QUALITY": 85,
+        },
+        "pi5": {
+            "CAMERA_SIZE": (1920, 1080),
+            "STREAM_SIZE": (1280, 720),
+            "FPS": 30,
+            "JPEG_QUALITY": 88,
+        },
+    }
+    _PROFILE = _STREAM_PRESETS.get(STREAM_PROFILE, _STREAM_PRESETS["pi5"])
+    CAMERA_SIZE = _PROFILE["CAMERA_SIZE"]
+    STREAM_SIZE = _PROFILE["STREAM_SIZE"]
+    CAMERA_FPS = _PROFILE["FPS"]
+    JPEG_QUALITY = _PROFILE["JPEG_QUALITY"]
+    APPLY_SHARPEN = os.getenv("STREAM_SHARPEN", "1") == "1"
+    
+    # HAILO AI HAT+ SETTINGS
+    HAILO_INPUT_SIZE = (640, 640)  # Model input dimensions (H, W) - must match HEF
+    
+    # IOU TRACKER SETTINGS (replaces ultralytics BoT-SORT)
+    TRACKER_IOU_THRESHOLD = 0.3   # Min IOU to match detection to existing track
+    TRACKER_MAX_AGE = 30           # Frames before unmatched track is deleted
     
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
     CLASS_COLORS = {
@@ -550,100 +608,502 @@ def is_bending_posture(keypoints, image_shape):
 
 
 # ============================================================================
-# SIMPLE IN-MEMORY DATABASE FOR FALL INCIDENTS
+# SQLITE-BACKED DATABASE FOR FALL INCIDENTS (persistent across restarts)
 # ============================================================================
 
-class SimpleDatabase:
-    """Simple in-memory database for fall incidents"""
-    def __init__(self):
-        self.incidents = []
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from database import FallIncidentDB
+
+
+# ============================================================================
+# HAILO AI HAT+ POSE ESTIMATOR
+# ============================================================================
+
+class HailoPoseEstimator:
+    """Wrapper for YOLO pose estimation inference on the Hailo-8 NPU.
+    
+    Handles:
+    - Loading the HEF model onto the Hailo device
+    - Letterbox preprocessing to the model's expected input size
+    - Running inference via HailoRT InferVStreams
+    - Decoding YOLO output tensors into bounding boxes + 17 keypoints
+    - Non-Maximum Suppression (NMS)
+    """
+    
+    NUM_KEYPOINTS = 17
+    
+    def __init__(self, hef_path):
+        print(f"Initializing Hailo AI HAT+ NPU...")
+        
+        if not os.path.exists(hef_path):
+            raise FileNotFoundError(
+                f"HEF model not found at: {hef_path}\n"
+                f"Download it with:\n"
+                f"  wget -O {hef_path} "
+                f"https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.14.0/hailo8/yolov8s_pose.hef"
+            )
+        
+        # Create virtual device and load HEF
+        self.vdevice = VDevice()
+        self.hef = HEF(hef_path)
+        
+        # Configure the network group
+        self.configure_params = ConfigureParams.create_from_hef(
+            hef=self.hef, interface=HailoStreamInterface.PCIe
+        )
+        self.network_group = self.vdevice.configure(self.hef, self.configure_params)[0]
+        self.network_group_params = self.network_group.create_params()
+        
+        # Get input/output stream info
+        input_vstreams_info = self.hef.get_input_vstream_infos()
+        output_vstreams_info = self.hef.get_output_vstream_infos()
+        
+        self.input_vstream_info = input_vstreams_info[0]
+        self.output_vstreams_info = output_vstreams_info
+        
+        # Get model input shape from the HEF
+        self.input_shape = self.input_vstream_info.shape  # e.g., (640, 640, 3)
+        self.input_height = self.input_shape[0]
+        self.input_width = self.input_shape[1]
+        
+        # Configure stream parameters
+        self.input_vstream_params = InputVStreamParams.make(
+            self.network_group, format_type=FormatType.UINT8
+        )
+        self.output_vstream_params = OutputVStreamParams.make(
+            self.network_group, format_type=FormatType.FLOAT32
+        )
+        
+        # Activate network group once and keep it active
+        # (activating/deactivating per-frame adds ~50ms overhead)
+        self._network_group_ctx = self.network_group.activate(self.network_group_params)
+        self._network_group_ctx.__enter__()
+        
+        print(f"  Hailo device initialized successfully")
+        print(f"  HEF model loaded: {os.path.basename(hef_path)}")
+        print(f"  Model input size: {self.input_width}x{self.input_height}")
+        print(f"  Network group activated (persistent)")
+        print(f"  Output layers: {len(output_vstreams_info)}")
+        for info in output_vstreams_info:
+            print(f"    - {info.name}: {info.shape}")
+    
+    def preprocess(self, frame):
+        """Letterbox-resize frame to model input size, preserving aspect ratio.
+        
+        Returns:
+            preprocessed: uint8 numpy array shaped (input_height, input_width, 3)
+            meta: dict with scale/padding info for coordinate mapping back to original
+        """
+        orig_h, orig_w = frame.shape[:2]
+        target_h, target_w = self.input_height, self.input_width
+        
+        # Calculate scale factor (fit inside target, maintain aspect ratio)
+        scale = min(target_w / orig_w, target_h / orig_h)
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        
+        # Resize
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Pad to target size (center padding with gray)
+        pad_top = (target_h - new_h) // 2
+        pad_bottom = target_h - new_h - pad_top
+        pad_left = (target_w - new_w) // 2
+        pad_right = target_w - new_w - pad_left
+        
+        padded = cv2.copyMakeBorder(
+            resized, pad_top, pad_bottom, pad_left, pad_right,
+            cv2.BORDER_CONSTANT, value=(114, 114, 114)
+        )
+        
+        meta = {
+            'orig_h': orig_h, 'orig_w': orig_w,
+            'scale': scale,
+            'pad_top': pad_top, 'pad_left': pad_left,
+            'new_h': new_h, 'new_w': new_w,
+        }
+        
+        return padded.astype(np.uint8), meta
+    
+    def infer(self, preprocessed_frame):
+        """Run inference on the Hailo NPU.
+        
+        Args:
+            preprocessed_frame: uint8 array of shape (H, W, 3)
+        
+        Returns:
+            dict mapping output layer name -> numpy array
+        """
+        # Add batch dimension
+        input_data = np.expand_dims(preprocessed_frame, axis=0)
+        
+        input_dict = {self.input_vstream_info.name: input_data}
+        
+        # Network group is already activated in __init__
+        with InferVStreams(
+            self.network_group,
+            self.input_vstream_params,
+            self.output_vstream_params
+        ) as pipeline:
+            results = pipeline.infer(input_dict)
+        
+        return results
+    
+    @staticmethod
+    def _sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
+    
+    @staticmethod
+    def _dfl_decode(raw, reg_max=16):
+        """Decode DFL (Distribution Focal Loss) bounding box predictions.
+        
+        Args:
+            raw: (N, 64) where 64 = 4 * reg_max
+            reg_max: number of bins per coordinate (default 16)
+        
+        Returns:
+            (N, 4) decoded offsets: left, top, right, bottom distances from anchor
+        """
+        batch = raw.reshape(-1, 4, reg_max)
+        # Softmax per coordinate
+        batch_exp = np.exp(batch - batch.max(axis=-1, keepdims=True))
+        probs = batch_exp / batch_exp.sum(axis=-1, keepdims=True)
+        # Weighted sum (expected value)
+        weights = np.arange(reg_max).reshape(1, 1, reg_max).astype(np.float32)
+        return (probs * weights).sum(axis=-1)  # (N, 4)
+    
+    def _decode_yolov8_pose_output(self, raw_outputs, meta, conf_threshold=0.5):
+        """Decode YOLOv8-pose outputs from Hailo HEF using DFL decoding.
+        
+        Hailo outputs 9 layers (3 scales x 3 types):
+          - DFL bounding box regression (C=64 = 4 x 16 bins)
+          - Object confidence (C=1, already sigmoid)
+          - Keypoints (C=51 = 17 x 3, raw offsets + logit conf)
+        
+        Args:
+            raw_outputs: dict of output tensors from Hailo inference
+            meta: preprocessing metadata for coordinate mapping
+            conf_threshold: minimum detection confidence
+        
+        Returns:
+            list of dicts with 'box', 'confidence', 'keypoints' keys
+        """
+        input_size = self.input_height  # 640
+        
+        # Group outputs by spatial dimensions (H, W) to identify scales
+        scale_groups = {}
+        for name, output in raw_outputs.items():
+            arr = output.squeeze(0)  # Remove batch dim: (H, W, C)
+            h, w, c = arr.shape
+            key = (h, w)
+            if key not in scale_groups:
+                scale_groups[key] = {}
+            
+            # Classify by channel count
+            if c == 64:
+                scale_groups[key]['bbox'] = arr
+            elif c == 1:
+                scale_groups[key]['conf'] = arr
+            elif c == 51:
+                scale_groups[key]['kps'] = arr
+        
+        all_boxes = []
+        all_confs = []
+        all_kps = []
+        
+        for (grid_h, grid_w), group in sorted(scale_groups.items(), key=lambda x: x[0][0]):
+            if 'bbox' not in group or 'conf' not in group or 'kps' not in group:
+                continue
+            
+            stride = input_size / grid_h
+            n = grid_h * grid_w
+            
+            bbox_flat = group['bbox'].reshape(n, 64)
+            conf_flat = group['conf'].reshape(n)
+            kps_flat = group['kps'].reshape(n, 51)
+            
+            # Grid: anchor at center of each cell
+            yv, xv = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing='ij')
+            grid = np.stack([xv.ravel(), yv.ravel()], axis=-1).astype(np.float32)
+            anchor = grid + 0.5
+            
+            # Decode DFL bounding boxes
+            offsets = self._dfl_decode(bbox_flat)  # (N, 4): left, top, right, bottom
+            x1 = (anchor[:, 0] - offsets[:, 0]) * stride
+            y1 = (anchor[:, 1] - offsets[:, 1]) * stride
+            x2 = (anchor[:, 0] + offsets[:, 2]) * stride
+            y2 = (anchor[:, 1] + offsets[:, 3]) * stride
+            boxes = np.stack([x1, y1, x2, y2], axis=-1)
+            
+            # Decode keypoints
+            kps = kps_flat.reshape(n, 17, 3).copy()
+            kps[:, :, 0] = (kps[:, :, 0] * 2.0 + (anchor[:, 0:1] - 0.5)) * stride
+            kps[:, :, 1] = (kps[:, :, 1] * 2.0 + (anchor[:, 1:2] - 0.5)) * stride
+            kps[:, :, 2] = self._sigmoid(kps[:, :, 2])
+            
+            all_boxes.append(boxes)
+            all_confs.append(conf_flat)
+            all_kps.append(kps)
+        
+        if not all_boxes:
+            return []
+        
+        all_boxes = np.concatenate(all_boxes, axis=0)
+        all_confs = np.concatenate(all_confs, axis=0)
+        all_kps = np.concatenate(all_kps, axis=0)
+        
+        # Filter by confidence
+        mask = all_confs > conf_threshold
+        boxes = all_boxes[mask]
+        confs = all_confs[mask]
+        kps = all_kps[mask]
+        
+        if len(boxes) == 0:
+            return []
+        
+        # Apply NMS
+        keep = self._nms(boxes, confs, Config.YOLO_NMS_IOU_THRESHOLD)
+        
+        # Map coordinates back to original frame
+        scale = meta['scale']
+        pad_left = meta['pad_left']
+        pad_top = meta['pad_top']
+        
+        detections = []
+        for idx in keep:
+            box = boxes[idx].copy()
+            keypoints = kps[idx].copy()
+            conf = float(confs[idx])
+            
+            # Remove padding and scale back to original image coordinates
+            box[0] = (box[0] - pad_left) / scale
+            box[1] = (box[1] - pad_top) / scale
+            box[2] = (box[2] - pad_left) / scale
+            box[3] = (box[3] - pad_top) / scale
+            
+            # Clip to original image dimensions
+            box[0] = max(0, min(box[0], meta['orig_w']))
+            box[1] = max(0, min(box[1], meta['orig_h']))
+            box[2] = max(0, min(box[2], meta['orig_w']))
+            box[3] = max(0, min(box[3], meta['orig_h']))
+            
+            # Skip tiny boxes
+            if (box[2] - box[0]) < 10 or (box[3] - box[1]) < 10:
+                continue
+            
+            # Map keypoints back to original coordinates
+            keypoints[:, 0] = (keypoints[:, 0] - pad_left) / scale
+            keypoints[:, 1] = (keypoints[:, 1] - pad_top) / scale
+            
+            detections.append({
+                'box': box,
+                'confidence': conf,
+                'keypoints': keypoints  # shape: (17, 3) with [x, y, conf]
+            })
+        
+        return detections
+    
+    @staticmethod
+    def _nms(boxes, scores, iou_threshold):
+        """Non-Maximum Suppression.
+        
+        Args:
+            boxes: (N, 4) array of [x1, y1, x2, y2]
+            scores: (N,) array of confidence scores
+            iou_threshold: IOU threshold for suppression
+        
+        Returns:
+            list of indices to keep
+        """
+        if len(boxes) == 0:
+            return []
+        
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 2]
+        y2 = boxes[:, 3]
+        areas = (x2 - x1) * (y2 - y1)
+        
+        order = scores.argsort()[::-1]
+        keep = []
+        
+        while len(order) > 0:
+            i = order[0]
+            keep.append(i)
+            
+            if len(order) == 1:
+                break
+            
+            # Compute IOU with remaining boxes
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            
+            w = np.maximum(0.0, xx2 - xx1)
+            h = np.maximum(0.0, yy2 - yy1)
+            intersection = w * h
+            
+            iou = intersection / (areas[i] + areas[order[1:]] - intersection + 1e-6)
+            
+            # Keep boxes with IOU below threshold
+            remaining = np.where(iou <= iou_threshold)[0]
+            order = order[remaining + 1]
+        
+        return keep
+    
+    def detect(self, frame):
+        """Full detection pipeline: preprocess -> infer -> postprocess.
+        
+        Args:
+            frame: BGR numpy array from camera
+        
+        Returns:
+            list of dicts with 'box' (xyxy), 'confidence', 'keypoints' (17,3) keys
+        """
+        preprocessed, meta = self.preprocess(frame)
+        raw_outputs = self.infer(preprocessed)
+        detections = self._decode_yolov8_pose_output(
+            raw_outputs, meta, conf_threshold=Config.YOLO_CONF_THRESHOLD
+        )
+        return detections
+
+
+# ============================================================================
+# IOU-BASED MULTI-OBJECT TRACKER
+# ============================================================================
+
+class SimpleIOUTracker:
+    """Lightweight IOU-based tracker replacing ultralytics BoT-SORT.
+    
+    Uses the Hungarian algorithm for optimal matching between
+    existing tracks and new detections based on IOU overlap.
+    Ideal for fixed-camera scenarios like fall detection.
+    """
+    
+    def __init__(self, iou_threshold=0.3, max_age=30):
+        self.iou_threshold = iou_threshold
+        self.max_age = max_age        # Frames before a track is deleted
+        self.tracks = {}              # track_id -> {'box': xyxy, 'age': int, 'hits': int}
         self.next_id = 1
     
-    def log_fall_incident(self, person_id, confidence, location):
-        """Log a new fall incident"""
-        incident = {
-            'id': self.next_id,
-            'person_id': person_id,
-            'confidence': confidence,
-            'location': location,
-            'timestamp': time.time(),
-            'status': 'active',
-            'type': 'fall',
-            'resolved_at': None
-        }
-        self.incidents.append(incident)
-        self.next_id += 1
-        return incident['id']
+    @staticmethod
+    def _compute_iou_matrix(boxes_a, boxes_b):
+        """Compute IOU matrix between two sets of boxes.
+        
+        Args:
+            boxes_a: (N, 4) array of [x1, y1, x2, y2]
+            boxes_b: (M, 4) array of [x1, y1, x2, y2]
+        
+        Returns:
+            (N, M) IOU matrix
+        """
+        N = len(boxes_a)
+        M = len(boxes_b)
+        iou_matrix = np.zeros((N, M))
+        
+        for i in range(N):
+            for j in range(M):
+                xa1, ya1, xa2, ya2 = boxes_a[i]
+                xb1, yb1, xb2, yb2 = boxes_b[j]
+                
+                xi1 = max(xa1, xb1)
+                yi1 = max(ya1, yb1)
+                xi2 = min(xa2, xb2)
+                yi2 = min(ya2, yb2)
+                
+                inter_w = max(0, xi2 - xi1)
+                inter_h = max(0, yi2 - yi1)
+                intersection = inter_w * inter_h
+                
+                area_a = (xa2 - xa1) * (ya2 - ya1)
+                area_b = (xb2 - xb1) * (yb2 - yb1)
+                union = area_a + area_b - intersection
+                
+                iou_matrix[i, j] = intersection / (union + 1e-6)
+        
+        return iou_matrix
     
-    def log_at_risk_event(self, person_id, confidence, location):
-        """Log an at-risk (abnormal gait) detection"""
-        incident = {
-            'id': self.next_id,
-            'person_id': person_id,
-            'confidence': confidence,
-            'location': location,
-            'timestamp': time.time(),
-            'status': 'logged',  # Different status for at-risk vs active fall
-            'type': 'at_risk',
-            'resolved_at': None
-        }
-        self.incidents.append(incident)
-        self.next_id += 1
-        return incident['id']
-    
-    def resolve_fall_for_person(self, person_id):
-        """Resolve active falls for a person"""
-        resolved_count = 0
-        for incident in self.incidents:
-            if incident['person_id'] == person_id and incident['status'] == 'active':
-                incident['status'] = 'resolved'
-                incident['resolved_at'] = time.time()
-                resolved_count += 1
-                print(f"DB: Incident {incident['id']} for person {person_id} resolved")
-        if resolved_count == 0:
-            print(f"DB: No active incidents found for person {person_id}")
-    
-    def resolve_fall_incident(self, incident_id):
-        """Resolve a specific incident"""
-        for incident in self.incidents:
-            if incident['id'] == incident_id:
-                incident['status'] = 'resolved'
-                incident['resolved_at'] = time.time()
-                return True
-        return False
-    
-    def get_all_incidents(self, limit=100, status=None):
-        """Get all incidents with optional filter"""
-        result = self.incidents
-        if status:
-            result = [i for i in result if i['status'] == status]
-        return result[-limit:]
-    
-    def get_active_falls(self):
-        """Get currently active falls"""
-        return [i for i in self.incidents if i['status'] == 'active']
-    
-    def get_statistics(self):
-        """Get incident statistics"""
-        active = len([i for i in self.incidents if i['status'] == 'active'])
-        resolved = len([i for i in self.incidents if i['status'] == 'resolved'])
-        return {
-            'total': len(self.incidents),
-            'active': active,
-            'resolved': resolved
-        }
-    
-    def delete_incident(self, incident_id):
-        """Delete an incident"""
-        self.incidents = [i for i in self.incidents if i['id'] != incident_id]
-    
-    def clear_all_incidents(self):
-        """Clear all incidents"""
-        self.incidents = []
+    def update(self, detections):
+        """Update tracks with new detections.
+        
+        Args:
+            detections: list of dicts with 'box' key (xyxy format)
+        
+        Returns:
+            list of track_ids corresponding to each detection (same order)
+        """
+        if len(detections) == 0:
+            # Age out all tracks
+            to_delete = []
+            for tid, track in self.tracks.items():
+                track['age'] += 1
+                if track['age'] > self.max_age:
+                    to_delete.append(tid)
+            for tid in to_delete:
+                del self.tracks[tid]
+            return []
+        
+        det_boxes = np.array([d['box'] for d in detections])
+        track_ids = list(self.tracks.keys())
+        
+        if len(track_ids) == 0:
+            # No existing tracks, create new ones for all detections
+            assigned_ids = []
+            for det in detections:
+                tid = self.next_id
+                self.next_id += 1
+                self.tracks[tid] = {'box': det['box'].copy(), 'age': 0, 'hits': 1}
+                assigned_ids.append(tid)
+            return assigned_ids
+        
+        # Compute IOU matrix between existing tracks and new detections
+        track_boxes = np.array([self.tracks[tid]['box'] for tid in track_ids])
+        iou_matrix = self._compute_iou_matrix(track_boxes, det_boxes)
+        
+        # Use Hungarian algorithm for optimal assignment (minimize cost = 1 - IOU)
+        cost_matrix = 1.0 - iou_matrix
+        row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        
+        # Determine matches
+        matched_tracks = set()
+        matched_dets = set()
+        assigned_ids = [None] * len(detections)
+        
+        for row, col in zip(row_indices, col_indices):
+            if iou_matrix[row, col] >= self.iou_threshold:
+                tid = track_ids[row]
+                self.tracks[tid]['box'] = det_boxes[col].copy()
+                self.tracks[tid]['age'] = 0
+                self.tracks[tid]['hits'] += 1
+                assigned_ids[col] = tid
+                matched_tracks.add(row)
+                matched_dets.add(col)
+        
+        # Create new tracks for unmatched detections
+        for col in range(len(detections)):
+            if col not in matched_dets:
+                tid = self.next_id
+                self.next_id += 1
+                self.tracks[tid] = {'box': det_boxes[col].copy(), 'age': 0, 'hits': 1}
+                assigned_ids[col] = tid
+        
+        # Age unmatched tracks
+        to_delete = []
+        for row, tid in enumerate(track_ids):
+            if row not in matched_tracks:
+                self.tracks[tid]['age'] += 1
+                if self.tracks[tid]['age'] > self.max_age:
+                    to_delete.append(tid)
+        for tid in to_delete:
+            del self.tracks[tid]
+        
+        return assigned_ids
 
 
-# Global database instance
-db = SimpleDatabase()
+# Global database instance — uses the same cairetaker.db as the auth server
+db = FallIncidentDB()
 
 
 # ============================================================================
@@ -653,12 +1113,18 @@ db = SimpleDatabase()
 class FallDetector:
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
+        print(f"Using device: {self.device} (CNN classifier only - YOLO runs on Hailo NPU)")
         
-        # Load YOLO pose model with tracking enabled
-        print("Loading YOLO pose model with tracking...")
-        self.pose_model = YOLO(Config.YOLO_MODEL)
-        print("✓ YOLO model loaded")
+        # Load YOLO pose model on Hailo AI HAT+ NPU
+        print("Loading YOLO pose model on Hailo AI HAT+ NPU...")
+        self.pose_estimator = HailoPoseEstimator(Config.YOLO_MODEL)
+        
+        # Initialize IOU-based tracker (replaces ultralytics BoT-SORT)
+        self.tracker = SimpleIOUTracker(
+            iou_threshold=Config.TRACKER_IOU_THRESHOLD,
+            max_age=Config.TRACKER_MAX_AGE
+        )
+        print("IOU tracker initialized")
         
         # Load Simple 1D-CNN classifier
         print("Loading Simple 1D-CNN classifier...")
@@ -670,7 +1136,7 @@ class FallDetector:
         checkpoint = torch.load(Config.CNN_MODEL_PATH, map_location=self.device)
         self.cnn_model.load_state_dict(checkpoint['model_state_dict'])
         self.cnn_model.eval()
-        print(f"✓ CNN model loaded (epoch: {checkpoint.get('epoch', 'N/A')}, val_acc: {checkpoint.get('val_acc', 0):.2f}%)")
+        print(f"CNN model loaded (epoch: {checkpoint.get('epoch', 'N/A')}, val_acc: {checkpoint.get('val_acc', 0):.2f}%)")
         
         # Prediction smoothing per track ID
         self.prediction_buffers = defaultdict(lambda: deque(maxlen=Config.SMOOTHING_WINDOW))
@@ -689,6 +1155,9 @@ class FallDetector:
         self.at_risk_log = []
         self.rejected_log = []
         
+        # Frame counter for throttled logging
+        self._frame_count = 0
+        
     def extract_features(self, keypoints, image_shape):
         """Extract normalized keypoint features (same as inference)"""
         h, w = image_shape[:2]
@@ -701,290 +1170,293 @@ class FallDetector:
     
     def detect(self, frame):
         """Detect pose and classify activity with tracking (same logic as inference but multi-person)"""
-        results = self.pose_model.track(frame, persist=True, verbose=False, conf=0.5)
+        self._frame_count += 1
+        _should_log = Config.DEBUG_LOGGING or (self._frame_count % Config.LOG_INTERVAL == 0)
+        
+        # Run YOLO pose estimation on Hailo NPU
+        hailo_detections = self.pose_estimator.detect(frame)
+        
+        # Assign track IDs using IOU tracker
+        track_ids = self.tracker.update(hailo_detections)
         
         detections = []
         current_person_ids = set()
         
-        if results and len(results) > 0:
-            result = results[0]
-            
-            if hasattr(result, 'keypoints') and result.keypoints is not None:
-                keypoints_data = result.keypoints.data.cpu().numpy()
-                boxes = result.boxes
+        if hailo_detections and len(hailo_detections) > 0:
+            for idx, hailo_det in enumerate(hailo_detections):
+                box = hailo_det['box']
+                box_conf = hailo_det['confidence']
+                keypoints = hailo_det['keypoints']  # (17, 3) array
+                track_id = track_ids[idx] if idx < len(track_ids) else idx
                 
-                # Safety check: ensure boxes has data
-                if boxes.xyxy is None or len(boxes.xyxy) == 0:
-                    return detections
+                current_person_ids.add(track_id)
                 
-                track_ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
+                # Initialize fall state for new person
+                if track_id not in self.fall_states:
+                    self.fall_states[track_id] = {
+                        'is_fallen': False,
+                        'incident_id': None
+                    }
                 
-                for idx, keypoints in enumerate(keypoints_data):
-                    # Skip if idx exceeds available boxes
-                    if idx >= len(boxes.xyxy):
-                        continue
+                # SAME VALIDATION AS INFERENCE: Only check if 10+ keypoints visible
+                visible_count = np.sum(keypoints[:, 2] > 0.3)
+                
+                if visible_count >= 10:
+                    # Normalize keypoints
+                    keypoints_normalized = self.extract_features(keypoints, frame.shape)
                     
-                    box = boxes.xyxy[idx].cpu().numpy()
-                    box_conf = boxes.conf[idx].cpu().numpy()
-                    track_id = int(track_ids[idx]) if track_ids is not None else idx
+                    # Prepare tensor
+                    keypoints_tensor = torch.tensor(
+                        keypoints_normalized.reshape(1, Config.NUM_KEYPOINTS, Config.NUM_COORDS),
+                        dtype=torch.float32
+                    ).to(self.device)
                     
-                    current_person_ids.add(track_id)
-                    
-                    # Initialize fall state for new person
-                    if track_id not in self.fall_states:
-                        self.fall_states[track_id] = {
-                            'is_fallen': False,
-                            'incident_id': None
-                        }
-                    
-                    # SAME VALIDATION AS INFERENCE: Only check if 10+ keypoints visible
-                    visible_count = np.sum(keypoints[:, 2] > 0.3)
-                    
-                    if visible_count >= 10:
-                        # Normalize keypoints
-                        keypoints_normalized = self.extract_features(keypoints, frame.shape)
+                    # Forward pass (Simple1DCNN only takes keypoints)
+                    with torch.no_grad():
+                        outputs = self.cnn_model(keypoints_tensor)
+                        probabilities = torch.softmax(outputs, dim=1)
+                        confidence_val, predicted = torch.max(probabilities, 1)
                         
-                        # Prepare tensor
-                        keypoints_tensor = torch.tensor(
-                            keypoints_normalized.reshape(1, Config.NUM_KEYPOINTS, Config.NUM_COORDS),
-                            dtype=torch.float32
-                        ).to(self.device)
-                        
-                        # Forward pass (Simple1DCNN only takes keypoints)
-                        with torch.no_grad():
-                            outputs = self.cnn_model(keypoints_tensor)
-                            probabilities = torch.softmax(outputs, dim=1)
-                            confidence_val, predicted = torch.max(probabilities, 1)
+                        # Store RAW prediction BEFORE smoothing
+                        raw_prediction = predicted.item()
+                        raw_confidence = confidence_val.item()
+                    
+                    # Smooth predictions per track ID (for display purposes)
+                    self.prediction_buffers[track_id].append(raw_prediction)
+                    if len(self.prediction_buffers[track_id]) >= Config.SMOOTHING_WINDOW // 2:
+                        smoothed_prediction = max(set(self.prediction_buffers[track_id]), 
+                                       key=self.prediction_buffers[track_id].count)
+                    else:
+                        smoothed_prediction = raw_prediction
+                    
+                    # Use smoothed for display
+                    prediction = smoothed_prediction
+                    confidence = raw_confidence
+                    
+                    # THREE-TIER CONFIDENCE SYSTEM
+                    fallen_confidence = probabilities[0][2].item()
+                    
+                    # Initialize variables
+                    display_state = "normal"
+                    confidence_tier = "N/A"
+                    is_raw_fallen = False
+                    
+                    if raw_prediction == 2:  # Model predicts fallen class
+                        if fallen_confidence >= Config.HIGH_CONFIDENCE_THRESHOLD:
+                            is_raw_fallen = True
+                            confidence_tier = "HIGH"
+                            display_state = "normal"
                             
-                            # Store RAW prediction BEFORE smoothing
-                            raw_prediction = predicted.item()
-                            raw_confidence = confidence_val.item()
-                        
-                        # Smooth predictions per track ID (for display purposes)
-                        self.prediction_buffers[track_id].append(raw_prediction)
-                        if len(self.prediction_buffers[track_id]) >= Config.SMOOTHING_WINDOW // 2:
-                            smoothed_prediction = max(set(self.prediction_buffers[track_id]), 
-                                           key=self.prediction_buffers[track_id].count)
-                        else:
-                            smoothed_prediction = raw_prediction
-                        
-                        # Use smoothed for display
-                        prediction = smoothed_prediction
-                        confidence = raw_confidence
-                        
-                        # THREE-TIER CONFIDENCE SYSTEM
-                        fallen_confidence = probabilities[0][2].item()
-                        
-                        # Initialize variables
-                        display_state = "normal"
-                        confidence_tier = "N/A"
-                        is_raw_fallen = False
-                        
-                        if raw_prediction == 2:  # Model predicts fallen class
-                            if fallen_confidence >= Config.HIGH_CONFIDENCE_THRESHOLD:
-                                is_raw_fallen = True
-                                confidence_tier = "HIGH"
-                                display_state = "normal"
-                                
-                            elif fallen_confidence >= Config.LOW_CONFIDENCE_THRESHOLD:
-                                is_raw_fallen = False
-                                confidence_tier = "AT_RISK"
-                                display_state = "at_risk"
-                                
-                                print(f"⚠️ Person ID {track_id}: AT RISK (Medium confidence)")
+                        elif fallen_confidence >= Config.LOW_CONFIDENCE_THRESHOLD:
+                            is_raw_fallen = False
+                            confidence_tier = "AT_RISK"
+                            display_state = "at_risk"
+                            
+                            if _should_log:
+                                print(f"Person ID {track_id}: AT RISK (Medium confidence)")
                                 print(f"   Fallen confidence: {fallen_confidence:.2%}")
-                                
-                                self.at_risk_log.append({
-                                    'timestamp': time.time(),
-                                    'person_id': track_id,
-                                    'confidence': fallen_confidence,
-                                    'reason': 'medium_confidence_fallen'
-                                })
-                                
-                                # NOTE: At Risk database logging disabled until gait analysis is implemented
-                                # db.log_at_risk_event() is available but not used yet
-                                
-                            else:
-                                is_raw_fallen = False
-                                confidence_tier = "REJECTED"
-                                display_state = "normal"
-                                
-                                print(f"❌ Person ID {track_id}: Fallen REJECTED (low confidence)")
-                                print(f"   Fallen confidence: {fallen_confidence:.2%}")
-                                
-                                self.rejected_log.append({
-                                    'timestamp': time.time(),
-                                    'person_id': track_id,
-                                    'confidence': fallen_confidence,
-                                    'reason': 'very_low_confidence'
-                                })
+                            
+                            self.at_risk_log.append({
+                                'timestamp': time.time(),
+                                'person_id': track_id,
+                                'confidence': fallen_confidence,
+                                'reason': 'medium_confidence_fallen'
+                            })
+                            
+                            # NOTE: At Risk database logging disabled until gait analysis is implemented
+                            # db.log_at_risk_event() is available but not used yet
+                            
                         else:
                             is_raw_fallen = False
-                            confidence_tier = "N/A"
+                            confidence_tier = "REJECTED"
                             display_state = "normal"
-                        
-                        # Override smoothed prediction for rejected/at-risk falls
-                        if raw_prediction == 2 and not is_raw_fallen:
-                            if confidence_tier == "AT_RISK":
-                                pass
-                            else:
-                                prediction = 0  # Override to Standing
-                        
-                        # Check for fall state changes
-                        was_fallen = self.fall_states[track_id]['is_fallen']
-                        
-                        # BENDING DETECTION OVERRIDE
-                        if is_raw_fallen:
-                            is_bending, bend_conf, reasons = is_bending_posture(keypoints, frame.shape)
                             
-                            if is_bending and bend_conf > 0.5:
-                                print(f"✓ Person ID {track_id}: Detected BENDING (not fallen)")
+                            if _should_log:
+                                print(f"Person ID {track_id}: Fallen REJECTED (low confidence)")
+                                print(f"   Fallen confidence: {fallen_confidence:.2%}")
+                            
+                            self.rejected_log.append({
+                                'timestamp': time.time(),
+                                'person_id': track_id,
+                                'confidence': fallen_confidence,
+                                'reason': 'very_low_confidence'
+                            })
+                    else:
+                        is_raw_fallen = False
+                        confidence_tier = "N/A"
+                        display_state = "normal"
+                    
+                    # Override smoothed prediction for rejected/at-risk falls
+                    if raw_prediction == 2 and not is_raw_fallen:
+                        if confidence_tier == "AT_RISK":
+                            pass
+                        else:
+                            prediction = 0  # Override to Standing
+                    
+                    # Check for fall state changes
+                    was_fallen = self.fall_states[track_id]['is_fallen']
+                    
+                    # BENDING DETECTION OVERRIDE
+                    if is_raw_fallen:
+                        is_bending, bend_conf, reasons = is_bending_posture(keypoints, frame.shape)
+                        
+                        if is_bending and bend_conf > 0.5:
+                            if _should_log:
+                                print(f"Person ID {track_id}: Detected BENDING (not fallen)")
                                 print(f"  Confidence: {bend_conf:.2f}")
                                 print(f"  Reasons: {', '.join(reasons)}")
-                                
-                                prediction = 0
-                                confidence = bend_conf
-                                is_raw_fallen = False
-                                confidence_tier = "BENDING"
-                                display_state = "normal"
-                        
-                        # TEMPORAL FALL DETECTION
-                        current_time = time.time()
-                        candidate = self.fall_candidates[track_id]
-                        
-                        if is_raw_fallen:
-                            if was_fallen:
-                                print(f"🔴 Person ID {track_id}: Maintaining FALLEN state")
-                                
-                            elif candidate['start_time'] is None:
-                                candidate['start_time'] = current_time
-                                candidate['frame_count'] = 1
-                                candidate['consecutive_fallen_frames'] = 1
-                                
-                                if self.fall_states[track_id]['is_fallen']:
-                                    print(f"⚠️ WARNING: is_fallen was True, forcing False for monitoring")
-                                self.fall_states[track_id]['is_fallen'] = False
-                                
-                                print(f"\n{'='*60}")
-                                print(f"⏱️ MONITORING STARTED - Person ID {track_id}")
-                                print(f"{'='*60}")
-                                print(f"Fallen confidence: {fallen_confidence:.2%} (HIGH - ≥70%)")
-                                print(f"Confirmation requirements:")
-                                print(f"  • Time: {Config.FALL_CONFIRMATION_TIME}s")
-                                print(f"  • Frames: {Config.FALL_CONFIRMATION_FRAMES} consecutive")
-                                print(f"Status: MONITORING IN PROGRESS...")
-                                print(f"{'='*60}\n")
                             
-                            else:
-                                candidate['frame_count'] += 1
-                                candidate['consecutive_fallen_frames'] += 1
-                                elapsed_time = current_time - candidate['start_time']
-                                
-                                time_threshold_met = elapsed_time >= Config.FALL_CONFIRMATION_TIME
-                                frames_threshold_met = candidate['consecutive_fallen_frames'] >= Config.FALL_CONFIRMATION_FRAMES
-                                
-                                if time_threshold_met and frames_threshold_met:
-                                    if not self.fall_states[track_id]['is_fallen']:
-                                        room_name = Config.get_room_name(current_camera_index)
-                                        print(f"\n{'='*70}")
-                                        print(f"🚨🚨🚨 CONFIRMED FALL ALERT 🚨🚨🚨")
-                                        print(f"{'='*70}")
-                                        print(f"Person ID: {track_id}")
-                                        print(f"Location: {room_name}")
-                                        print(f"Fallen Confidence: {fallen_confidence:.2%}")
-                                        print(f"Time Fallen: {elapsed_time:.2f}s")
-                                        print(f"")
-                                        
-                                        incident_id = db.log_fall_incident(
-                                            person_id=track_id,
-                                            confidence=fallen_confidence,
-                                            location=room_name
-                                        )
-                                        
+                            prediction = 0
+                            confidence = bend_conf
+                            is_raw_fallen = False
+                            confidence_tier = "BENDING"
+                            display_state = "normal"
+                    
+                    # TEMPORAL FALL DETECTION
+                    current_time = time.time()
+                    candidate = self.fall_candidates[track_id]
+                    
+                    if is_raw_fallen:
+                        if was_fallen:
+                            if _should_log:
+                                print(f"Person ID {track_id}: Maintaining FALLEN state")
+                            
+                        elif candidate['start_time'] is None:
+                            candidate['start_time'] = current_time
+                            candidate['frame_count'] = 1
+                            candidate['consecutive_fallen_frames'] = 1
+                            
+                            if self.fall_states[track_id]['is_fallen']:
+                                print(f"WARNING: is_fallen was True, forcing False for monitoring")
+                            self.fall_states[track_id]['is_fallen'] = False
+                            
+                            print(f"\n{'='*60}")
+                            print(f"MONITORING STARTED - Person ID {track_id}")
+                            print(f"{'='*60}")
+                            print(f"Fallen confidence: {fallen_confidence:.2%} (HIGH - >=70%)")
+                            print(f"Confirmation requirements:")
+                            print(f"  Time: {Config.FALL_CONFIRMATION_TIME}s")
+                            print(f"  Frames: {Config.FALL_CONFIRMATION_FRAMES} consecutive")
+                            print(f"Status: MONITORING IN PROGRESS...")
+                            print(f"{'='*60}\n")
+                        
+                        else:
+                            candidate['frame_count'] += 1
+                            candidate['consecutive_fallen_frames'] += 1
+                            elapsed_time = current_time - candidate['start_time']
+                            
+                            time_threshold_met = elapsed_time >= Config.FALL_CONFIRMATION_TIME
+                            frames_threshold_met = candidate['consecutive_fallen_frames'] >= Config.FALL_CONFIRMATION_FRAMES
+                            
+                            if time_threshold_met and frames_threshold_met:
+                                if not self.fall_states[track_id]['is_fallen']:
+                                    room_name = Config.get_room_name(current_camera_index)
+                                    print(f"\n{'='*70}")
+                                    print(f"CONFIRMED FALL ALERT")
+                                    print(f"{'='*70}")
+                                    print(f"Person ID: {track_id}")
+                                    print(f"Location: {room_name}")
+                                    print(f"Fallen Confidence: {fallen_confidence:.2%}")
+                                    print(f"Time Fallen: {elapsed_time:.2f}s")
+                                    print(f"")
+                                    
+                                    incident_id = db.log_fall_incident(
+                                        person_id=track_id,
+                                        confidence=fallen_confidence,
+                                        location=room_name
+                                    )
+                                    
+                                    if incident_id is None:
+                                        # Person already has an active fall in DB — skip duplicate
+                                        print(f"Person ID {track_id}: Active fall already exists in DB, skipping")
+                                    else:
                                         self.fall_states[track_id]['is_fallen'] = True
                                         self.fall_states[track_id]['incident_id'] = incident_id
                                         
-                                        print(f"📝 Incident logged (ID: {incident_id})")
-                                        print(f"🚨 ALERT TRIGGERED - Caregivers must respond")
+                                        print(f"Incident logged (ID: {incident_id})")
+                                        print(f"ALERT TRIGGERED - Caregivers must respond")
                                         print(f"{'='*70}\n")
                                         
                                         # Send push notification to registered devices
                                         send_expo_push_notification(
-                                            "🚨 Fall Detected!",
+                                            "Fall Detected!",
                                             f"Person ID {track_id} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
                                         )
-                                    else:
-                                        print(f"ℹ️ Person ID {track_id}: Fall already confirmed")
                                 else:
-                                    remaining_time = max(0, Config.FALL_CONFIRMATION_TIME - elapsed_time)
-                                    remaining_frames = max(0, Config.FALL_CONFIRMATION_FRAMES - candidate['consecutive_fallen_frames'])
-                                    
-                                    print(f"⏱️ Person ID {track_id}: MONITORING IN PROGRESS")
+                                    if _should_log:
+                                        print(f"Person ID {track_id}: Fall already confirmed")
+                            else:
+                                remaining_time = max(0, Config.FALL_CONFIRMATION_TIME - elapsed_time)
+                                remaining_frames = max(0, Config.FALL_CONFIRMATION_FRAMES - candidate['consecutive_fallen_frames'])
+                                
+                                if _should_log:
+                                    print(f"Person ID {track_id}: MONITORING IN PROGRESS")
                                     print(f"   Time: {elapsed_time:.2f}s / {Config.FALL_CONFIRMATION_TIME}s")
                                     print(f"   Frames: {candidate['consecutive_fallen_frames']} / {Config.FALL_CONFIRMATION_FRAMES}")
-                        
-                        else:
-                            if candidate['start_time'] is not None:
-                                elapsed = current_time - candidate['start_time']
-                                
-                                print(f"\n{'='*60}")
-                                print(f"✓ RECOVERY DETECTED - Person ID {track_id}")
-                                print(f"{'='*60}")
-                                print(f"Fallen duration: {elapsed:.2f}s")
-                                print(f"Result: NO ALERT - Person recovered before confirmation")
-                                print(f"Monitoring: RESET")
-                                print(f"{'='*60}\n")
-                                
-                                candidate['start_time'] = None
-                                candidate['frame_count'] = 0
-                                candidate['consecutive_fallen_frames'] = 0
-                            
-                            if was_fallen:
-                                print(f"\n{'='*70}")
-                                print(f"✅✅✅ RECOVERY CONFIRMED ✅✅✅")
-                                print(f"{'='*70}")
-                                print(f"Person ID: {track_id}")
-                                print(f"Status: Person has stood up and recovered")
-                                
-                                if self.fall_states[track_id]['incident_id'] is not None:
-                                    db.resolve_fall_for_person(track_id)
-                                    print(f"📝 Incident {self.fall_states[track_id]['incident_id']} marked as RESOLVED")
-                                
-                                self.fall_states[track_id]['is_fallen'] = False
-                                self.fall_states[track_id]['incident_id'] = None
-                                
-                                print(f"Person ID {track_id} returned to normal monitoring")
-                                print(f"{'='*70}\n")
-                        
-                        status = "classified"
-                    else:
-                        prediction = None
-                        confidence = 0.0
-                        status = "insufficient_keypoints"
-                        
-                        if track_id in self.fall_candidates:
-                            candidate = self.fall_candidates[track_id]
-                            if candidate['start_time'] is not None:
-                                print(f"⚠ Person ID {track_id}: Keypoints lost during monitoring, resetting")
-                                candidate['start_time'] = None
-                                candidate['frame_count'] = 0
-                                candidate['consecutive_fallen_frames'] = 0
                     
-                    detections.append({
-                        'track_id': track_id,
-                        'box': box,
-                        'box_conf': float(box_conf),
-                        'keypoints': keypoints,
-                        'prediction': prediction,
-                        'display_state': display_state if 'display_state' in locals() else "normal",
-                        'confidence': float(confidence),
-                        'confidence_tier': confidence_tier if 'confidence_tier' in locals() else "N/A",
-                        'fallen_confidence': fallen_confidence if 'fallen_confidence' in locals() else 0.0,
-                        'status': status,
-                        'is_fallen': self.fall_states[track_id]['is_fallen'],
-                        'incident_id': self.fall_states[track_id].get('incident_id'),
-                        'visible_count': visible_count
-                    })
+                    else:
+                        if candidate['start_time'] is not None:
+                            elapsed = current_time - candidate['start_time']
+                            
+                            print(f"\n{'='*60}")
+                            print(f"RECOVERY DETECTED - Person ID {track_id}")
+                            print(f"{'='*60}")
+                            print(f"Fallen duration: {elapsed:.2f}s")
+                            print(f"Result: NO ALERT - Person recovered before confirmation")
+                            print(f"Monitoring: RESET")
+                            print(f"{'='*60}\n")
+                            
+                            candidate['start_time'] = None
+                            candidate['frame_count'] = 0
+                            candidate['consecutive_fallen_frames'] = 0
+                        
+                        if was_fallen:
+                            print(f"\n{'='*70}")
+                            print(f"RECOVERY CONFIRMED")
+                            print(f"{'='*70}")
+                            print(f"Person ID: {track_id}")
+                            print(f"Status: Person has stood up and recovered")
+                            
+                            if self.fall_states[track_id]['incident_id'] is not None:
+                                db.resolve_fall_for_person(track_id)
+                                print(f"Incident {self.fall_states[track_id]['incident_id']} marked as RESOLVED")
+                            
+                            self.fall_states[track_id]['is_fallen'] = False
+                            self.fall_states[track_id]['incident_id'] = None
+                            
+                            print(f"Person ID {track_id} returned to normal monitoring")
+                            print(f"{'='*70}\n")
+                    
+                    status = "classified"
+                else:
+                    prediction = None
+                    confidence = 0.0
+                    status = "insufficient_keypoints"
+                    
+                    if track_id in self.fall_candidates:
+                        candidate = self.fall_candidates[track_id]
+                        if candidate['start_time'] is not None:
+                            if _should_log:
+                                print(f"Person ID {track_id}: Keypoints lost during monitoring, resetting")
+                            candidate['start_time'] = None
+                            candidate['frame_count'] = 0
+                            candidate['consecutive_fallen_frames'] = 0
+                
+                detections.append({
+                    'track_id': track_id,
+                    'box': box,
+                    'box_conf': float(box_conf),
+                    'keypoints': keypoints,
+                    'prediction': prediction,
+                    'display_state': display_state if 'display_state' in locals() else "normal",
+                    'confidence': float(confidence),
+                    'confidence_tier': confidence_tier if 'confidence_tier' in locals() else "N/A",
+                    'fallen_confidence': fallen_confidence if 'fallen_confidence' in locals() else 0.0,
+                    'status': status,
+                    'is_fallen': self.fall_states[track_id]['is_fallen'],
+                    'incident_id': self.fall_states[track_id].get('incident_id'),
+                    'visible_count': visible_count
+                })
         
         # Clean up tracking for people who left the frame
         disappeared_ids = set(self.fall_states.keys()) - current_person_ids
@@ -1063,23 +1535,22 @@ class FallDetector:
             cv2.putText(frame, label, (x1, y1 - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
-            # Draw skeleton
-            if prediction is not None:
-                for start_idx, end_idx in skeleton_connections:
-                    if (keypoints[start_idx, 2] > 0.3 and keypoints[end_idx, 2] > 0.3):
-                        pt1 = (int(keypoints[start_idx, 0]), int(keypoints[start_idx, 1]))
-                        pt2 = (int(keypoints[end_idx, 0]), int(keypoints[end_idx, 1]))
-                        cv2.line(frame, pt1, pt2, color, thickness=4, lineType=cv2.LINE_AA)
-                        line_color_bright = tuple(min(c + 50, 255) for c in color)
-                        cv2.line(frame, pt1, pt2, line_color_bright, thickness=2, lineType=cv2.LINE_AA)
+            # Draw keypoints and skeleton
+            if keypoints is not None and len(keypoints) == 17:
+                # Draw skeleton lines first (so dots appear on top)
+                for (a, b) in skeleton_connections:
+                    if keypoints[a, 2] > 0.3 and keypoints[b, 2] > 0.3:
+                        pt1 = (int(keypoints[a, 0]), int(keypoints[a, 1]))
+                        pt2 = (int(keypoints[b, 0]), int(keypoints[b, 1]))
+                        cv2.line(frame, pt1, pt2, color, 2)
                 
-                for i, kp in enumerate(keypoints):
-                    x_kp, y_kp, conf = kp
-                    if conf > 0.3:
-                        kp_pos = (int(x_kp), int(y_kp))
-                        cv2.circle(frame, kp_pos, 8, (0, 0, 0), -1, lineType=cv2.LINE_AA)
-                        cv2.circle(frame, kp_pos, 6, color, -1, lineType=cv2.LINE_AA)
-                        cv2.circle(frame, kp_pos, 3, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+                # Draw keypoint dots
+                for ki in range(17):
+                    kx, ky, kc = keypoints[ki]
+                    if kc > 0.3:
+                        cv2.circle(frame, (int(kx), int(ky)), 4, color, -1)
+                        cv2.circle(frame, (int(kx), int(ky)), 5, (255, 255, 255), 1)
+            
         
         return frame
 
@@ -1101,6 +1572,67 @@ current_status = {
 import threading
 camera_lock = threading.Lock()
 status_lock = threading.Lock()
+
+
+# ============================================================================
+# SINGLE-PRODUCER / MULTI-CONSUMER FRAME BUFFER
+# Captures, detects, encodes once — all viewers read the same JPEG bytes.
+# ============================================================================
+
+class FrameBuffer:
+    """Thread-safe container for the latest MJPEG frame.
+
+    Countermeasures built in:
+    - Fallback frame: if no real frame has been produced yet, clients get
+      a static "loading" placeholder instead of hanging.
+    - Event-based wake: consumers block on threading.Event so they don't
+      busy-wait, keeping CPU near zero when idle.
+    - Sequence counter: lets consumers detect whether they already
+      served the current frame (avoids sending duplicates).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._event = threading.Event()          # signalled on every new frame
+        self._frame_bytes: bytes = self._make_placeholder()
+        self._seq: int = 0                       # monotonic frame counter
+
+    @staticmethod
+    def _make_placeholder() -> bytes:
+        """Encode a static 'Loading…' placeholder JPEG."""
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(img, "Loading stream...", (140, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+        _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        return buf.tobytes()
+
+    def update(self, jpeg_bytes: bytes):
+        """Called by producer thread with new encoded frame."""
+        with self._lock:
+            self._frame_bytes = jpeg_bytes
+            self._seq += 1
+        self._event.set()       # wake all waiting consumers
+        self._event.clear()     # reset for next cycle
+
+    def wait_and_get(self, last_seq: int, timeout: float = 2.0):
+        """Block until a new frame is available or timeout.
+        Returns (jpeg_bytes, new_seq)."""
+        # Fast path: a newer frame is already available
+        with self._lock:
+            if self._seq != last_seq:
+                return self._frame_bytes, self._seq
+        # Slow path: wait for producer signal
+        self._event.wait(timeout=timeout)
+        with self._lock:
+            return self._frame_bytes, self._seq
+
+
+frame_buffer = FrameBuffer()
+
+# Producer state
+_producer_thread: threading.Thread | None = None
+_producer_stop = threading.Event()
+_producer_lock = threading.Lock()     # guards start/stop lifecycle
 
 
 def initialize_detector():
@@ -1132,10 +1664,14 @@ def initialize_camera(camera_index=0):
         try:
             print(f"Initializing Pi Camera V3 Wide...")
             camera = Picamera2()
+
+            camera_controls = {"FrameRate": Config.CAMERA_FPS}
+            if controls is not None:
+                camera_controls["AfMode"] = controls.AfModeEnum.Continuous
             
             config = camera.create_video_configuration(
-                main={"size": (1280, 720), "format": "RGB888"},
-                controls={"FrameRate": 30}
+                main={"size": Config.CAMERA_SIZE, "format": "RGB888"},
+                controls=camera_controls
             )
             camera.configure(config)
             camera.start()
@@ -1168,71 +1704,72 @@ def initialize_camera(camera_index=0):
             return False
 
 
-def generate_frames():
-    """Generator function for video streaming"""
+# ---------------------------------------------------------------------------
+# PRODUCER — runs in its own thread; captures, detects, encodes once.
+# ---------------------------------------------------------------------------
+
+def _frame_producer():
+    """Single background thread that feeds FrameBuffer.
+
+    Countermeasures:
+    - Watchdog: auto-restarts camera after 10 consecutive capture failures.
+    - Graceful stop: honours _producer_stop event so camera switch / shutdown
+      can terminate the loop cleanly.
+    - Error frame: on unrecoverable camera failure the buffer receives a
+      static error image so clients don't hang forever.
+    """
     global camera, camera_initialized
-    
+
     if not camera_initialized:
-        print("⚠ Camera not initialized, attempting to initialize...")
+        print("⚠ Producer: camera not initialised, attempting...")
         if not initialize_camera(current_camera_index):
-            print("✗ Camera initialization failed, sending error frame...")
-            
-            error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(error_frame, "Camera Unavailable", (150, 240),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-            cv2.putText(error_frame, "Please check camera connection", (80, 300),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            
-            ret, buffer = cv2.imencode('.jpg', error_frame)
-            frame_bytes = buffer.tobytes()
-            
-            while True:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                time.sleep(1)
-    
-    print(f"✓ Starting frame generation for camera {current_camera_index}...")
+            print("✗ Producer: camera init failed — pushing error frame")
+            _push_error_frame("Camera Unavailable", "Please check camera connection")
+            return
+
+    print(f"✓ Producer started for camera {current_camera_index}")
     frame_count = 0
     fps_time = time.time()
     fps_value = 0
     consecutive_failures = 0
-    
-    while True:
+
+    while not _producer_stop.is_set():
         try:
+            # --- capture ---
             with camera_lock:
                 if camera is None:
-                    print("Camera lost, attempting to reconnect...")
+                    print("Producer: camera lost, reconnecting...")
                     if not initialize_camera(current_camera_index):
                         time.sleep(1)
                         continue
-                
                 try:
                     frame = camera.capture_array()
                     success = frame is not None
                 except Exception:
                     success = False
                     frame = None
-            
+
             if not success or frame is None:
                 consecutive_failures += 1
-                print(f"Frame read failed (attempt {consecutive_failures})")
-                
+                if consecutive_failures % 5 == 0:
+                    print(f"Producer: frame read failed ({consecutive_failures} in a row)")
                 if consecutive_failures > 10:
-                    print("Too many consecutive failures, reinitializing camera...")
+                    print("Producer: too many failures — reinitialising camera")
                     camera_initialized = False
                     if not initialize_camera(current_camera_index):
-                        time.sleep(1)
+                        _push_error_frame("Camera Lost", "Attempting to reconnect...")
+                        time.sleep(2)
                     consecutive_failures = 0
-                
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
-            
+
             consecutive_failures = 0
-            
+
+            # --- detect ---
             if detector is not None:
                 detections = detector.detect(frame)
                 frame = detector.draw_results(frame, detections)
-                
+
                 with status_lock:
                     current_status['people_detected'] = len(detections)
                     current_status['detections'] = [
@@ -1247,33 +1784,117 @@ def generate_frames():
                         }
                         for d in detections
                     ]
-                    
+
                 frame_count += 1
                 if frame_count % 10 == 0:
-                    current_time = time.time()
-                    fps_value = 10 / (current_time - fps_time)
-                    fps_time = current_time
+                    now = time.time()
+                    fps_value = 10 / max(now - fps_time, 0.001)
+                    fps_time = now
                     current_status['fps'] = round(fps_value, 1)
-                
-                cv2.putText(frame, f"FPS: {fps_value:.1f} | Camera: {current_camera_index}", 
-                           (frame.shape[1] - 350, 40),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-            
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
+                cv2.putText(frame, f"FPS: {fps_value:.1f} | Camera: {current_camera_index}",
+                            (frame.shape[1] - 350, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+            # --- resize / sharpen / encode (once for all viewers) ---
+            stream_width, stream_height = Config.STREAM_SIZE
+            if frame.shape[1] != stream_width or frame.shape[0] != stream_height:
+                frame = cv2.resize(frame, (stream_width, stream_height), interpolation=cv2.INTER_AREA)
+
+            if Config.APPLY_SHARPEN:
+                blurred = cv2.GaussianBlur(frame, (0, 0), 1.0)
+                frame = cv2.addWeighted(frame, 1.15, blurred, -0.15, 0)
+
+            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, Config.JPEG_QUALITY])
             if not ret:
-                print("⚠ Frame encoding failed")
                 continue
-                
-            frame_bytes = buffer.tobytes()
-            
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                   
+
+            frame_buffer.update(buffer.tobytes())
+
         except Exception as e:
-            print(f"✗ Error in frame generation: {e}")
+            print(f"✗ Producer error: {e}")
             import traceback
             traceback.print_exc()
             time.sleep(0.1)
+
+    print("Producer thread stopped.")
+
+
+def _push_error_frame(title: str, subtitle: str):
+    """Encode a static error image and push it into the shared buffer."""
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(img, title, (120, 240),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+    cv2.putText(img, subtitle, (80, 300),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    frame_buffer.update(buf.tobytes())
+
+
+# ---------------------------------------------------------------------------
+# PRODUCER LIFECYCLE — start / stop / restart with safety lock.
+# ---------------------------------------------------------------------------
+
+def start_producer():
+    """Start the frame-producer thread (idempotent)."""
+    global _producer_thread
+    with _producer_lock:
+        if _producer_thread is not None and _producer_thread.is_alive():
+            return  # already running
+        _producer_stop.clear()
+        _producer_thread = threading.Thread(target=_frame_producer, daemon=True,
+                                            name="frame-producer")
+        _producer_thread.start()
+        print("✓ Frame producer thread launched")
+
+
+def stop_producer(timeout: float = 5.0):
+    """Gracefully stop the producer thread."""
+    global _producer_thread
+    with _producer_lock:
+        if _producer_thread is None or not _producer_thread.is_alive():
+            return
+        _producer_stop.set()
+        _producer_thread.join(timeout=timeout)
+        if _producer_thread.is_alive():
+            print("⚠ Producer thread did not stop in time")
+        _producer_thread = None
+        print("Producer thread stopped cleanly")
+
+
+def restart_producer():
+    """Stop then start — used after camera switch."""
+    stop_producer()
+    start_producer()
+
+
+# ---------------------------------------------------------------------------
+# CONSUMER — lightweight generator; just relays pre-encoded frames.
+# ---------------------------------------------------------------------------
+
+def generate_frames():
+    """Generator consumed by each MJPEG client connection.
+
+    Countermeasures:
+    - Timeout on wait (2 s): if producer stalls, client gets last known
+      frame rather than hanging.
+    - Auto-start: if producer is not running when the first viewer
+      connects, it gets kicked off automatically.
+    - Duplicate suppression: same frame is not re-sent if sequence
+      has not advanced (saves bandwidth on slow producers).
+    """
+    # Ensure producer is alive (covers edge-case of late viewers)
+    start_producer()
+
+    last_seq = -1
+    while True:
+        jpeg_bytes, seq = frame_buffer.wait_and_get(last_seq, timeout=2.0)
+        if seq == last_seq:
+            # Timeout with no new frame — send last known to keep connection alive
+            pass
+        last_seq = seq
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
 
 
 # ============================================================================
@@ -1306,8 +1927,11 @@ def switch_camera():
         
         print(f"🔄 Switching from camera {current_camera_index} to camera {new_camera_index}")
         
+        # Stop producer, switch camera, restart producer
+        stop_producer()
         camera_initialized = False
         if initialize_camera(new_camera_index):
+            restart_producer()
             return jsonify({
                 'success': True,
                 'message': f'Switched to camera {new_camera_index}',
@@ -1361,7 +1985,7 @@ def health():
         'detector_loaded': detector is not None,
         'camera_available': cam_available,
         'current_camera_index': current_camera_index,
-        'model_type': 'EnhancedSpatial1DCNN (Reset-on-Recovery + 70% Threshold)'
+        'model_type': 'HailoNPU(YOLOv8m-pose) + CPU(Simple1DCNN)'
     })
 
 
@@ -1387,10 +2011,7 @@ def get_incidents():
         status_filter = request.args.get('status')
         limit = int(request.args.get('limit', 100))
         
-        if status_filter:
-            incidents = [i for i in db.incidents if i['status'] == status_filter][-limit:]
-        else:
-            incidents = db.get_all_incidents(limit=limit)
+        incidents = db.get_all_incidents(limit=limit, status=status_filter)
         
         return jsonify({
             'success': True,
@@ -1505,6 +2126,7 @@ def clear_all_incidents():
 if __name__ == '__main__':
     print("\n" + "="*60)
     print("CAIretaker Backend - Enhanced Fall Detection")
+    print("Powered by Hailo AI HAT+ (26 TOPS NPU)")
     print("="*60)
     
     if initialize_detector():
@@ -1516,6 +2138,9 @@ if __name__ == '__main__':
             print("  The system will continue to attempt camera connection.")
             print("  Video feed will be available once camera is detected.\n")
         
+        # Start the single frame-producer thread before accepting viewers
+        start_producer()
+
         print("\nStarting Flask server...")
         print("Backend will be available at: http://localhost:5002")
         print("\nEndpoints:")

@@ -57,6 +57,21 @@ def init_db():
         )
     ''')
     
+    # Fall incidents table for persistent fall log storage
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fall_incidents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL,
+            confidence REAL NOT NULL,
+            location TEXT,
+            timestamp REAL NOT NULL,
+            status TEXT DEFAULT 'active',
+            type TEXT DEFAULT 'fall',
+            resolved_at REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     # Create default Super Admin if not exists
     cursor.execute('SELECT id FROM users WHERE role = ?', ('super_admin',))
     if not cursor.fetchone():
@@ -389,6 +404,203 @@ def verify_otp(email: str, otp_code: str, purpose: str = 'password_reset') -> di
         return {'success': False, 'error': str(e)}
     finally:
         conn.close()
+
+# ==================== FALL INCIDENT OPERATIONS (SQLite-backed) ====================
+
+class FallIncidentDB:
+    """
+    SQLite-backed database for fall incidents.
+    Replaces the in-memory SimpleDatabase so logs persist across restarts.
+    
+    Single-active-fall-per-person rule:
+    - Only one 'active' fall per person_id at a time.
+    - A new fall is only logged if that person has no active fall.
+    - When a person recovers, their active fall is resolved,
+      making them eligible for a new fall log if they fall again.
+    """
+
+    def __init__(self, db_path=None):
+        self.db_path = db_path or Config.DATABASE_PATH
+        # Ensure the fall_incidents table exists
+        init_db()
+
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _row_to_dict(self, row):
+        """Convert a sqlite3.Row to a plain dict matching the old in-memory format"""
+        if row is None:
+            return None
+        return {
+            'id': row['id'],
+            'person_id': row['person_id'],
+            'confidence': row['confidence'],
+            'location': row['location'],
+            'timestamp': row['timestamp'],
+            'status': row['status'],
+            'type': row['type'],
+            'resolved_at': row['resolved_at'],
+        }
+
+    # ---------- check for active fall ----------
+    def has_active_fall(self, person_id):
+        """Return True if the person already has an unresolved active fall"""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT id FROM fall_incidents WHERE person_id = ? AND status = 'active' LIMIT 1",
+                (person_id,)
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    # ---------- log a new fall ----------
+    def log_fall_incident(self, person_id, confidence, location):
+        """
+        Log a new fall incident.
+        Returns the incident id, or None if the person already has an active fall.
+        """
+        if self.has_active_fall(person_id):
+            print(f"DB: Person {person_id} already has an active fall — skipping duplicate log")
+            return None
+
+        import time as _time
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                '''INSERT INTO fall_incidents (person_id, confidence, location, timestamp, status, type)
+                   VALUES (?, ?, ?, ?, 'active', 'fall')''',
+                (person_id, confidence, location, _time.time())
+            )
+            conn.commit()
+            incident_id = cur.lastrowid
+            print(f"DB: Fall incident {incident_id} logged for person {person_id}")
+            return incident_id
+        except Exception as e:
+            print(f"DB ERROR (log_fall_incident): {e}")
+            return None
+        finally:
+            conn.close()
+
+    # ---------- log an at-risk event ----------
+    def log_at_risk_event(self, person_id, confidence, location):
+        """Log an at-risk (abnormal gait) detection"""
+        import time as _time
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                '''INSERT INTO fall_incidents (person_id, confidence, location, timestamp, status, type)
+                   VALUES (?, ?, ?, ?, 'logged', 'at_risk')''',
+                (person_id, confidence, location, _time.time())
+            )
+            conn.commit()
+            return cur.lastrowid
+        except Exception as e:
+            print(f"DB ERROR (log_at_risk_event): {e}")
+            return None
+        finally:
+            conn.close()
+
+    # ---------- resolve by person ----------
+    def resolve_fall_for_person(self, person_id):
+        """Resolve all active falls for a person (called on recovery)"""
+        import time as _time
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                '''UPDATE fall_incidents SET status = 'resolved', resolved_at = ?
+                   WHERE person_id = ? AND status = 'active' ''',
+                (_time.time(), person_id)
+            )
+            conn.commit()
+            if cur.rowcount:
+                print(f"DB: {cur.rowcount} incident(s) resolved for person {person_id}")
+            else:
+                print(f"DB: No active incidents found for person {person_id}")
+        finally:
+            conn.close()
+
+    # ---------- resolve by incident id ----------
+    def resolve_fall_incident(self, incident_id):
+        """Resolve a specific incident"""
+        import time as _time
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                '''UPDATE fall_incidents SET status = 'resolved', resolved_at = ?
+                   WHERE id = ?''',
+                (_time.time(), incident_id)
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"DB ERROR (resolve_fall_incident): {e}")
+            return False
+        finally:
+            conn.close()
+
+    # ---------- queries ----------
+    def get_all_incidents(self, limit=100, status=None):
+        """Get incidents with optional status filter, newest first"""
+        conn = self._get_conn()
+        try:
+            if status:
+                rows = conn.execute(
+                    'SELECT * FROM fall_incidents WHERE status = ? ORDER BY timestamp DESC LIMIT ?',
+                    (status, limit)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    'SELECT * FROM fall_incidents ORDER BY timestamp DESC LIMIT ?',
+                    (limit,)
+                ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_active_falls(self):
+        """Get currently active falls"""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM fall_incidents WHERE status = 'active' ORDER BY timestamp DESC"
+            ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_statistics(self):
+        """Get incident statistics"""
+        conn = self._get_conn()
+        try:
+            total = conn.execute('SELECT COUNT(*) FROM fall_incidents').fetchone()[0]
+            active = conn.execute("SELECT COUNT(*) FROM fall_incidents WHERE status = 'active'").fetchone()[0]
+            resolved = conn.execute("SELECT COUNT(*) FROM fall_incidents WHERE status = 'resolved'").fetchone()[0]
+            return {'total': total, 'active': active, 'resolved': resolved}
+        finally:
+            conn.close()
+
+    def delete_incident(self, incident_id):
+        """Delete a specific incident"""
+        conn = self._get_conn()
+        try:
+            conn.execute('DELETE FROM fall_incidents WHERE id = ?', (incident_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def clear_all_incidents(self):
+        """Clear all incidents"""
+        conn = self._get_conn()
+        try:
+            conn.execute('DELETE FROM fall_incidents')
+            conn.commit()
+        finally:
+            conn.close()
+
 
 # Initialize database when module is imported
 if __name__ == '__main__':

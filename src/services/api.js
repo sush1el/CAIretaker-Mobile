@@ -47,6 +47,8 @@ export const API_CONFIG = {
     // System
     REBOOT: '/api/system/reboot',
     SHUTDOWN: '/api/system/shutdown',
+    RESTART_SERVICES: '/api/system/restart-services',
+    SYSTEM_STATS: '/api/system/stats',
   },
   TIMEOUT: 10000, // 10 seconds
 };
@@ -336,6 +338,12 @@ class APIService {
     });
   }
 
+  async getSystemStats() {
+    return this.request(`${API_CONFIG.ENDPOINTS.SYSTEM_STATS}?_t=${Date.now()}`, {
+      method: 'GET',
+    });
+  }
+
   async rebootSystem() {
     return this.request(API_CONFIG.ENDPOINTS.REBOOT, {
       method: 'POST',
@@ -344,6 +352,12 @@ class APIService {
 
   async shutdownSystem() {
     return this.request(API_CONFIG.ENDPOINTS.SHUTDOWN, {
+      method: 'POST',
+    });
+  }
+
+  async restartServices() {
+    return this.request(API_CONFIG.ENDPOINTS.RESTART_SERVICES, {
       method: 'POST',
     });
   }

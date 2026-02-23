@@ -35,7 +35,7 @@ async function sendLocalFallNotification(personId, location) {
     },
     trigger: null,
   });
-  
+
   // Trigger device vibration
   Vibration.vibrate([0, 500, 200, 500, 200, 500]);
 }
@@ -49,13 +49,13 @@ export function startFallAlarm(personId = 'Unknown', location = 'Unknown') {
     console.log('🔔 Fall alarm already active');
     return;
   }
-  
+
   isAlarmActive = true;
   console.log('🔔 Starting continuous fall alarm');
-  
+
   // Send first notification immediately
   sendLocalFallNotification(personId, location);
-  
+
   // Then send every 3 seconds
   alarmIntervalId = setInterval(() => {
     if (isAlarmActive) {
@@ -73,18 +73,18 @@ export function stopFallAlarm() {
     console.log('🔕 No active alarm to stop');
     return;
   }
-  
+
   isAlarmActive = false;
-  
+
   if (alarmIntervalId) {
     clearInterval(alarmIntervalId);
     alarmIntervalId = null;
   }
-  
+
   // Stop vibration
   Vibration.cancel();
   console.log('🔕 Fall alarm stopped');
-  
+
   // Dismiss all notifications
   Notifications.dismissAllNotificationsAsync();
 }

@@ -549,100 +549,15 @@ def is_bending_posture(keypoints, image_shape):
 
 
 # ============================================================================
-# SIMPLE IN-MEMORY DATABASE FOR FALL INCIDENTS
+# SQLITE-BACKED DATABASE FOR FALL INCIDENTS (persistent across restarts)
 # ============================================================================
 
-class SimpleDatabase:
-    """Simple in-memory database for fall incidents"""
-    def __init__(self):
-        self.incidents = []
-        self.next_id = 1
-    
-    def log_fall_incident(self, person_id, confidence, location):
-        """Log a new fall incident"""
-        incident = {
-            'id': self.next_id,
-            'person_id': person_id,
-            'confidence': confidence,
-            'location': location,
-            'timestamp': time.time(),
-            'status': 'active',
-            'type': 'fall',
-            'resolved_at': None
-        }
-        self.incidents.append(incident)
-        self.next_id += 1
-        return incident['id']
-    
-    def log_at_risk_event(self, person_id, confidence, location):
-        """Log an at-risk (abnormal gait) detection"""
-        incident = {
-            'id': self.next_id,
-            'person_id': person_id,
-            'confidence': confidence,
-            'location': location,
-            'timestamp': time.time(),
-            'status': 'logged',  # Different status for at-risk vs active fall
-            'type': 'at_risk',
-            'resolved_at': None
-        }
-        self.incidents.append(incident)
-        self.next_id += 1
-        return incident['id']
-    
-    def resolve_fall_for_person(self, person_id):
-        """Resolve active falls for a person"""
-        resolved_count = 0
-        for incident in self.incidents:
-            if incident['person_id'] == person_id and incident['status'] == 'active':
-                incident['status'] = 'resolved'
-                incident['resolved_at'] = time.time()
-                resolved_count += 1
-                print(f"📱 DB: Incident {incident['id']} for person {person_id} resolved")
-        if resolved_count == 0:
-            print(f"📱 DB: No active incidents found for person {person_id}")
-    
-    def resolve_fall_incident(self, incident_id):
-        """Resolve a specific incident"""
-        for incident in self.incidents:
-            if incident['id'] == incident_id:
-                incident['status'] = 'resolved'
-                incident['resolved_at'] = time.time()
-                return True
-        return False
-    
-    def get_all_incidents(self, limit=100, status=None):
-        """Get all incidents with optional filter"""
-        result = self.incidents
-        if status:
-            result = [i for i in result if i['status'] == status]
-        return result[-limit:]
-    
-    def get_active_falls(self):
-        """Get currently active falls"""
-        return [i for i in self.incidents if i['status'] == 'active']
-    
-    def get_statistics(self):
-        """Get incident statistics"""
-        active = len([i for i in self.incidents if i['status'] == 'active'])
-        resolved = len([i for i in self.incidents if i['status'] == 'resolved'])
-        return {
-            'total': len(self.incidents),
-            'active': active,
-            'resolved': resolved
-        }
-    
-    def delete_incident(self, incident_id):
-        """Delete an incident"""
-        self.incidents = [i for i in self.incidents if i['id'] != incident_id]
-    
-    def clear_all_incidents(self):
-        """Clear all incidents"""
-        self.incidents = []
+import sys, os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from database import FallIncidentDB
 
-
-# Global database instance
-db = SimpleDatabase()
+# Global database instance — uses the same cairetaker.db as the auth server
+db = FallIncidentDB()
 
 
 # ============================================================================
@@ -900,18 +815,22 @@ class FallDetector:
                                             location=room_name
                                         )
                                         
-                                        self.fall_states[track_id]['is_fallen'] = True
-                                        self.fall_states[track_id]['incident_id'] = incident_id
-                                        
-                                        print(f"📝 Incident logged (ID: {incident_id})")
-                                        print(f"🚨 ALERT TRIGGERED - Caregivers must respond")
-                                        print(f"{'='*70}\n")
-                                        
-                                        # Send push notification to registered devices
-                                        send_expo_push_notification(
-                                            "🚨 Fall Detected!",
-                                            f"Person ID {track_id} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
-                                        )
+                                        if incident_id is None:
+                                            # Person already has an active fall in DB — skip duplicate
+                                            print(f"ℹ️ Person ID {track_id}: Active fall already exists in DB, skipping")
+                                        else:
+                                            self.fall_states[track_id]['is_fallen'] = True
+                                            self.fall_states[track_id]['incident_id'] = incident_id
+                                            
+                                            print(f"📝 Incident logged (ID: {incident_id})")
+                                            print(f"🚨 ALERT TRIGGERED - Caregivers must respond")
+                                            print(f"{'='*70}\n")
+                                            
+                                            # Send push notification to registered devices
+                                            send_expo_push_notification(
+                                                "🚨 Fall Detected!",
+                                                f"Person ID {track_id} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
+                                            )
                                     else:
                                         print(f"ℹ️ Person ID {track_id}: Fall already confirmed")
                                 else:
@@ -1384,10 +1303,7 @@ def get_incidents():
         status_filter = request.args.get('status')
         limit = int(request.args.get('limit', 100))
         
-        if status_filter:
-            incidents = [i for i in db.incidents if i['status'] == status_filter][-limit:]
-        else:
-            incidents = db.get_all_incidents(limit=limit)
+        incidents = db.get_all_incidents(limit=limit, status=status_filter)
         
         return jsonify({
             'success': True,

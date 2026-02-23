@@ -48,6 +48,71 @@ def health_check():
         'version': '1.0.0'
     })
 
+# ==================== SYSTEM STATS ENDPOINT ====================
+
+@app.route('/api/system/stats', methods=['GET'])
+def system_stats():
+    """Get Raspberry Pi system statistics"""
+    stats = {
+        'cpu_usage': 0,
+        'memory_percent': 0,
+        'temperature': 'N/A',
+        'voltage': 'N/A'
+    }
+    
+    # 1. CPU & Memory (Cross-platform)
+    try:
+        import psutil
+        stats['cpu_usage'] = psutil.cpu_percent(interval=0.1)
+        stats['memory_percent'] = psutil.virtual_memory().percent
+    except ImportError:
+        pass
+    except Exception as e:
+        stats['error_cpu'] = str(e)
+
+    # 2. Raspberry Pi Specific (Temperature & Voltage)
+    try:
+        # Check if vcgencmd exists (only on Pi)
+        temp_out = subprocess.check_output(['vcgencmd', 'measure_temp'], stderr=subprocess.STDOUT).decode('utf-8')
+        # Output format: temp=42.8'C
+        try:
+            raw_temp = temp_out.replace('temp=', '').replace('\'C', '').strip()
+            stats['temperature'] = f"{float(raw_temp):.1f}°C" # Format to 1 decimal place with °C
+        except ValueError:
+            stats['temperature'] = raw_temp # Keep raw if conversion fails
+        
+        try:
+            # vcgencmd pmic_read_adc (Pi 5 only)
+            pmic_out = subprocess.check_output(['vcgencmd', 'pmic_read_adc'], stderr=subprocess.STDOUT).decode('utf-8')
+            ext5v_line = next((line for line in pmic_out.split('\n') if 'EXT5V_V' in line), None)
+            if ext5v_line:
+                # Format: EXT5V_V voltage=5.12345V
+                raw_volts = ext5v_line.split('=')[-1].replace('V', '').strip()
+                try:
+                    stats['voltage'] = f"{float(raw_volts):.4f}V"
+                except ValueError:
+                    stats['voltage'] = f"{raw_volts}V"
+            else:
+                stats['voltage'] = 'N/A'
+        except Exception:
+            # Fallback to older core voltage if Pi 5 PMIC command isn't supported
+            try:
+                volt_out = subprocess.check_output(['vcgencmd', 'measure_volts'], stderr=subprocess.STDOUT).decode('utf-8')
+                raw_volts = volt_out.replace('volt=', '').replace('V', '').strip()
+                try:
+                    stats['voltage'] = f"{float(raw_volts):.4f}V"
+                except ValueError:
+                    stats['voltage'] = f"{raw_volts}V"
+            except Exception:
+                stats['voltage'] = 'N/A'
+    except Exception:
+        pass
+
+    return jsonify({
+        'success': True,
+        'stats': stats
+    })
+
 # ==================== SYSTEM ENDPOINTS ====================
 
 @app.route('/api/system/reboot', methods=['POST'])
@@ -83,6 +148,23 @@ def shutdown_system():
         return jsonify({
             'success': False,
             'error': f'Failed to shutdown: {str(e)}'
+        }), 500
+
+@app.route('/api/system/restart-services', methods=['POST'])
+def restart_services():
+    """Restart the backend services (picks up code changes without full reboot)"""
+    try:
+        subprocess.Popen(['sudo', 'systemctl', 'restart', 'cairetaker.service'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+        return jsonify({
+            'success': True,
+            'message': 'Services are restarting...'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'Failed to restart services: {str(e)}'
         }), 500
 
 # ==================== AUTH ENDPOINTS ====================
