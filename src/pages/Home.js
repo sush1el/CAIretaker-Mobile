@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Modal, Dimensions, StatusBar } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faCamera, faTriangleExclamation, faExclamationCircle, faChevronDown, faPersonWalking, faArrowLeft, faRefresh, faVideoCamera, faExpand, faCompress } from '@fortawesome/free-solid-svg-icons';
+import { faCamera, faTriangleExclamation, faChevronDown, faPersonWalking, faArrowLeft, faRefresh, faVideoCamera, faExpand, faCompress, faChartBar } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
 import api from '../services/api';
 import { useTheme } from '../context/ThemeContext';
+import AlertCard from '../components/AlertCard';
 
 export default function Home({ setScreen, setMonitoringRoom }) {
   const { theme, isDarkMode } = useTheme();
@@ -12,30 +13,26 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const [activeFallCount, setActiveFallCount] = useState(0);
   const [fallEvents, setFallEvents] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [roomFilter, setRoomFilter] = useState(null); // null = all rooms, 1/2/3 = specific room
-  const [sortType, setSortType] = useState('latestDate'); // latestDate, latestTime, oldestDate, oldestTime
+  const [roomFilter, setRoomFilter] = useState(null); 
+  const [sortType, setSortType] = useState('latestDate'); 
   const [showSortDropdown, setShowSortDropdown] = useState(false);
-  const [lastUpdate, setLastUpdate] = useState(Date.now()); // Force re-render on updates
+  const [lastUpdate, setLastUpdate] = useState(Date.now()); 
   const isPolling = useRef(false);
 
-  // Inline camera feed state
   const [selectedRoom, setSelectedRoom] = useState(null);
   const [cameraStatus, setCameraStatus] = useState(null);
   const [streamKey, setStreamKey] = useState(0);
   const [isStreamLoading, setIsStreamLoading] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // Fetch residents and fall events on mount
   useEffect(() => {
     fetchData();
   }, []);
 
-  // Poll for active falls every 500ms for real-time updates
   useEffect(() => {
     let mounted = true;
 
     const checkFalls = async () => {
-      // Prevent overlapping requests
       if (isPolling.current) return;
       isPolling.current = true;
 
@@ -43,33 +40,28 @@ export default function Home({ setScreen, setMonitoringRoom }) {
         let hasLiveFall = false;
         let liveFallCount = 0;
 
-        // Check camera status for real-time detections - PRIMARY source for status
         const statusResult = await api.getCameraStatus();
         if (mounted && statusResult.ok) {
           const detections = statusResult.data.detections || [];
-          // Check both is_fall and is_fallen for compatibility
           hasLiveFall = detections.some(d => d.is_fall || d.is_fallen);
           liveFallCount = detections.filter(d => d.is_fall || d.is_fallen).length;
 
-          // Also check has_active_fall from status if available
           if (statusResult.data.has_active_fall) {
             hasLiveFall = true;
             liveFallCount = Math.max(liveFallCount, 1);
           }
         }
 
-        // The status indicator should ONLY reflect current camera detections
         if (mounted) {
           setHasActiveFall(hasLiveFall);
           setActiveFallCount(liveFallCount);
-          setLastUpdate(Date.now()); // Force re-render
+          setLastUpdate(Date.now()); 
         }
 
-        // Refresh fall events for logs - this includes historical data from database
         const eventsResult = await api.getFallEvents();
         if (mounted && eventsResult.ok) {
           const events = eventsResult.data.events || eventsResult.data.incidents || [];
-          setFallEvents([...events]); // Create new array to ensure state update
+          setFallEvents([...events]); 
         }
       } catch (error) {
         console.log('Error checking falls:', error);
@@ -79,7 +71,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     };
 
     checkFalls();
-    const interval = setInterval(checkFalls, 500); // Poll every 500ms for real-time updates
+    const interval = setInterval(checkFalls, 500); 
 
     return () => {
       mounted = false;
@@ -87,7 +79,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     };
   }, []);
 
-  // Poll camera status when a room is selected for inline feed
   useEffect(() => {
     if (selectedRoom === null) {
       setCameraStatus(null);
@@ -126,7 +117,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const fetchData = async () => {
     setIsLoading(true);
     try {
-      // Fetch fall events
       const eventsResult = await api.getFallEvents();
       if (eventsResult.ok) {
         setFallEvents(eventsResult.data.events || []);
@@ -138,15 +128,11 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     }
   };
 
-  // Create logs from fall events - ONLY include confirmed Fall events
-  // Columns: ID, Room No, Status, Date, Time
   const recentLogs = fallEvents
     .filter(event => {
-      // Filter to only include fall events (not at-risk/abnormal gait until gait analysis is implemented)
       const isFall = event.class?.toLowerCase().includes('fall') || event.class?.toLowerCase().includes('fallen') || event.type === 'fall' || event.status === 'active';
       if (!isFall) return false;
 
-      // Apply room filter
       if (roomFilter !== null) {
         const roomNum = event.location ? event.location.replace(/\D/g, '') || '1' : '1';
         if (parseInt(roomNum) !== roomFilter) return false;
@@ -155,7 +141,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       return true;
     })
     .map((event, index) => {
-      // Extract room number from location (e.g., "Room 1" -> "1")
       const roomNum = event.location ? event.location.replace(/\D/g, '') || '1' : '1';
       const eventDate = event.timestamp ? new Date(event.timestamp * 1000) : new Date();
 
@@ -178,24 +163,19 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       };
     })
     .sort((a, b) => {
-      // Sort based on sortType
       const dateA = a.eventDate || new Date(0);
       const dateB = b.eventDate || new Date(0);
 
       switch (sortType) {
         case 'latestDate':
-          // Sort by date descending (newest first), then by time descending
           return dateB - dateA;
         case 'latestTime':
-          // Sort by time of day descending (latest time first)
           const timeA1 = dateA.getHours() * 60 + dateA.getMinutes();
           const timeB1 = dateB.getHours() * 60 + dateB.getMinutes();
           return timeB1 - timeA1;
         case 'oldestDate':
-          // Sort by date ascending (oldest first)
           return dateA - dateB;
         case 'oldestTime':
-          // Sort by time of day ascending (earliest time first)
           const timeA2 = dateA.getHours() * 60 + dateA.getMinutes();
           const timeB2 = dateB.getHours() * 60 + dateB.getMinutes();
           return timeA2 - timeB2;
@@ -204,7 +184,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       }
     });
 
-  // Sort options
   const sortOptions = [
     { value: 'latestDate', label: 'Latest by Date' },
     { value: 'latestTime', label: 'Latest by Time' },
@@ -214,16 +193,14 @@ export default function Home({ setScreen, setMonitoringRoom }) {
 
   const currentSortLabel = sortOptions.find(opt => opt.value === sortType)?.label || 'Latest by Date';
 
-  // Toggle room filter
   const handleRoomFilter = (room) => {
     if (roomFilter === room) {
-      setRoomFilter(null); // Deselect if already selected
+      setRoomFilter(null); 
     } else {
       setRoomFilter(room);
     }
   };
 
-  // Render inline camera feed when a room is selected
   const renderInlineCameraFeed = () => {
     if (selectedRoom !== 1) {
       return (
@@ -319,33 +296,129 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     );
   };
 
-  // Dynamic styles based on theme
+  // -------------------------
+  // THEME DYNAMIC STYLES
+  // -------------------------
   const dynamicStyles = {
     pillHeader: { backgroundColor: theme.card, padding: 12, borderRadius: 30, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
     pillHeaderText: { fontWeight: '800', color: theme.text, marginRight: 10, fontSize: 15 },
-    roomGrid: { flexDirection: 'row', justifyContent: 'space-between', backgroundColor: theme.primary, padding: 12, borderRadius: 20, marginBottom: 20 },
-    roomBtn: { backgroundColor: theme.card, padding: 15, borderRadius: 15, flex: 1, marginHorizontal: 5, alignItems: 'center' },
-    roomBtnLabel: { fontSize: 10, color: theme.text, fontWeight: 'bold' },
-    roomBtnNum: { fontSize: 24, fontWeight: '900', color: theme.text },
-    statusCard: { backgroundColor: theme.card, padding: 20, borderRadius: 15, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 20 },
-    statusCardText: { fontSize: 18, fontWeight: '700', color: '#7CB342' },
-    gaitStatusCard: { backgroundColor: theme.card, padding: 20, borderRadius: 15, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 20, borderWidth: 1, borderColor: isDarkMode ? '#3a4a5a' : '#E8F4F8', borderStyle: 'dashed' },
-    pagination: { flexDirection: 'row', backgroundColor: isDarkMode ? theme.card : '#E0E0E0', borderRadius: 8, overflow: 'hidden' },
-    paginationText: { color: theme.text, fontWeight: '600', fontSize: 11 },
-    sortDropdown: { flexDirection: 'row', alignItems: 'center', backgroundColor: isDarkMode ? theme.card : '#E0E0E0', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 },
-    sortDropdownText: { color: theme.primary, fontWeight: '600', fontSize: 11, marginRight: 6 },
-    sortDropdownMenu: { position: 'absolute', top: '100%', right: 0, backgroundColor: theme.card, borderRadius: 8, marginTop: 4, elevation: 5, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 4, minWidth: 140 },
-    sortDropdownItemText: { color: theme.text, fontSize: 11 },
-    logsContainer: { backgroundColor: theme.card, borderRadius: 15, overflow: 'hidden' },
-    logHeaderRow: { flexDirection: 'row', backgroundColor: theme.primary, padding: 12, alignItems: 'center' },
-    logRow: { flexDirection: 'row', padding: 12, borderBottomWidth: 1, borderBottomColor: isDarkMode ? '#3a4a5a' : '#EEE', alignItems: 'center' },
-    logText: { color: theme.text, fontSize: 11 },
+    
+    // 1. TOP CAMERA BUTTONS (No Borders, Clean Shadows, Bold Navy Assets)
+    topRoomGrid: { 
+      flexDirection: 'row', 
+      justifyContent: 'space-between', 
+      marginBottom: 20,
+      paddingHorizontal: 2 
+    },
+    topRoomBtn: { 
+      backgroundColor: theme.card, // Flat card color (white or dark gray depending on theme)
+      paddingVertical: 20, // Slightly taller to breathe
+      borderRadius: 24, 
+      flex: 1, 
+      marginHorizontal: 6, 
+      alignItems: 'center',
+      // We rely entirely on this beautiful floating shadow instead of an outline
+      shadowColor: isDarkMode ? '#000' : '#1E3A5F', // Navy-tinted shadow looks premium in light mode
+      shadowOffset: { width: 0, height: 6 },
+      shadowOpacity: 0.12,
+      shadowRadius: 10,
+      elevation: 6,
+      borderWidth: 0, // NO MORE BORDER
+    },
+    topRoomIconCircle: {
+      backgroundColor: '#1E3A5F', // Solid Navy Blue bubble
+      width: 44, // Slightly larger to act as the visual anchor
+      height: 44,
+      borderRadius: 22,
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginBottom: 10,
+      shadowColor: '#1E3A5F', // Inner glow/drop shadow for the circle itself
+      shadowOffset: { width: 0, height: 3 },
+      shadowOpacity: 0.3,
+      shadowRadius: 4,
+      elevation: 4,
+    },
+    topRoomBtnLabel: { 
+      fontSize: 10, 
+      color: isDarkMode ? '#8c9eff' : '#1E3A5F', // Navy Blue text
+      fontWeight: '800',
+      letterSpacing: 1,
+    },
+    topRoomBtnNum: { 
+      fontSize: 28, 
+      fontWeight: '900', 
+      color: isDarkMode ? theme.text : '#1E3A5F', // Navy Blue text
+      marginTop: 2,
+    },
+
+    // 2. NAVY BLUE RECENT LOGS HEADER 
+    logsSectionHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: '#1E3A5F', 
+      paddingVertical: 14,
+      paddingHorizontal: 20,
+      borderRadius: 15,
+      marginBottom: 15,
+    },
+    logsSectionHeaderText: {
+      fontWeight: '800',
+      color: '#FFFFFF', 
+      fontSize: 15,
+      marginLeft: 10,
+      letterSpacing: 1,
+    },
+
+    // 3. BOTTOM FILTER BUBBLES
+    livelyPaginationTrack: {
+      flexDirection: 'row',
+      backgroundColor: isDarkMode ? '#1A2332' : '#E8ECEF', 
+      borderRadius: 25, 
+      padding: 4, 
+      flex: 1, 
+      marginRight: 10,
+    },
+    bubbleBtn: {
+      flex: 1, 
+      paddingVertical: 10,
+      borderRadius: 20, 
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: 'transparent',
+    },
+    bubbleBtnActive: {
+      backgroundColor: isDarkMode ? '#1E3A5F' : '#FFFFFF', 
+      shadowColor: '#000',
+      shadowOffset: { width: 0, height: 2 },
+      shadowOpacity: 0.15,
+      shadowRadius: 4,
+      elevation: 3,
+    },
+    bubbleText: {
+      color: isDarkMode ? '#6C7C92' : '#8A9BA8', 
+      fontWeight: '700',
+      fontSize: 12,
+    },
+    bubbleTextActive: {
+      color: isDarkMode ? '#FFFFFF' : '#1E3A5F', 
+      fontWeight: '900',
+    },
+
+    sortDropdown: { flexDirection: 'row', alignItems: 'center', backgroundColor: isDarkMode ? '#1A2332' : '#E8ECEF', paddingHorizontal: 14, paddingVertical: 12, borderRadius: 25 },
+    sortDropdownText: { color: isDarkMode ? '#8c9eff' : '#5C6C7B', fontWeight: '700', fontSize: 11, marginRight: 6 },
+    sortDropdownMenu: { position: 'absolute', top: '100%', right: 0, backgroundColor: theme.card, borderRadius: 12, marginTop: 4, elevation: 5, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 4, minWidth: 150, zIndex: 1000 },
+    sortDropdownItemText: { color: theme.text, fontSize: 12 },
+    logsContainer: { backgroundColor: theme.card, borderRadius: 15, overflow: 'hidden', elevation: 2, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.1, shadowRadius: 3 },
+    logHeaderRow: { flexDirection: 'row', backgroundColor: theme.primary, padding: 14, alignItems: 'center' },
+    logRow: { flexDirection: 'row', padding: 14, borderBottomWidth: 1, borderBottomColor: isDarkMode ? '#2c3e50' : '#F0F0F0', alignItems: 'center' },
+    logText: { color: theme.text, fontSize: 12 },
     loadingContainer: { backgroundColor: theme.card, padding: 20, borderRadius: 15, alignItems: 'center' },
     loadingText: { color: theme.textSecondary, marginTop: 10 },
     emptyState: { backgroundColor: theme.card, padding: 30, borderRadius: 15, alignItems: 'center' },
     emptyStateText: { color: theme.textSecondary, fontWeight: '600', fontSize: 16 },
     emptyStateSubtext: { color: theme.textSecondary, marginTop: 5, fontSize: 12 },
-    // Inline camera feed dynamic styles
     backBadge: { backgroundColor: theme.primary, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20 },
     liveBadge: { backgroundColor: theme.primary, paddingHorizontal: 15, paddingVertical: 5, borderRadius: 20, flexDirection: 'row', alignItems: 'center' },
     metaBadge: { backgroundColor: theme.card, paddingHorizontal: 15, paddingVertical: 5, borderRadius: 20 },
@@ -354,25 +427,35 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   };
 
   return (
-    <View>
+    <View style={{ flex: 1, paddingBottom: 20 }}>
       {renderFullscreenModal()}
+      
+      {/* -------------------- TOP CAMERA SECTION -------------------- */}
       <View style={dynamicStyles.pillHeader}>
         <Text style={dynamicStyles.pillHeaderText}>{selectedRoom ? 'LIVE MONITORING' : 'SELECT CAMERA'}</Text>
         <FontAwesomeIcon icon={faCamera} color={theme.text} size={16} />
       </View>
 
+      {/* RE-STYLED LIVELY CAMERA SELECTION BUTTONS WITH NAVY */}
       {selectedRoom === null ? (
-        /* Room selection grid */
-        <View style={dynamicStyles.roomGrid}>
+        <View style={dynamicStyles.topRoomGrid}>
           {[1, 2, 3].map(r => (
-            <TouchableOpacity key={r} style={dynamicStyles.roomBtn} onPress={() => { setSelectedRoom(r); setMonitoringRoom(r); }}>
-              <Text style={dynamicStyles.roomBtnLabel}>ROOM</Text>
-              <Text style={dynamicStyles.roomBtnNum}>{r}</Text>
+            <TouchableOpacity 
+              key={r} 
+              style={dynamicStyles.topRoomBtn} 
+              activeOpacity={0.7}
+              onPress={() => { setSelectedRoom(r); setMonitoringRoom(r); }}
+            >
+              {/* Solid Navy Blue Icon Circle with White Icon */}
+              <View style={dynamicStyles.topRoomIconCircle}>
+                <FontAwesomeIcon icon={faVideoCamera} color="#FFFFFF" size={16} />
+              </View>
+              <Text style={dynamicStyles.topRoomBtnLabel}>ROOM</Text>
+              <Text style={dynamicStyles.topRoomBtnNum}>{r}</Text>
             </TouchableOpacity>
           ))}
         </View>
       ) : (
-        /* Inline camera feed */
         <View style={{ marginBottom: 20 }}>
           <View style={styles.liveMetaRow}>
             <TouchableOpacity style={dynamicStyles.backBadge} onPress={() => setSelectedRoom(null)}>
@@ -396,70 +479,61 @@ export default function Home({ setScreen, setMonitoringRoom }) {
         </View>
       )}
 
-      <View style={dynamicStyles.pillHeader}>
-        <Text style={dynamicStyles.pillHeaderText}>LIVE FALL ALERTS</Text>
-        <FontAwesomeIcon icon={faTriangleExclamation} color={theme.text} size={16} />
+      {/* -------------------- ALERT DASHBOARD -------------------- */}
+      <View style={styles.alertGridContainer}>
+        <AlertCard
+          title="Live Fall Alerts"
+          icon={faTriangleExclamation}
+          mainValue={hasActiveFall ? activeFallCount.toString() : "0"}
+          subText={hasActiveFall ? "Fall(s) Detected!" : "Active Falls"}
+          isSafe={!hasActiveFall}
+          theme={theme}
+          isDarkMode={isDarkMode}
+        />
+
+        <AlertCard
+          title="Live Gait Alerts"
+          icon={faPersonWalking}
+          mainValue="0" 
+          subText="Bad Gait Alerts"
+          isSafe={true} 
+          theme={theme}
+          isDarkMode={isDarkMode}
+        />
       </View>
 
-      {/* Fall Alert Status Card */}
-      <View style={[dynamicStyles.statusCard, hasActiveFall && styles.statusCardAlert]}>
-        <View style={[styles.statusDot, hasActiveFall && styles.redDot]} />
-        <Text style={[dynamicStyles.statusCardText, hasActiveFall && styles.statusCardTextAlert]}>
-          {hasActiveFall ? `Active Fall${activeFallCount > 1 ? 's' : ''} Detected!` : 'No Active Falls'}
-        </Text>
-        {hasActiveFall && (
-          <FontAwesomeIcon icon={faExclamationCircle} color="#D32F2F" size={20} style={{ marginLeft: 10 }} />
-        )}
+      {/* -------------------- RECENT LOGS SECTION -------------------- */}
+      <View style={dynamicStyles.logsSectionHeader}>
+        <Text style={dynamicStyles.logsSectionHeaderText}>RECENT LOGS </Text>
+        <FontAwesomeIcon icon={faChartBar} color="#FFFFFF" size={18} />
       </View>
 
-      {/* Live Gait Alerts Placeholder */}
-      <View style={dynamicStyles.pillHeader}>
-        <Text style={dynamicStyles.pillHeaderText}>LIVE GAIT ALERTS</Text>
-        <FontAwesomeIcon icon={faPersonWalking} color={theme.text} size={16} />
-      </View>
-
-      {/* Gait Alert Status Card - Placeholder */}
-      <View style={dynamicStyles.gaitStatusCard}>
-        <View style={styles.gaitStatusDot} />
-        <Text style={styles.gaitStatusCardText}>No Bad Gait Alerts</Text>
-      </View>
-
-      {/* Recent Logs Section */}
-      <View style={dynamicStyles.pillHeader}>
-        <Text style={dynamicStyles.pillHeaderText}>RECENT LOGS</Text>
-      </View>
-
-      {/* Filter Bar: Pagination on left, Sort dropdown on right */}
       <View style={styles.filterBar}>
-        {/* Room Pagination */}
-        <View style={dynamicStyles.pagination}>
+        <View style={dynamicStyles.livelyPaginationTrack}>
           {[1, 2, 3].map((room) => (
             <TouchableOpacity
               key={room}
               style={[
-                styles.paginationItem,
-                room === 1 && styles.paginationFirst,
-                room === 3 && styles.paginationLast,
-                roomFilter === room && { backgroundColor: theme.primary }
+                dynamicStyles.bubbleBtn,
+                roomFilter === room && dynamicStyles.bubbleBtnActive
               ]}
               onPress={() => handleRoomFilter(room)}
             >
               <Text style={[
-                dynamicStyles.paginationText,
-                roomFilter === room && styles.paginationTextActive
+                dynamicStyles.bubbleText,
+                roomFilter === room && dynamicStyles.bubbleTextActive
               ]}>Room {room}</Text>
             </TouchableOpacity>
           ))}
         </View>
 
-        {/* Sort Dropdown */}
         <View style={styles.sortDropdownContainer}>
           <TouchableOpacity
             style={dynamicStyles.sortDropdown}
             onPress={() => setShowSortDropdown(!showSortDropdown)}
           >
             <Text style={dynamicStyles.sortDropdownText}>{currentSortLabel}</Text>
-            <FontAwesomeIcon icon={faChevronDown} size={12} color={theme.primary} />
+            <FontAwesomeIcon icon={faChevronDown} size={10} color={isDarkMode ? '#8c9eff' : '#5C6C7B'} />
           </TouchableOpacity>
 
           {showSortDropdown && (
@@ -487,7 +561,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
         </View>
       </View>
 
-      {/* Recent Logs List - Room No, Status, Date, Time */}
       {isLoading ? (
         <View style={dynamicStyles.loadingContainer}>
           <ActivityIndicator size="small" color={theme.primary} />
@@ -495,7 +568,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
         </View>
       ) : recentLogs.length > 0 ? (
         <View style={dynamicStyles.logsContainer}>
-          {/* Header Row */}
           <View style={dynamicStyles.logHeaderRow}>
             <View style={styles.columnCenter}>
               <Text style={styles.logHeaderText}>Room No</Text>
@@ -511,7 +583,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
             </View>
           </View>
 
-          {/* Log Rows */}
           {recentLogs.slice(0, 10).map((log, index) => (
             <View key={`log-${index}-${log.incidentId || 'no-id'}-${log.date}-${log.time}`} style={dynamicStyles.logRow}>
               <View style={styles.columnCenter}>
@@ -534,11 +605,10 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       ) : (
         <View style={dynamicStyles.emptyState}>
           <Text style={dynamicStyles.emptyStateText}>No recent logs</Text>
-          <Text style={dynamicStyles.emptyStateSubtext}>Fall events and Abnormal Gait will appear here</Text>
+          <Text style={dynamicStyles.emptyStateSubtext}>Fall events will appear here</Text>
         </View>
       )}
 
-      {/* Hidden WebView to keep camera stream active for real-time detection */}
       <View style={styles.hiddenStream}>
         <WebView
           source={{ uri: api.getCameraStreamUrl() }}
@@ -552,23 +622,12 @@ export default function Home({ setScreen, setMonitoringRoom }) {
 }
 
 const styles = StyleSheet.create({
-  pillHeader: { backgroundColor: '#FFF', padding: 12, borderRadius: 30, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
-  pillHeaderText: { fontWeight: '800', color: '#1E3A5F', marginRight: 10, fontSize: 15 },
-  roomGrid: { flexDirection: 'row', justifyContent: 'space-between', backgroundColor: '#1E3A5F', padding: 12, borderRadius: 20, marginBottom: 20 },
-  roomBtn: { backgroundColor: '#FFF', padding: 15, borderRadius: 15, flex: 1, marginHorizontal: 5, alignItems: 'center' },
-  roomBtnLabel: { fontSize: 10, color: '#1E3A5F', fontWeight: 'bold' },
-  roomBtnNum: { fontSize: 24, fontWeight: '900', color: '#1E3A5F' },
-  statusCard: { backgroundColor: '#FFF', padding: 20, borderRadius: 15, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 20 },
-  statusCardAlert: { backgroundColor: '#FFEBEE', borderWidth: 2, borderColor: '#D32F2F' },
-  statusDot: { width: 12, height: 12, borderRadius: 6, backgroundColor: '#7CB342', marginRight: 10 },
-  redDot: { backgroundColor: '#D32F2F' },
-  statusCardText: { fontSize: 18, fontWeight: '700', color: '#7CB342' },
-  statusCardTextAlert: { color: '#D32F2F' },
-  // Gait Status Card (Placeholder)
-  gaitStatusCard: { backgroundColor: '#FFF', padding: 20, borderRadius: 15, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 20, borderWidth: 1, borderColor: '#E8F4F8', borderStyle: 'dashed' },
-  gaitStatusDot: { width: 12, height: 12, borderRadius: 6, backgroundColor: '#7CB342', marginRight: 10 },
-  gaitStatusCardText: { fontSize: 18, fontWeight: '700', color: '#7CB342' },
-  // Inline camera feed styles
+  alertGridContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 0, 
+    marginVertical: 15,
+  },
   liveMetaRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10, alignItems: 'center' },
   innerDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
   liveBadgeText: { color: '#FFF', fontWeight: 'bold', fontSize: 10 },
@@ -589,44 +648,15 @@ const styles = StyleSheet.create({
   fullscreenLiveText: { color: '#FFF', fontWeight: 'bold', fontSize: 12 },
   fullscreenRoomText: { color: '#FFF', fontWeight: 'bold', fontSize: 14, textShadowColor: 'rgba(0,0,0,0.8)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
   fullscreenCloseButton: { position: 'absolute', bottom: 15, right: 15, backgroundColor: 'rgba(0,0,0,0.6)', padding: 12, borderRadius: 14 },
-  // Filter Bar
-  filterBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 15 },
-  // Pagination Style
-  pagination: { flexDirection: 'row', backgroundColor: '#E0E0E0', borderRadius: 8, overflow: 'hidden' },
-  paginationItem: { paddingHorizontal: 12, paddingVertical: 8, borderRightWidth: 1, borderRightColor: '#CCC' },
-  paginationFirst: { borderTopLeftRadius: 8, borderBottomLeftRadius: 8 },
-  paginationLast: { borderTopRightRadius: 8, borderBottomRightRadius: 8, borderRightWidth: 0 },
-  paginationActive: { backgroundColor: '#1E3A5F' },
-  paginationText: { color: '#333', fontWeight: '600', fontSize: 11 },
-  paginationTextActive: { color: '#FFF' },
-  // Sort Dropdown
+  
+  filterBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15 },
+  
   sortDropdownContainer: { position: 'relative', zIndex: 100 },
-  sortDropdown: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#E0E0E0', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 },
-  sortDropdownText: { color: '#1E3A5F', fontWeight: '600', fontSize: 11, marginRight: 6 },
-  sortDropdownMenu: { position: 'absolute', top: '100%', right: 0, backgroundColor: '#FFF', borderRadius: 8, marginTop: 4, elevation: 5, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 4, minWidth: 140 },
-  sortDropdownItem: { paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#EEE' },
-  sortDropdownItemActive: { backgroundColor: '#E8F4FD' },
-  sortDropdownItemText: { color: '#333', fontSize: 11 },
-  sortDropdownItemTextActive: { color: '#1E3A5F', fontWeight: '600' },
-  // Logs Container
-  logsContainer: { backgroundColor: '#FFF', borderRadius: 15, overflow: 'hidden' },
-  logHeaderRow: { flexDirection: 'row', backgroundColor: '#1E3A5F', padding: 12, alignItems: 'center' },
-  logHeaderText: { color: '#FFF', fontWeight: 'bold', fontSize: 11 },
-  logRow: { flexDirection: 'row', padding: 12, borderBottomWidth: 1, borderBottomColor: '#EEE', alignItems: 'center' },
-  logText: { color: '#333', fontSize: 11 },
+  sortDropdownItem: { paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#F0F0F0' },
+  logHeaderText: { color: '#FFF', fontWeight: 'bold', fontSize: 12 },
   columnCenter: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  timeText: { color: '#999' },
-  // Tag Badges
-  tagBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12, backgroundColor: '#EEE' },
-  tagFall: { backgroundColor: '#D32F2F' },
-  tagGait: { backgroundColor: '#FFF8E1' },
-  tagText: { fontSize: 10, fontWeight: '600', color: '#FFF' },
-  // Loading & Empty States
-  loadingContainer: { backgroundColor: '#FFF', padding: 20, borderRadius: 15, alignItems: 'center' },
-  loadingText: { color: '#666', marginTop: 10 },
-  emptyState: { backgroundColor: '#FFF', padding: 30, borderRadius: 15, alignItems: 'center' },
-  emptyStateText: { color: '#666', fontWeight: '600', fontSize: 16 },
-  emptyStateSubtext: { color: '#999', marginTop: 5, fontSize: 12 },
-  // Hidden stream for keeping detection active
+  tagBadge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12, backgroundColor: '#EEE' },
+  tagFall: { backgroundColor: '#FF3B30' }, 
+  tagText: { fontSize: 11, fontWeight: '700', color: '#FFF', letterSpacing: 0.5 },
   hiddenStream: { position: 'absolute', width: 1, height: 1, opacity: 0, overflow: 'hidden' },
 });
