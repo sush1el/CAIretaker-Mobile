@@ -43,12 +43,22 @@ export const API_CONFIG = {
     CAMERA_STREAM: '/api/camera/stream',
     FALL_EVENTS: '/api/fall-events',
     ACTIVE_FALLS: '/api/active-falls',
+    GAIT_EVENTS: '/api/gait-events',
 
     // System
     REBOOT: '/api/system/reboot',
     SHUTDOWN: '/api/system/shutdown',
     RESTART_SERVICES: '/api/system/restart-services',
     SYSTEM_STATS: '/api/system/stats',
+
+    // Data Gathering (camera server)
+    DATA_GATHERING_START: '/api/data-gathering/start',
+    DATA_GATHERING_STOP: '/api/data-gathering/stop',
+    DATA_GATHERING_STATUS: '/api/data-gathering/status',
+    DATA_GATHERING_REPORT: '/api/data-gathering/report',
+    DATA_GATHERING_EXPORT: '/api/data-gathering/export',
+    // Push token registration on the camera server
+    PUSH_TOKEN_CAMERA: '/api/push-token',
   },
   TIMEOUT: 10000, // 10 seconds
 };
@@ -318,14 +328,26 @@ class APIService {
   }
 
   async clearFallEvents() {
-    return this.cameraRequest(`${API_CONFIG.ENDPOINTS.FALL_EVENTS}/clear`, {
+    return this.cameraRequest('/incidents/clear', {
       method: 'POST',
+    });
+  }
+
+  async deleteFallEvent(incidentId) {
+    return this.cameraRequest(`/incidents/${incidentId}`, {
+      method: 'DELETE',
     });
   }
 
   async getActiveFalls() {
     // Add timestamp to prevent caching and ensure fresh data
     return this.cameraRequest(`${API_CONFIG.ENDPOINTS.ACTIVE_FALLS}?_t=${Date.now()}`, {
+      method: 'GET',
+    });
+  }
+
+  async getGaitEvents() {
+    return this.cameraRequest(`${API_CONFIG.ENDPOINTS.GAIT_EVENTS}?_t=${Date.now()}`, {
       method: 'GET',
     });
   }
@@ -359,6 +381,45 @@ class APIService {
   async restartServices() {
     return this.request(API_CONFIG.ENDPOINTS.RESTART_SERVICES, {
       method: 'POST',
+    });
+  }
+
+  // ==================== DATA GATHERING METHODS ====================
+
+  async startDataGathering() {
+    return this.cameraRequest(API_CONFIG.ENDPOINTS.DATA_GATHERING_START, {
+      method: 'POST',
+    });
+  }
+
+  async stopDataGathering() {
+    return this.cameraRequest(API_CONFIG.ENDPOINTS.DATA_GATHERING_STOP, {
+      method: 'POST',
+    });
+  }
+
+  async getDataGatheringStatus() {
+    return this.cameraRequest(`${API_CONFIG.ENDPOINTS.DATA_GATHERING_STATUS}?_t=${Date.now()}`, {
+      method: 'GET',
+    });
+  }
+
+  async getDataGatheringReport() {
+    return this.cameraRequest(`${API_CONFIG.ENDPOINTS.DATA_GATHERING_REPORT}?_t=${Date.now()}`, {
+      method: 'GET',
+    });
+  }
+
+  getDataGatheringExportUrl() {
+    return `${API_CONFIG.CAMERA_URL}${API_CONFIG.ENDPOINTS.DATA_GATHERING_EXPORT}`;
+  }
+
+  async registerPushTokenOnCamera(token) {
+    // Register the Expo push token with the CAMERA server (fall_detector_server_pi.py)
+    // so it can measure real notification delivery times during field tests.
+    return this.cameraRequest(API_CONFIG.ENDPOINTS.PUSH_TOKEN_CAMERA, {
+      method: 'POST',
+      body: JSON.stringify({ token }),
     });
   }
 }

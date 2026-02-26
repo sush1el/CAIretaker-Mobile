@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { View, ActivityIndicator, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
+import { View, ActivityIndicator, Text, StyleSheet, ScrollView, TouchableOpacity, Alert } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faChevronDown } from '@fortawesome/free-solid-svg-icons';
+import { faChevronDown, faChevronLeft, faChevronRight, faTrash, faFileExport } from '@fortawesome/free-solid-svg-icons';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
 import api from '../services/api';
 import { useTheme } from '../context/ThemeContext';
 
@@ -12,6 +14,9 @@ export default function Logs() {
   const [roomFilter, setRoomFilter] = useState(null); // null = all rooms, 1/2/3 = specific room
   const [sortType, setSortType] = useState('latestDate'); // latestDate, latestTime, oldestDate, oldestTime
   const [showSortDropdown, setShowSortDropdown] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+
+  const ROWS_PER_PAGE = 10;
 
   useEffect(() => {
     fetchData();
@@ -26,20 +31,23 @@ export default function Logs() {
       const eventsResult = await api.getFallEvents();
       if (eventsResult.ok) {
         const fallEvents = eventsResult.data.events || [];
-        
-        // Transform fall events to log format - only falls
+
+        // Transform fall events to log format — falls and gait alerts
         // Columns: Room No, Status, Date, Time
         const transformedLogs = fallEvents
-          .filter(event => event.type === 'fall')
+          .filter(event => event.type === 'fall' || event.type === 'at_risk')
           .map((event, index) => {
             const roomNum = event.location ? event.location.replace(/\D/g, '') || '1' : '1';
             const eventDate = event.timestamp ? new Date(event.timestamp * 1000) : new Date();
-            
+            const isGait = event.type === 'at_risk';
+
             return {
-              id: event.id || index,
+              id: event.id ?? event.incident_id ?? null,
+              key: `${event.id ?? event.incident_id ?? index}-${event.timestamp ?? Date.now()}-${index}`,
               roomNo: `Room ${roomNum}`,
               roomNum: parseInt(roomNum),
-              status: 'Fall',
+              status: isGait ? 'Gait' : 'Fall',
+              eventType: event.type,
               timestamp: event.timestamp,
               eventDate: eventDate,
               date: eventDate.toLocaleDateString('en-US', {
@@ -47,14 +55,14 @@ export default function Logs() {
                 day: 'numeric',
                 year: 'numeric'
               }),
-              time: eventDate.toLocaleTimeString('en-US', { 
-                hour: 'numeric', 
+              time: eventDate.toLocaleTimeString('en-US', {
+                hour: 'numeric',
                 minute: '2-digit',
-                hour12: true 
+                hour12: true
               }),
             };
           });
-        
+
         setAllLogs(transformedLogs);
       }
     } catch (error) {
@@ -70,7 +78,7 @@ export default function Logs() {
     .sort((a, b) => {
       const dateA = a.eventDate || new Date(0);
       const dateB = b.eventDate || new Date(0);
-      
+
       switch (sortType) {
         case 'latestDate':
           return dateB - dateA;
@@ -89,6 +97,9 @@ export default function Logs() {
       }
     });
 
+  const totalPages = Math.max(1, Math.ceil(logs.length / ROWS_PER_PAGE));
+  const paginatedLogs = logs.slice((currentPage - 1) * ROWS_PER_PAGE, currentPage * ROWS_PER_PAGE);
+
   // Sort options
   const sortOptions = [
     { value: 'latestDate', label: 'Latest by Date' },
@@ -101,11 +112,80 @@ export default function Logs() {
 
   // Toggle room filter
   const handleRoomFilter = (room) => {
+    setCurrentPage(1);
     if (roomFilter === room) {
       setRoomFilter(null);
     } else {
       setRoomFilter(room);
     }
+  };
+
+  useEffect(() => {
+    setCurrentPage(prev => Math.min(prev, totalPages));
+  }, [totalPages]);
+
+  const handleExportCSV = async () => {
+    if (logs.length === 0) {
+      Alert.alert('No Data', 'There are no logs to export.');
+      return;
+    }
+
+    try {
+      const header = 'Room No,Status,Date,Time\n';
+      const rows = logs
+        .map(log => `"${log.roomNo}","${log.status}","${log.date}","${log.time}"`)
+        .join('\n');
+      const csvContent = header + rows;
+
+      const fileName = `fall_logs_${new Date().toISOString().slice(0, 10)}.csv`;
+      const fileUri = FileSystem.cacheDirectory + fileName;
+
+      await FileSystem.writeAsStringAsync(fileUri, csvContent, {
+        encoding: 'utf8',
+      });
+
+      const isAvailable = await Sharing.isAvailableAsync();
+      if (!isAvailable) {
+        Alert.alert('Sharing Not Available', 'Sharing is not supported on this device.');
+        return;
+      }
+
+      await Sharing.shareAsync(fileUri, {
+        mimeType: 'text/csv',
+        dialogTitle: 'Export Fall Logs CSV',
+        UTI: 'public.comma-separated-values-text',
+      });
+    } catch (error) {
+      console.error('CSV export error:', error);
+      Alert.alert('Export Failed', 'An error occurred while exporting the logs.');
+    }
+  };
+
+  const handleDeleteLog = (log) => {
+    if (!log.id) {
+      Alert.alert('Unable to Delete', 'This log does not have a valid incident ID.');
+      return;
+    }
+
+    Alert.alert(
+      'Delete Log',
+      `Delete ${log.roomNo} fall log from ${log.date} ${log.time}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            const result = await api.deleteFallEvent(log.id);
+            if (result.ok) {
+              setAllLogs(prev => prev.filter(item => item.id !== log.id));
+            } else {
+              Alert.alert('Delete Failed', result.data?.error || 'Failed to delete log.');
+            }
+          },
+        },
+      ]
+    );
   };
 
   if (isLoading) {
@@ -215,8 +295,8 @@ export default function Logs() {
         {/* Room Pagination */}
         <View style={dynamicStyles.pagination}>
           {[1, 2, 3].map((room) => (
-            <TouchableOpacity 
-              key={room} 
+            <TouchableOpacity
+              key={room}
               style={[
                 styles.paginationItem,
                 room === 1 && styles.paginationFirst,
@@ -235,14 +315,14 @@ export default function Logs() {
 
         {/* Sort Dropdown */}
         <View style={styles.sortDropdownContainer}>
-          <TouchableOpacity 
+          <TouchableOpacity
             style={dynamicStyles.sortDropdown}
             onPress={() => setShowSortDropdown(!showSortDropdown)}
           >
             <Text style={dynamicStyles.sortDropdownText}>{currentSortLabel}</Text>
             <FontAwesomeIcon icon={faChevronDown} size={12} color={theme.primary} />
           </TouchableOpacity>
-          
+
           {showSortDropdown && (
             <View style={dynamicStyles.sortDropdownMenu}>
               {sortOptions.map((option) => (
@@ -254,6 +334,7 @@ export default function Logs() {
                   ]}
                   onPress={() => {
                     setSortType(option.value);
+                    setCurrentPage(1);
                     setShowSortDropdown(false);
                   }}
                 >
@@ -284,18 +365,21 @@ export default function Logs() {
           <View style={styles.columnCenter}>
             <Text style={styles.headerText}>Time</Text>
           </View>
+          <View style={styles.columnAction}>
+            <Text style={styles.headerText}>Action</Text>
+          </View>
         </View>
 
         {/* Log Rows */}
         <ScrollView style={styles.scrollContainer}>
-          {logs.length > 0 ? (
-            logs.map((log, index) => (
-              <View key={index} style={[dynamicStyles.row, index % 2 === 0 && dynamicStyles.rowEven]}>
+          {paginatedLogs.length > 0 ? (
+            paginatedLogs.map((log, index) => (
+              <View key={log.key} style={[dynamicStyles.row, index % 2 === 0 && dynamicStyles.rowEven]}>
                 <View style={styles.columnCenter}>
                   <Text style={dynamicStyles.cellText}>{log.roomNo}</Text>
                 </View>
                 <View style={styles.columnCenter}>
-                  <View style={styles.statusBadge}>
+                  <View style={[styles.statusBadge, log.eventType === 'at_risk' && styles.statusBadgeGait]}>
                     <Text style={styles.statusText}>{log.status}</Text>
                   </View>
                 </View>
@@ -305,16 +389,56 @@ export default function Logs() {
                 <View style={styles.columnCenter}>
                   <Text style={dynamicStyles.cellText}>{log.time}</Text>
                 </View>
+                <View style={styles.columnAction}>
+                  <TouchableOpacity style={styles.deleteButton} onPress={() => handleDeleteLog(log)}>
+                    <FontAwesomeIcon icon={faTrash} size={12} color={theme.danger} />
+                  </TouchableOpacity>
+                </View>
               </View>
             ))
           ) : (
             <View style={styles.emptyState}>
-              <Text style={[styles.emptyText, { color: theme.textSecondary }]}>No fall events logged</Text>
-              <Text style={[styles.emptySubtext, { color: theme.textSecondary }]}>Fall events will appear here when detected</Text>
+              <Text style={[styles.emptyText, { color: theme.textSecondary }]}>No events logged</Text>
+              <Text style={[styles.emptySubtext, { color: theme.textSecondary }]}>Fall and gait events will appear here when detected</Text>
             </View>
           )}
         </ScrollView>
       </View>
+
+      {/* Export CSV — compact, bottom right, above pagination */}
+      <View style={styles.exportRow}>
+        <TouchableOpacity
+          style={[styles.exportButton, { backgroundColor: theme.primary }]}
+          onPress={handleExportCSV}
+        >
+          <FontAwesomeIcon icon={faFileExport} size={13} color="#FFF" />
+          <Text style={styles.exportButtonText}>Export CSV</Text>
+        </TouchableOpacity>
+      </View>
+
+      {logs.length > 0 && (
+        <View style={styles.paginationFooter}>
+          <TouchableOpacity
+            style={[styles.pageArrowButton, currentPage === 1 && styles.pageArrowDisabled]}
+            disabled={currentPage === 1}
+            onPress={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+          >
+            <FontAwesomeIcon icon={faChevronLeft} size={12} color={currentPage === 1 ? theme.textSecondary : theme.primary} />
+          </TouchableOpacity>
+
+          <Text style={[styles.pageText, { color: theme.textSecondary }]}>
+            Page {currentPage} of {totalPages}
+          </Text>
+
+          <TouchableOpacity
+            style={[styles.pageArrowButton, currentPage === totalPages && styles.pageArrowDisabled]}
+            disabled={currentPage === totalPages}
+            onPress={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+          >
+            <FontAwesomeIcon icon={faChevronRight} size={12} color={currentPage === totalPages ? theme.textSecondary : theme.primary} />
+          </TouchableOpacity>
+        </View>
+      )}
     </View>
   );
 }
@@ -335,6 +459,25 @@ const styles = StyleSheet.create({
     color: '#666',
     fontSize: 14,
   },
+  exportRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: 10,
+    marginBottom: 4,
+  },
+  exportButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    gap: 6,
+  },
+  exportButtonText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '600',
+  },
   titleContainer: {
     backgroundColor: '#1E3A5F',
     paddingVertical: 12,
@@ -342,6 +485,19 @@ const styles = StyleSheet.create({
     borderRadius: 25,
     marginBottom: 15,
     alignItems: 'center',
+  },
+  exportButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 10,
+    gap: 6,
+  },
+  exportButtonText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '600',
   },
   title: {
     color: '#FFFFFF',
@@ -464,6 +620,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  columnAction: {
+    width: 60,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   scrollContainer: {
     maxHeight: 400,
   },
@@ -488,6 +649,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     borderRadius: 12,
   },
+  statusBadgeGait: {
+    backgroundColor: '#F57C00',
+  },
   statusText: {
     color: '#FFFFFF',
     fontSize: 10,
@@ -506,5 +670,30 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#999',
     marginTop: 5,
+  },
+  deleteButton: {
+    padding: 8,
+  },
+  paginationFooter: {
+    marginTop: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pageArrowButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(30,58,95,0.08)',
+  },
+  pageArrowDisabled: {
+    opacity: 0.45,
+  },
+  pageText: {
+    marginHorizontal: 12,
+    fontSize: 12,
+    fontWeight: '600',
   },
 });

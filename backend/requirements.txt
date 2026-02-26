@@ -5,6 +5,7 @@ Flask-JWT-Extended==4.6.0
 python-dotenv==1.0.0
 bcrypt==4.1.2
 eventlet==0.34.2
+psutil>=5.9.0
 
 # Camera & Fall Detection
 opencv-python==4.9.0.80
@@ -12,6 +13,8 @@ ultralytics>=8.0.0
 numpy>=1.24.0
 torch>=2.0.0
 torchvision>=0.15.0
+onnxruntime>=1.16.0
 
 # Push Notifications
 firebase-admin>=6.0.0
+expo-file-system expo-sharing

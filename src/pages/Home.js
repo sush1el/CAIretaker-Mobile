@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Modal, Dimensions, StatusBar } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Modal, Dimensions, StatusBar, Alert } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faCamera, faTriangleExclamation, faChevronDown, faPersonWalking, faArrowLeft, faRefresh, faVideoCamera, faExpand, faCompress, faChartBar } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
@@ -13,10 +13,12 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const [activeFallCount, setActiveFallCount] = useState(0);
   const [fallEvents, setFallEvents] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [roomFilter, setRoomFilter] = useState(null); 
-  const [sortType, setSortType] = useState('latestDate'); 
+  const [roomFilter, setRoomFilter] = useState(null);
+  const [sortType, setSortType] = useState('latestDate');
   const [showSortDropdown, setShowSortDropdown] = useState(false);
-  const [lastUpdate, setLastUpdate] = useState(Date.now()); 
+  const [homeLogsClearedAt, setHomeLogsClearedAt] = useState(null);
+  const [lastUpdate, setLastUpdate] = useState(Date.now());
+  const [gaitAlertCount, setGaitAlertCount] = useState(0);
   const isPolling = useRef(false);
 
   const [selectedRoom, setSelectedRoom] = useState(null);
@@ -55,13 +57,14 @@ export default function Home({ setScreen, setMonitoringRoom }) {
         if (mounted) {
           setHasActiveFall(hasLiveFall);
           setActiveFallCount(liveFallCount);
-          setLastUpdate(Date.now()); 
+          setGaitAlertCount(statusResult.ok ? (statusResult.data.gait_alerts || 0) : 0);
+          setLastUpdate(Date.now());
         }
 
         const eventsResult = await api.getFallEvents();
         if (mounted && eventsResult.ok) {
           const events = eventsResult.data.events || eventsResult.data.incidents || [];
-          setFallEvents([...events]); 
+          setFallEvents([...events]);
         }
       } catch (error) {
         console.log('Error checking falls:', error);
@@ -71,7 +74,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     };
 
     checkFalls();
-    const interval = setInterval(checkFalls, 500); 
+    const interval = setInterval(checkFalls, 500);
 
     return () => {
       mounted = false;
@@ -131,7 +134,12 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const recentLogs = fallEvents
     .filter(event => {
       const isFall = event.class?.toLowerCase().includes('fall') || event.class?.toLowerCase().includes('fallen') || event.type === 'fall' || event.status === 'active';
-      if (!isFall) return false;
+      const isGait = event.type === 'at_risk';
+      if (!isFall && !isGait) return false;
+
+      if (homeLogsClearedAt !== null) {
+        if (!event.timestamp || event.timestamp <= homeLogsClearedAt) return false;
+      }
 
       if (roomFilter !== null) {
         const roomNum = event.location ? event.location.replace(/\D/g, '') || '1' : '1';
@@ -143,11 +151,13 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     .map((event, index) => {
       const roomNum = event.location ? event.location.replace(/\D/g, '') || '1' : '1';
       const eventDate = event.timestamp ? new Date(event.timestamp * 1000) : new Date();
+      const isGait = event.type === 'at_risk';
 
       return {
         incidentId: event.id || index,
         roomNo: `Room ${roomNum}`,
-        status: 'Fall',
+        status: isGait ? 'Gait' : 'Fall',
+        eventType: event.type,
         timestamp: event.timestamp,
         eventDate: eventDate,
         date: eventDate.toLocaleDateString('en-US', {
@@ -195,10 +205,27 @@ export default function Home({ setScreen, setMonitoringRoom }) {
 
   const handleRoomFilter = (room) => {
     if (roomFilter === room) {
-      setRoomFilter(null); 
+      setRoomFilter(null);
     } else {
       setRoomFilter(room);
     }
+  };
+
+  const handleClearLogs = () => {
+    Alert.alert(
+      'Clear Home Logs',
+      'This will only clear logs shown on this Home page until a new log is recorded.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: () => {
+            setHomeLogsClearedAt(Math.floor(Date.now() / 1000));
+          },
+        },
+      ]
+    );
   };
 
   const renderInlineCameraFeed = () => {
@@ -242,8 +269,8 @@ export default function Home({ setScreen, setMonitoringRoom }) {
           bounces={false}
           onError={(e) => console.log('WebView error:', e.nativeEvent)}
         />
-        <TouchableOpacity 
-          style={styles.fullscreenButton} 
+        <TouchableOpacity
+          style={styles.fullscreenButton}
           onPress={() => setIsFullscreen(true)}
         >
           <FontAwesomeIcon icon={faExpand} color="#FFF" size={16} />
@@ -302,20 +329,20 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const dynamicStyles = {
     pillHeader: { backgroundColor: theme.card, padding: 12, borderRadius: 30, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
     pillHeaderText: { fontWeight: '800', color: theme.text, marginRight: 10, fontSize: 15 },
-    
+
     // 1. TOP CAMERA BUTTONS (No Borders, Clean Shadows, Bold Navy Assets)
-    topRoomGrid: { 
-      flexDirection: 'row', 
-      justifyContent: 'space-between', 
+    topRoomGrid: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
       marginBottom: 20,
-      paddingHorizontal: 2 
+      paddingHorizontal: 2
     },
-    topRoomBtn: { 
+    topRoomBtn: {
       backgroundColor: theme.card, // Flat card color (white or dark gray depending on theme)
       paddingVertical: 20, // Slightly taller to breathe
-      borderRadius: 24, 
-      flex: 1, 
-      marginHorizontal: 6, 
+      borderRadius: 24,
+      flex: 1,
+      marginHorizontal: 6,
       alignItems: 'center',
       // We rely entirely on this beautiful floating shadow instead of an outline
       shadowColor: isDarkMode ? '#000' : '#1E3A5F', // Navy-tinted shadow looks premium in light mode
@@ -339,15 +366,15 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       shadowRadius: 4,
       elevation: 4,
     },
-    topRoomBtnLabel: { 
-      fontSize: 10, 
+    topRoomBtnLabel: {
+      fontSize: 10,
       color: isDarkMode ? '#8c9eff' : '#1E3A5F', // Navy Blue text
       fontWeight: '800',
       letterSpacing: 1,
     },
-    topRoomBtnNum: { 
-      fontSize: 28, 
-      fontWeight: '900', 
+    topRoomBtnNum: {
+      fontSize: 28,
+      fontWeight: '900',
       color: isDarkMode ? theme.text : '#1E3A5F', // Navy Blue text
       marginTop: 2,
     },
@@ -357,7 +384,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'center',
-      backgroundColor: '#1E3A5F', 
+      backgroundColor: '#1E3A5F',
       paddingVertical: 14,
       paddingHorizontal: 20,
       borderRadius: 15,
@@ -365,7 +392,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     },
     logsSectionHeaderText: {
       fontWeight: '800',
-      color: '#FFFFFF', 
+      color: '#FFFFFF',
       fontSize: 15,
       marginLeft: 10,
       letterSpacing: 1,
@@ -374,22 +401,22 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     // 3. BOTTOM FILTER BUBBLES
     livelyPaginationTrack: {
       flexDirection: 'row',
-      backgroundColor: isDarkMode ? '#1A2332' : '#E8ECEF', 
-      borderRadius: 25, 
-      padding: 4, 
-      flex: 1, 
+      backgroundColor: isDarkMode ? '#1A2332' : '#E8ECEF',
+      borderRadius: 25,
+      padding: 4,
+      flex: 1,
       marginRight: 10,
     },
     bubbleBtn: {
-      flex: 1, 
+      flex: 1,
       paddingVertical: 10,
-      borderRadius: 20, 
+      borderRadius: 20,
       alignItems: 'center',
       justifyContent: 'center',
       backgroundColor: 'transparent',
     },
     bubbleBtnActive: {
-      backgroundColor: isDarkMode ? '#1E3A5F' : '#FFFFFF', 
+      backgroundColor: isDarkMode ? '#1E3A5F' : '#FFFFFF',
       shadowColor: '#000',
       shadowOffset: { width: 0, height: 2 },
       shadowOpacity: 0.15,
@@ -397,12 +424,12 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       elevation: 3,
     },
     bubbleText: {
-      color: isDarkMode ? '#6C7C92' : '#8A9BA8', 
+      color: isDarkMode ? '#6C7C92' : '#8A9BA8',
       fontWeight: '700',
       fontSize: 12,
     },
     bubbleTextActive: {
-      color: isDarkMode ? '#FFFFFF' : '#1E3A5F', 
+      color: isDarkMode ? '#FFFFFF' : '#1E3A5F',
       fontWeight: '900',
     },
 
@@ -424,12 +451,18 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     metaBadge: { backgroundColor: theme.card, paddingHorizontal: 15, paddingVertical: 5, borderRadius: 20 },
     refreshBadge: { backgroundColor: theme.card, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20 },
     metaText: { color: theme.text, fontWeight: 'bold', fontSize: 10 },
+    clearLogsButton: {
+      backgroundColor: theme.danger,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderRadius: 16,
+    },
   };
 
   return (
     <View style={{ flex: 1, paddingBottom: 20 }}>
       {renderFullscreenModal()}
-      
+
       {/* -------------------- TOP CAMERA SECTION -------------------- */}
       <View style={dynamicStyles.pillHeader}>
         <Text style={dynamicStyles.pillHeaderText}>{selectedRoom ? 'LIVE MONITORING' : 'SELECT CAMERA'}</Text>
@@ -440,9 +473,9 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       {selectedRoom === null ? (
         <View style={dynamicStyles.topRoomGrid}>
           {[1, 2, 3].map(r => (
-            <TouchableOpacity 
-              key={r} 
-              style={dynamicStyles.topRoomBtn} 
+            <TouchableOpacity
+              key={r}
+              style={dynamicStyles.topRoomBtn}
               activeOpacity={0.7}
               onPress={() => { setSelectedRoom(r); setMonitoringRoom(r); }}
             >
@@ -494,9 +527,9 @@ export default function Home({ setScreen, setMonitoringRoom }) {
         <AlertCard
           title="Live Gait Alerts"
           icon={faPersonWalking}
-          mainValue="0" 
-          subText="Bad Gait Alerts"
-          isSafe={true} 
+          mainValue={gaitAlertCount.toString()}
+          subText={gaitAlertCount > 0 ? "Abnormal Gait!" : "Bad Gait Alerts"}
+          isSafe={gaitAlertCount === 0}
           theme={theme}
           isDarkMode={isDarkMode}
         />
@@ -583,13 +616,13 @@ export default function Home({ setScreen, setMonitoringRoom }) {
             </View>
           </View>
 
-          {recentLogs.slice(0, 10).map((log, index) => (
+          {recentLogs.slice(0, 5).map((log, index) => (
             <View key={`log-${index}-${log.incidentId || 'no-id'}-${log.date}-${log.time}`} style={dynamicStyles.logRow}>
               <View style={styles.columnCenter}>
                 <Text style={dynamicStyles.logText}>{log.roomNo}</Text>
               </View>
               <View style={styles.columnCenter}>
-                <View style={[styles.tagBadge, styles.tagFall]}>
+                <View style={[styles.tagBadge, log.eventType === 'at_risk' ? styles.tagGait : styles.tagFall]}>
                   <Text style={styles.tagText}>{log.status}</Text>
                 </View>
               </View>
@@ -609,6 +642,12 @@ export default function Home({ setScreen, setMonitoringRoom }) {
         </View>
       )}
 
+      <View style={styles.logsActionsRow}>
+        <TouchableOpacity style={dynamicStyles.clearLogsButton} onPress={handleClearLogs}>
+          <Text style={styles.clearLogsButtonText}>Clear Logs</Text>
+        </TouchableOpacity>
+      </View>
+
       <View style={styles.hiddenStream}>
         <WebView
           source={{ uri: api.getCameraStreamUrl() }}
@@ -625,7 +664,7 @@ const styles = StyleSheet.create({
   alertGridContainer: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    paddingHorizontal: 0, 
+    paddingHorizontal: 0,
     marginVertical: 15,
   },
   liveMetaRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10, alignItems: 'center' },
@@ -648,15 +687,27 @@ const styles = StyleSheet.create({
   fullscreenLiveText: { color: '#FFF', fontWeight: 'bold', fontSize: 12 },
   fullscreenRoomText: { color: '#FFF', fontWeight: 'bold', fontSize: 14, textShadowColor: 'rgba(0,0,0,0.8)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
   fullscreenCloseButton: { position: 'absolute', bottom: 15, right: 15, backgroundColor: 'rgba(0,0,0,0.6)', padding: 12, borderRadius: 14 },
-  
+
   filterBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15 },
-  
+
   sortDropdownContainer: { position: 'relative', zIndex: 100 },
   sortDropdownItem: { paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#F0F0F0' },
   logHeaderText: { color: '#FFF', fontWeight: 'bold', fontSize: 12 },
   columnCenter: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   tagBadge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12, backgroundColor: '#EEE' },
-  tagFall: { backgroundColor: '#FF3B30' }, 
+  tagFall: { backgroundColor: '#FF3B30' },
+  tagGait: { backgroundColor: '#F57C00' },
   tagText: { fontSize: 11, fontWeight: '700', color: '#FFF', letterSpacing: 0.5 },
   hiddenStream: { position: 'absolute', width: 1, height: 1, opacity: 0, overflow: 'hidden' },
+  logsActionsRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: 12,
+    marginBottom: 10,
+  },
+  clearLogsButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
 });

@@ -65,7 +65,7 @@ function MainApp() {
 
   // User State (role will be set after login)
   const [userRole, setUserRole] = useState('user'); // Default role
-  
+
   // Push notification state
   const [expoPushToken, setExpoPushToken] = useState('');
   const notificationListener = useRef();
@@ -82,7 +82,7 @@ function MainApp() {
           // This ensures alarm stops immediately when person recovers, not based on stale DB data
           const currentDetections = result.data.current_detections || [];
           const hasRealTimeFall = currentDetections.some(d => d.is_fall === true);
-          
+
           if (hasRealTimeFall && !fallAlarmRef.current) {
             // Found an active fall in real-time detection - start alarm
             const fallDetection = currentDetections.find(d => d.is_fall === true);
@@ -107,10 +107,10 @@ function MainApp() {
 
     // Poll every 3 seconds for active falls
     const intervalId = setInterval(checkForActiveFalls, 3000);
-    
+
     // Initial check
     checkForActiveFalls();
-    
+
     return () => {
       clearInterval(intervalId);
       if (fallAlarmRef.current) {
@@ -124,16 +124,22 @@ function MainApp() {
     const role = api.getUserRole();
     setUserRole(role);
 
-    // Register for push notifications
+    // Register for push notifications (may fail in Expo Go SDK 53+)
     pushNotifications.registerForPushNotificationsAsync().then(token => {
       if (token) {
         setExpoPushToken(token);
         console.log('Push token registered:', token);
-        // Send token to backend
-        api.registerPushToken(token).catch(err => 
+        api.registerPushToken(token).catch(err =>
           console.log('Could not register token with backend:', err.message)
         );
+        api.registerPushTokenOnCamera(token).catch(err =>
+          console.log('Could not register token with camera server:', err.message)
+        );
+      } else {
+        console.log('Push tokens unavailable (Expo Go limitation) — delivery time is measured on the Pi via timing probe');
       }
+    }).catch(() => {
+      console.log('Push notifications not supported in Expo Go — alerts use polling instead');
     });
 
     // Listen for notifications received while app is foregrounded
@@ -174,23 +180,23 @@ function MainApp() {
     { q: "How does the AI detect falls?", a: "CAIretaker uses computer vision to track body skeleton points locally on the Raspberry Pi." },
     { q: "What happens when a fall is detected?", a: "The system immediately logs the event, captures the moment, and sends an alert notification to all connected caretakers." },
     { q: "How accurate is the fall detection?", a: "Our AI model is trained on thousands of fall scenarios with high accuracy. False positives are minimized through pose estimation algorithms." },
-    
+
     // Gait Analysis
     { q: "What is Gait Analysis?", a: "Gait Analysis monitors and analyzes walking patterns to detect irregularities that may indicate health concerns or fall risks." },
     { q: "How does bad gait detection work?", a: "The system tracks body posture, stride length, and balance while walking. Unusual patterns trigger a gait alert for review." },
-    
+
     // Monitoring
     { q: "Can I monitor multiple rooms?", a: "Yes! CAIretaker supports multiple camera feeds. This feature is designed for future expansion to cover more areas." },
-    
+
     // System & Hardware
     { q: "What hardware do I need?", a: "CAIretaker runs on a Raspberry Pi 5 with compatible USB or CSI cameras. A stable network connection is required." },
     { q: "How do I reboot the system?", a: "Go to Settings from the sidebar menu, then tap 'Reboot Hub' under the Hardware section." },
-    
+
     // Privacy & Security
     { q: "Is the video data private?", a: "Yes. All processing happens on the edge. No cloud uploads occur by default." },
     { q: "How do I reset my password?", a: "On the login screen, tap 'Forgot Password', enter your registered email, and follow the OTP verification process." },
     { q: "Who can create new accounts?", a: "Only Super Admin users can create and manage accounts through the User Management feature in the sidebar." },
-    
+
     // App Usage
     { q: "How do I view live camera feeds?", a: "Select a room from the home screen and tap on it to open the LiveView with real-time monitoring." },
     { q: "Where can I see past fall alerts?", a: "Check the Recent Logs section on the home screen or access the full history through the Logs feature." },
@@ -235,15 +241,15 @@ function MainApp() {
   // Dynamic styles based on theme
   const dynamicStyles = {
     container: { flex: 1, backgroundColor: theme.background },
-    header: { 
-      flexDirection: 'row', 
-      alignItems: 'center', 
-      justifyContent: 'space-between', 
-      backgroundColor: theme.headerBg, 
-      height: 80, 
-      paddingHorizontal: 15, 
-      borderBottomWidth: 1, 
-      borderBottomColor: theme.headerBorder 
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      backgroundColor: theme.headerBg,
+      height: 80,
+      paddingHorizontal: 15,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.headerBorder
     },
     // Logo size - same for both modes
     headerLogo: { height: 200, width: 200 },
@@ -252,9 +258,9 @@ function MainApp() {
   return (
     <SafeAreaProvider>
       <SafeAreaView style={dynamicStyles.container} edges={['top']}>
-        <StatusBar 
-          barStyle={isDarkMode ? "light-content" : "dark-content"} 
-          backgroundColor={theme.headerBg} 
+        <StatusBar
+          barStyle={isDarkMode ? "light-content" : "dark-content"}
+          backgroundColor={theme.headerBg}
         />
 
         {/* Header */}
@@ -265,18 +271,18 @@ function MainApp() {
             </TouchableOpacity>
           </View>
           <TouchableOpacity onPress={() => setCurrentScreen('Home')} activeOpacity={0.8} style={styles.logoContainer}>
-            <Image 
-              source={isDarkMode ? require('./assets/P1.png') : require('./assets/P2.png')} 
-              style={dynamicStyles.headerLogo} 
-              resizeMode="contain" 
+            <Image
+              source={isDarkMode ? require('./assets/P1.png') : require('./assets/P2.png')}
+              style={dynamicStyles.headerLogo}
+              resizeMode="contain"
             />
           </TouchableOpacity>
           <View style={styles.rightHeaderActions}>
             <TouchableOpacity onPress={toggleTheme} style={styles.themeToggle}>
-              <FontAwesomeIcon 
-                icon={isDarkMode ? faSun : faMoon} 
-                color={isDarkMode ? '#FFD700' : theme.textPrimary} 
-                size={20} 
+              <FontAwesomeIcon
+                icon={isDarkMode ? faSun : faMoon}
+                color={isDarkMode ? '#FFD700' : theme.textPrimary}
+                size={20}
               />
             </TouchableOpacity>
             <TouchableOpacity onPress={() => setShowLogoutConfirm(true)} style={styles.navIcon}>

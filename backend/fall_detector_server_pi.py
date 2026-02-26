@@ -15,7 +15,7 @@ SETUP INSTRUCTIONS (run on Raspberry Pi):
    hailortcli fw-control identify
 4. Download the pose estimation model:
    mkdir -p backend/models
-   wget -O backend/models/yolov8s_pose.hef \
+   wget -O backend/models/yolov8s_pose.hef 
      https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.14.0/hailo8/yolov8s_pose.hef
 5. Install Python dependencies:
    pip install flask flask-cors opencv-python numpy torch scipy requests picamera2
@@ -54,22 +54,129 @@ from hailo_platform import (
 # For IOU-based tracker (replaces ultralytics' built-in BoT-SORT)
 from scipy.optimize import linear_sum_assignment
 
+# ONNX Runtime for TCN gait model inference
+try:
+    import onnxruntime as ort
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
+    print("[WARN] onnxruntime not installed — gait analysis disabled")
+    print("       Install with: pip install onnxruntime")
+
 warnings.filterwarnings('ignore')
+
+try:
+    import psutil as _psutil
+    PSUTIL_AVAILABLE = True
+    _psutil.cpu_percent(interval=None)   # Prime the baseline — first call always returns 0.0
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("[WARN] psutil not installed — CPU/Memory metrics will be 0")
+    print("       Install with: pip install psutil")
 
 app = Flask(__name__)
 CORS(app)
+
+# ---- Background CPU + Voltage sampler (1-second interval for accurate readings) ----
+# cpu_percent(interval=None) in a tight frame loop gives noisy single-frame readings.
+# This thread samples every second using blocking interval=1.0 and stores the result.
+_cpu_sampler_value = 0.0
+_voltage_sampler_value = 0.0   # Volts (float), 0.0 if unavailable
+_temp_sampler_value = 0.0      # Celsius (float), 0.0 if unavailable
+
+def _read_voltage_v():
+    """Read Pi input/core voltage via vcgencmd. Returns float volts or 0.0."""
+    try:
+        import subprocess
+        try:
+            pmic = subprocess.check_output(['vcgencmd', 'pmic_read_adc'],
+                                           stderr=subprocess.STDOUT).decode()
+            line = next((l for l in pmic.split('\n') if 'EXT5V_V' in l), None)
+            if line:
+                return float(line.split('=')[-1].replace('V', '').strip())
+        except Exception:
+            pass
+        out = subprocess.check_output(['vcgencmd', 'measure_volts'],
+                                      stderr=subprocess.STDOUT).decode()
+        return float(out.replace('volt=', '').replace('V', '').strip())
+    except Exception:
+        return 0.0
+
+def _read_temp_c():
+    """Read Pi CPU temperature via vcgencmd. Returns float Celsius or 0.0."""
+    try:
+        import subprocess
+        out = subprocess.check_output(['vcgencmd', 'measure_temp'],
+                                      stderr=subprocess.STDOUT).decode()
+        return float(out.replace('temp=', '').replace("'C", '').strip())
+    except Exception:
+        return 0.0
+
+def _run_cpu_sampler():
+    global _cpu_sampler_value, _voltage_sampler_value, _temp_sampler_value
+    _tick = 0
+    while True:
+        try:
+            if PSUTIL_AVAILABLE:
+                _cpu_sampler_value = _psutil.cpu_percent(interval=1.0)
+            else:
+                import time as _t; _t.sleep(1)
+            _tick += 1
+            if _tick % 2 == 0:
+                _voltage_sampler_value = _read_voltage_v()
+                _temp_sampler_value = _read_temp_c()
+        except Exception:
+            pass
+
+_cpu_sampler_thread = None  # started after threading is imported later
 
 # ============== EXPO PUSH NOTIFICATIONS ==============
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 push_tokens = set()  # Store registered push tokens
 
+# ============== DATA GATHERING SESSION ==============
+# All metrics are reset each time Start is pressed.
+data_gathering = {
+    'active': False,
+    'start_time': None,
+    'end_time': None,
+    # Alert delivery
+    'alert_events': [],
+    # Frame-level performance
+    'inference_times_ms': [],
+    'fps_samples': [],
+    'cpu_samples': [],
+    'memory_samples_mb': [],
+    'voltage_samples': [],        # list of float (Volts)
+    'temp_samples': [],           # list of float (Celsius)
+    # Performance snapshot per detected-person-count
+    'perf_by_person_count': {},
+    '_perf_count_accum': {},
+}
+
 def send_expo_push_notification(title, body):
-    """Send push notification to all registered devices via Expo Push API"""
-    if not push_tokens:
-        print("No push tokens registered, skipping notification")
-        return
+    """Send push notification to all registered devices via Expo Push API.
     
-    for token in push_tokens:
+    During data gathering, ALWAYS measures the HTTP round-trip time to
+    Expo's push server (even when no real tokens are registered — uses a
+    test token for timing so the Pi → Expo network latency is real).
+    """
+    dispatch_time = time.time()
+    delivery_ms = None
+
+    # Decide which tokens to send to.
+    # If real tokens exist, use them.  Otherwise use a test token
+    # purely to measure the HTTP round-trip to Expo's servers.
+    tokens_to_send = list(push_tokens) if push_tokens else []
+    timing_only = len(tokens_to_send) == 0   # True = no real delivery
+
+    if timing_only:
+        # Use a dummy token.  Expo will respond with DeviceNotRegistered
+        # but the HTTP round-trip time is a valid network latency measurement.
+        tokens_to_send = ["ExponentPushToken[__timing_probe__]"]
+        print("No push tokens registered — sending timing probe to measure delivery latency")
+
+    for token in tokens_to_send:
         message = {
             "to": token,
             "sound": "default",
@@ -79,8 +186,9 @@ def send_expo_push_notification(title, body):
             "priority": "high",
             "channelId": "fall_alerts",
         }
-        
+
         try:
+            _t0 = time.time()
             response = requests.post(
                 EXPO_PUSH_URL,
                 json=message,
@@ -89,9 +197,24 @@ def send_expo_push_notification(title, body):
                     "Accept": "application/json",
                 }
             )
-            print(f"Push notification sent: {response.status_code}")
+            _delivery_ms = round((time.time() - _t0) * 1000, 1)
+            if delivery_ms is None:
+                delivery_ms = _delivery_ms
+            if timing_only:
+                print(f"Timing probe response: {response.status_code} ({_delivery_ms:.0f} ms)")
+            else:
+                print(f"Push notification sent: {response.status_code} ({_delivery_ms:.0f} ms)")
         except Exception as e:
             print(f"Push notification error: {e}")
+
+    # Record to data gathering session
+    if data_gathering['active']:
+        data_gathering['alert_events'].append({
+            'timestamp': dispatch_time,
+            'title': title,
+            'delivery_ms': delivery_ms,
+            'timing_only': timing_only,   # True = measured via probe, not a real delivery
+        })
 
 # Configuration
 class Config:
@@ -153,12 +276,24 @@ class Config:
     TRACKER_IOU_THRESHOLD = 0.3   # Min IOU to match detection to existing track
     TRACKER_MAX_AGE = 30           # Frames before unmatched track is deleted
     
+    # TCN GAIT ANALYSIS SETTINGS
+    TCN_MODEL_PATH = os.path.join(BASE_DIR, "models", "tcn_gait_model.onnx")
+    TCN_WINDOW = 60               # Frames per analysis window (must match training)
+    TCN_STRIDE = 15               # Frames between analysis attempts
+    TCN_THRESHOLD = 0.50          # Classification threshold (0 = normal, 1 = abnormal)
+    TCN_ALERT_COOLDOWN = 30       # Seconds between repeat gait alerts per person
+    TCN_IN_CHANNELS = 34          # 17 keypoints * 2 (x, y) — matches training
+    TCN_LEFT_HIP_IDX = 11         # COCO keypoint index for left hip
+    TCN_RIGHT_HIP_IDX = 12        # COCO keypoint index for right hip
+    TCN_MOTION_THRESHOLD = 5.0    # Min avg hip displacement (px/frame) to count as "walking"
+    
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
     CLASS_COLORS = {
         0: (0, 255, 0),      # Standing - Green
         1: (255, 255, 0),    # Sitting - Yellow (cyan in BGR)
         2: (0, 0, 255),      # Fallen (High Confidence) - Red
-        'at_risk': (0, 165, 255)  # At Risk (Low Confidence) - Orange
+        'at_risk': (0, 165, 255),  # At Risk (Low Confidence) - Orange
+        'abnormal_gait': (0, 255, 255)  # Abnormal Gait - Yellow
     }
     
     # Three-tier confidence thresholds
@@ -1107,6 +1242,186 @@ db = FallIncidentDB()
 
 
 # ============================================================================
+# TCN GAIT ANALYZER  (ONNX Runtime inference)
+# ============================================================================
+
+class GaitAnalyzer:
+    """Real-time gait analysis using the TCN model exported by train_tcn_v2.py.
+    
+    For each tracked person, maintains a rolling buffer of keypoints.
+    When the buffer reaches TCN_WINDOW frames, runs ONNX inference to
+    classify gait as Normal (0) or Abnormal (1).
+    
+    Uses the EXACT same normalization as training:
+    - Hip-centered: subtract hip midpoint from all keypoints
+    - Scale-invariant: divide by inter-hip distance
+    - Input shape: (1, 34, 60) = (batch, channels, time)
+    """
+    
+    def __init__(self, onnx_path):
+        self.enabled = False
+        self.session = None
+        self.input_name = None
+        
+        # Per-person state
+        self.keypoint_buffers = {}     # track_id -> deque of (17, 2) arrays
+        self.frame_counters = {}       # track_id -> frames since last analysis
+        self.last_alert_time = {}      # track_id -> timestamp of last alert
+        self.gait_results = {}         # track_id -> {'is_abnormal': bool, 'confidence': float}
+        
+        if not ONNX_AVAILABLE:
+            print("[GaitAnalyzer] ONNX Runtime not available — gait analysis disabled")
+            return
+        
+        if not os.path.exists(onnx_path):
+            print(f"[GaitAnalyzer] Model not found at: {onnx_path}")
+            print(f"               Gait analysis disabled (fall detection unaffected)")
+            print(f"               Train with train_tcn_v2.py and copy tcn_gait_model.onnx to backend/models/")
+            return
+        
+        try:
+            # Use CPU execution provider (Pi doesn't have CUDA for ONNX)
+            self.session = ort.InferenceSession(
+                onnx_path,
+                providers=['CPUExecutionProvider']
+            )
+            self.input_name = self.session.get_inputs()[0].name
+            self.enabled = True
+            
+            # Log model info
+            inp = self.session.get_inputs()[0]
+            out = self.session.get_outputs()[0]
+            print(f"[GaitAnalyzer] TCN model loaded successfully")
+            print(f"  Input:  {inp.name} {inp.shape}")
+            print(f"  Output: {out.name} {out.shape}")
+        except Exception as e:
+            print(f"[GaitAnalyzer] Failed to load model: {e}")
+            print(f"               Gait analysis disabled (fall detection unaffected)")
+    
+    @staticmethod
+    def _normalize_keypoints(kps_xy):
+        """Hip-centered normalization — MUST match train_tcn_v2.py exactly.
+        
+        Args:
+            kps_xy: numpy array of shape (T, 17, 2) — x, y coordinates only
+        
+        Returns:
+            Normalized array of same shape with hip_center=origin, inter-hip=1.0
+        """
+        left_hip  = kps_xy[:, Config.TCN_LEFT_HIP_IDX,  :]
+        right_hip = kps_xy[:, Config.TCN_RIGHT_HIP_IDX, :]
+        hip_center = (left_hip + right_hip) / 2.0
+        hip_dist   = np.linalg.norm(left_hip - right_hip, axis=1, keepdims=True)
+        hip_dist   = np.clip(hip_dist, 1e-6, None)
+        return (kps_xy - hip_center[:, np.newaxis, :]) / hip_dist[:, np.newaxis, :]
+    
+    def feed_keypoints(self, track_id, keypoints):
+        """Feed a single frame's keypoints for a tracked person.
+        
+        Args:
+            track_id: integer person tracking ID
+            keypoints: (17, 3) numpy array [x, y, confidence]
+        
+        Returns:
+            dict or None: {'is_abnormal': bool, 'confidence': float} when analysis runs
+        """
+        if not self.enabled:
+            return None
+        
+        # Extract just x, y (drop confidence) — shape (17, 2)
+        kps_xy = keypoints[:, :2].copy()
+        
+        # Initialize buffer for new person
+        if track_id not in self.keypoint_buffers:
+            self.keypoint_buffers[track_id] = deque(maxlen=Config.TCN_WINDOW)
+            self.frame_counters[track_id] = 0
+        
+        self.keypoint_buffers[track_id].append(kps_xy)
+        self.frame_counters[track_id] += 1
+        
+        # Only run analysis when buffer is full and stride interval reached
+        buf = self.keypoint_buffers[track_id]
+        if len(buf) < Config.TCN_WINDOW:
+            return self.gait_results.get(track_id)
+        
+        if self.frame_counters[track_id] < Config.TCN_STRIDE:
+            return self.gait_results.get(track_id)
+        
+        # Reset stride counter
+        self.frame_counters[track_id] = 0
+        
+        # Build window: (TCN_WINDOW, 17, 2)
+        window = np.array(list(buf), dtype=np.float32)
+        
+        # ---- MOTION GATE: skip classification if person is standing still ----
+        # Use NET displacement (start→end of window) instead of per-frame average.
+        # Standing still: per-frame jitter cancels out → net ≈ 0
+        # Walking (even slowly): progressive movement → net >> 0
+        hip_centers = (window[:, Config.TCN_LEFT_HIP_IDX, :] + 
+                       window[:, Config.TCN_RIGHT_HIP_IDX, :]) / 2.0
+        net_displacement = float(np.linalg.norm(hip_centers[-1] - hip_centers[0]))
+        
+        if net_displacement < Config.TCN_MOTION_THRESHOLD:
+            # Person hasn't actually moved from their starting position
+            result = {'is_abnormal': False, 'confidence': 0.0}
+            self.gait_results[track_id] = result
+            if Config.DEBUG_LOGGING:
+                print(f"[GaitAnalyzer] Person {track_id}: stationary (net={net_displacement:.1f}px < {Config.TCN_MOTION_THRESHOLD}px), skipping")
+            return result
+        
+        # Normalize (hip-centered) — matches training exactly
+        window_norm = self._normalize_keypoints(window)
+        
+        # Reshape to (TCN_WINDOW, 34) then transpose to (34, TCN_WINDOW) for TCN
+        window_flat = window_norm.reshape(Config.TCN_WINDOW, Config.TCN_IN_CHANNELS)
+        # Input shape for ONNX: (1, 34, 60)
+        input_tensor = window_flat.T[np.newaxis, :, :].astype(np.float32)
+        
+        try:
+            # Run ONNX inference
+            outputs = self.session.run(None, {self.input_name: input_tensor})
+            logit = float(outputs[0][0][0])
+            
+            # Apply sigmoid to get probability
+            prob = 1.0 / (1.0 + np.exp(-np.clip(logit, -50, 50)))
+            
+            is_abnormal = prob >= Config.TCN_THRESHOLD
+            
+            result = {
+                'is_abnormal': bool(is_abnormal),
+                'confidence': float(prob)
+            }
+            self.gait_results[track_id] = result
+            return result
+            
+        except Exception as e:
+            if Config.DEBUG_LOGGING:
+                print(f"[GaitAnalyzer] Inference error for person {track_id}: {e}")
+            return self.gait_results.get(track_id)
+    
+    def should_alert(self, track_id):
+        """Check if enough time has passed since the last alert for this person."""
+        current_time = time.time()
+        last_alert = self.last_alert_time.get(track_id, 0)
+        return (current_time - last_alert) >= Config.TCN_ALERT_COOLDOWN
+    
+    def mark_alerted(self, track_id):
+        """Record that an alert was just sent for this person."""
+        self.last_alert_time[track_id] = time.time()
+    
+    def cleanup_person(self, track_id):
+        """Remove all state for a person who left the frame."""
+        self.keypoint_buffers.pop(track_id, None)
+        self.frame_counters.pop(track_id, None)
+        self.last_alert_time.pop(track_id, None)
+        self.gait_results.pop(track_id, None)
+    
+    def get_result(self, track_id):
+        """Get the latest gait result for a person (may be None)."""
+        return self.gait_results.get(track_id)
+
+
+# ============================================================================
 # FALL DETECTOR CLASS
 # ============================================================================
 
@@ -1157,6 +1472,10 @@ class FallDetector:
         
         # Frame counter for throttled logging
         self._frame_count = 0
+        
+        # ---- TCN Gait Analyzer ----
+        self.gait_analyzer = GaitAnalyzer(Config.TCN_MODEL_PATH)
+        self.gait_alert_count = 0  # live count of people with abnormal gait
         
     def extract_features(self, keypoints, image_shape):
         """Extract normalized keypoint features (same as inference)"""
@@ -1428,6 +1747,35 @@ class FallDetector:
                             print(f"{'='*70}\n")
                     
                     status = "classified"
+                    
+                    # ---- GAIT ANALYSIS (TCN) ----
+                    gait_result = self.gait_analyzer.feed_keypoints(track_id, keypoints)
+                    if gait_result and gait_result['is_abnormal']:
+                        if self.gait_analyzer.should_alert(track_id):
+                            room_name = Config.get_room_name(current_camera_index)
+                            gait_conf = gait_result['confidence']
+                            
+                            print(f"\n{'='*60}")
+                            print(f"ABNORMAL GAIT DETECTED - Person ID {track_id}")
+                            print(f"{'='*60}")
+                            print(f"Location: {room_name}")
+                            print(f"Confidence: {gait_conf:.2%}")
+                            print(f"{'='*60}\n")
+                            
+                            # Log to database
+                            db.log_at_risk_event(
+                                person_id=track_id,
+                                confidence=gait_conf,
+                                location=room_name
+                            )
+                            
+                            # Send push notification
+                            send_expo_push_notification(
+                                "Abnormal Gait Detected",
+                                f"Person ID {track_id} at {room_name} — Confidence: {gait_conf:.0%}"
+                            )
+                            
+                            self.gait_analyzer.mark_alerted(track_id)
                 else:
                     prediction = None
                     confidence = 0.0
@@ -1442,6 +1790,9 @@ class FallDetector:
                             candidate['frame_count'] = 0
                             candidate['consecutive_fallen_frames'] = 0
                 
+                # Get latest gait result for this person (may be None)
+                gait_result_for_det = self.gait_analyzer.get_result(track_id)
+                
                 detections.append({
                     'track_id': track_id,
                     'box': box,
@@ -1455,7 +1806,9 @@ class FallDetector:
                     'status': status,
                     'is_fallen': self.fall_states[track_id]['is_fallen'],
                     'incident_id': self.fall_states[track_id].get('incident_id'),
-                    'visible_count': visible_count
+                    'visible_count': visible_count,
+                    'gait_status': 'abnormal' if (gait_result_for_det and gait_result_for_det['is_abnormal']) else 'normal',
+                    'gait_confidence': gait_result_for_det['confidence'] if gait_result_for_det else 0.0,
                 })
         
         # Clean up tracking for people who left the frame
@@ -1468,6 +1821,13 @@ class FallDetector:
                 del self.prediction_buffers[person_id]
             if person_id in self.fall_candidates:
                 del self.fall_candidates[person_id]
+            self.gait_analyzer.cleanup_person(person_id)
+        
+        # Update live gait alert count
+        self.gait_alert_count = sum(
+            1 for d in detections
+            if d.get('gait_status') == 'abnormal'
+        )
         
         return detections
     
@@ -1551,6 +1911,17 @@ class FallDetector:
                         cv2.circle(frame, (int(kx), int(ky)), 4, color, -1)
                         cv2.circle(frame, (int(kx), int(ky)), 5, (255, 255, 255), 1)
             
+            # Draw gait status label (below bounding box)
+            gait_status = detection.get('gait_status', 'normal')
+            gait_conf = detection.get('gait_confidence', 0.0)
+            if gait_status == 'abnormal':
+                gait_color = Config.CLASS_COLORS['abnormal_gait']  # Yellow
+                gait_label = f"Abnormal Gait ({gait_conf:.0%})"
+                gait_label_size, _ = cv2.getTextSize(gait_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                gait_y = y2 + gait_label_size[1] + 8
+                cv2.rectangle(frame, (x1, y2 + 2), (x1 + gait_label_size[0] + 4, gait_y + 2), gait_color, -1)
+                cv2.putText(frame, gait_label, (x1 + 2, gait_y - 2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
         
         return frame
 
@@ -1572,6 +1943,11 @@ current_status = {
 import threading
 camera_lock = threading.Lock()
 status_lock = threading.Lock()
+data_gathering_lock = threading.Lock()
+
+# Start the background CPU sampler now that threading is available
+_cpu_sampler_thread = threading.Thread(target=_run_cpu_sampler, daemon=True)
+_cpu_sampler_thread.start()
 
 
 # ============================================================================
@@ -1767,11 +2143,15 @@ def _frame_producer():
 
             # --- detect ---
             if detector is not None:
+                _t_detect_start = time.time()
                 detections = detector.detect(frame)
+                _inference_ms = (time.time() - _t_detect_start) * 1000
                 frame = detector.draw_results(frame, detections)
 
                 with status_lock:
                     current_status['people_detected'] = len(detections)
+                    current_status['gait_alerts'] = detector.gait_alert_count
+                    current_status['gait_enabled'] = detector.gait_analyzer.enabled
                     current_status['detections'] = [
                         {
                             'id': d['track_id'],
@@ -1780,7 +2160,9 @@ def _frame_producer():
                             'confidence_tier': d.get('confidence_tier', 'N/A'),
                             'is_fall': d.get('is_fallen', False),
                             'is_at_risk': d.get('display_state') == 'at_risk',
-                            'incident_id': d.get('incident_id')
+                            'incident_id': d.get('incident_id'),
+                            'gait_status': d.get('gait_status', 'normal'),
+                            'gait_confidence': d.get('gait_confidence', 0.0),
                         }
                         for d in detections
                     ]
@@ -1791,6 +2173,45 @@ def _frame_producer():
                     fps_value = 10 / max(now - fps_time, 0.001)
                     fps_time = now
                     current_status['fps'] = round(fps_value, 1)
+
+                # ---- DATA GATHERING: sample metrics ----
+                if data_gathering['active']:
+                    _cpu = _cpu_sampler_value if PSUTIL_AVAILABLE else 0.0
+                    _mem_mb = (_psutil.virtual_memory().used / (1024 * 1024)) if PSUTIL_AVAILABLE else 0.0
+                    _volts = _voltage_sampler_value
+                    _temp = _temp_sampler_value
+                    with data_gathering_lock:
+                        data_gathering['inference_times_ms'].append(_inference_ms)
+                        data_gathering['fps_samples'].append(fps_value)
+                        data_gathering['cpu_samples'].append(_cpu)
+                        data_gathering['memory_samples_mb'].append(_mem_mb)
+                        if _volts > 0:
+                            data_gathering['voltage_samples'].append(_volts)
+                        if _temp > 0:
+                            data_gathering['temp_samples'].append(_temp)
+
+                        # Per-person-count snapshot: accumulate 5 frames, then average
+                        _n = len(detections)
+                        accum = data_gathering['_perf_count_accum']
+                        if _n not in data_gathering['perf_by_person_count']:
+                            if _n not in accum:
+                                accum[_n] = {'frames': 0, 'sum_fps': 0.0,
+                                             'sum_inf': 0.0, 'sum_cpu': 0.0, 'sum_mem': 0.0}
+                            a = accum[_n]
+                            a['frames'] += 1
+                            a['sum_fps'] += fps_value
+                            a['sum_inf'] += _inference_ms
+                            a['sum_cpu'] += _cpu
+                            a['sum_mem'] += _mem_mb
+                            if a['frames'] >= 5:
+                                n = a['frames']
+                                data_gathering['perf_by_person_count'][_n] = {
+                                    'fps': round(a['sum_fps'] / n, 2),
+                                    'inference_ms': round(a['sum_inf'] / n, 2),
+                                    'cpu_percent': round(a['sum_cpu'] / n, 2),
+                                    'memory_mb': round(a['sum_mem'] / n, 2),
+                                }
+                                del accum[_n]
 
                 cv2.putText(frame, f"FPS: {fps_value:.1f} | Camera: {current_camera_index}",
                             (frame.shape[1] - 350, 40),
@@ -1980,13 +2401,38 @@ def health():
     with camera_lock:
         cam_available = camera is not None
     
+    gait_enabled = detector.gait_analyzer.enabled if detector else False
+    
     return jsonify({
         'status': 'healthy',
         'detector_loaded': detector is not None,
         'camera_available': cam_available,
         'current_camera_index': current_camera_index,
-        'model_type': 'HailoNPU(YOLOv8m-pose) + CPU(Simple1DCNN)'
+        'model_type': 'HailoNPU(YOLOv8m-pose) + CPU(Simple1DCNN)' + (' + ONNX(TCN-Gait)' if gait_enabled else ''),
+        'gait_analysis_enabled': gait_enabled,
     })
+
+
+@app.route('/api/gait-events', methods=['GET'])
+def get_gait_events():
+    """Get gait alert events (at_risk type incidents)"""
+    try:
+        limit = int(request.args.get('limit', 100))
+        
+        # Reuse existing incident query, filter to at_risk type
+        all_incidents = db.get_all_incidents(limit=limit)
+        gait_events = [i for i in all_incidents if i.get('type') == 'at_risk']
+        
+        return jsonify({
+            'success': True,
+            'events': gait_events,
+            'count': len(gait_events)
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 @app.route('/api/active-falls')
@@ -2120,6 +2566,253 @@ def clear_all_incidents():
 
 
 # ============================================================================
+# DATA GATHERING ENDPOINTS
+# ============================================================================
+
+def _dg_compute_summary():
+    """Compute summary stats from current data_gathering session."""
+    with data_gathering_lock:
+        dg = data_gathering.copy()
+        perf_by_count = dict(dg['perf_by_person_count'])
+        alert_events = list(dg['alert_events'])
+        inf_times = list(dg['inference_times_ms'])
+        fps_s = list(dg['fps_samples'])
+        cpu_s = list(dg['cpu_samples'])
+        mem_s = list(dg['memory_samples_mb'])
+
+    now = time.time()
+    start = dg['start_time']
+    end = dg['end_time']
+    uptime_sec = 0
+    if start:
+        uptime_sec = (end if end else now) - start
+
+    avg_inf = round(sum(inf_times) / len(inf_times), 2) if inf_times else 0.0
+    avg_fps = round(sum(fps_s) / len(fps_s), 2) if fps_s else 0.0
+    avg_cpu = round(sum(cpu_s) / len(cpu_s), 2) if cpu_s else 0.0
+    avg_mem = round(sum(mem_s) / len(mem_s), 2) if mem_s else 0.0
+
+    with data_gathering_lock:
+        volt_s = list(data_gathering['voltage_samples'])
+        temp_s = list(data_gathering['temp_samples'])
+    avg_voltage = round(sum(volt_s) / len(volt_s), 4) if volt_s else None
+    avg_temp = round(sum(temp_s) / len(temp_s), 1) if temp_s else None
+
+    # Alert delivery stats
+    measured = [e['delivery_ms'] for e in alert_events if e['delivery_ms'] is not None]
+    avg_delivery_ms = round(sum(measured) / len(measured), 1) if measured else None
+
+    return {
+        'active': dg['active'],
+        'start_time': start,
+        'end_time': end,
+        'uptime_seconds': round(uptime_sec, 1),
+        'alert_count': len(alert_events),
+        'alert_events': alert_events,
+        'avg_delivery_ms': avg_delivery_ms,
+        'avg_inference_ms': avg_inf,
+        'avg_fps': avg_fps,
+        'avg_cpu_percent': avg_cpu,
+        'avg_memory_mb': avg_mem,
+        'avg_voltage_v': avg_voltage,
+        'avg_temp_c': avg_temp,
+        'perf_by_person_count': perf_by_count,
+        'total_frames_sampled': len(inf_times),
+    }
+
+
+def _dg_format_report(summary):
+    """Format the data gathering summary as a human-readable text report."""
+    import datetime
+
+    def ts(epoch):
+        if epoch is None:
+            return 'N/A'
+        return datetime.datetime.fromtimestamp(epoch).strftime('%Y-%m-%d %H:%M:%S')
+
+    def hms(seconds):
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    lines = [
+        "=" * 60,
+        "       CAIretaker Field Test Evaluation Report",
+        "=" * 60,
+        f"Session Start : {ts(summary['start_time'])}",
+        f"Session End   : {ts(summary['end_time'])}",
+        f"Total Uptime  : {hms(summary['uptime_seconds'])} ({summary['uptime_seconds']:.1f} s)",
+        "",
+        "-" * 60,
+        "1. SYSTEM UPTIME & RELIABILITY",
+        "-" * 60,
+        f"  Uptime Duration : {hms(summary['uptime_seconds'])}",
+        f"  Frames Sampled  : {summary['total_frames_sampled']}",
+        "",
+        "-" * 60,
+        "2. ALERT NOTIFICATION DELIVERY TIME",
+        "   (Measured as round-trip time: Pi → Expo push server per alert)",
+        "-" * 60,
+        f"  Total Alerts Sent        : {summary['alert_count']}",
+    ]
+
+    avg_ms = summary.get('avg_delivery_ms')
+    if avg_ms is not None:
+        lines.append(f"  Avg Delivery Time        : {avg_ms:.1f} ms  (Pi → Expo server round-trip)")
+    else:
+        lines.append(f"  Avg Delivery Time        : N/A (network error)")
+
+    alert_events = summary.get('alert_events', [])
+    if alert_events:
+        lines.append("")
+        lines.append(f"  {'#':<5} {'Timestamp':<22} {'Type':<26} {'Delivery':>10} {'Method':>10}")
+        lines.append("  " + "-" * 75)
+        for i, ev in enumerate(alert_events, 1):
+            if ev['delivery_ms'] is not None:
+                dms = f"{ev['delivery_ms']:.1f} ms"
+            else:
+                dms = "error"
+            method = "probe" if ev.get('timing_only') else "push"
+            lines.append(f"  {i:<5} {ts(ev['timestamp']):<22} {ev['title']:<26} {dms:>10} {method:>10}")
+    else:
+        lines.append("  No alerts were sent during this session.")
+
+    lines += [
+        "",
+        "-" * 60,
+        "3. PERFORMANCE DEGRADATION BY PEOPLE IN FRAME",
+        "-" * 60,
+    ]
+
+    if summary['perf_by_person_count']:
+        lines.append(f"  {'People':<8} {'FPS':>8} {'Infer(ms)':>12} {'CPU%':>8} {'Mem(MB)':>10}")
+        lines.append("  " + "-" * 48)
+        for n in sorted(summary['perf_by_person_count'].keys()):
+            p = summary['perf_by_person_count'][n]
+            lines.append(
+                f"  {n:<8} {p['fps']:>8.2f} {p['inference_ms']:>12.2f} "
+                f"{p['cpu_percent']:>8.2f} {p['memory_mb']:>10.2f}"
+            )
+    else:
+        lines.append("  No person-count snapshots recorded yet.")
+
+    lines += [
+        "",
+        "-" * 60,
+        "4. EDGE DEVICE PERFORMANCE (Session Averages)",
+        "-" * 60,
+        f"  Avg Inference Time  : {summary['avg_inference_ms']:.2f} ms/frame",
+        f"  Avg FPS             : {summary['avg_fps']:.2f}",
+        f"  Avg CPU Utilization : {summary['avg_cpu_percent']:.2f}%",
+        f"  Avg Memory Usage    : {summary['avg_memory_mb']:.2f} MB",
+    ]
+    v = summary.get('avg_voltage_v')
+    lines.append(f"  Avg Input Voltage   : {v:.4f} V" if v is not None else
+                 "  Avg Input Voltage   : N/A (vcgencmd unavailable)")
+    t = summary.get('avg_temp_c')
+    lines.append(f"  Avg CPU Temperature : {t:.1f} \u00b0C" if t is not None else
+                 "  Avg CPU Temperature : N/A (vcgencmd unavailable)")
+    lines += [
+        "",
+        "=" * 60,
+        "              End of Report",
+        "=" * 60,
+    ]
+    return "\n".join(lines)
+
+
+@app.route('/api/data-gathering/start', methods=['POST'])
+def dg_start():
+    """Start a data gathering session (resets all counters)."""
+    with data_gathering_lock:
+        data_gathering['active'] = True
+        data_gathering['start_time'] = time.time()
+        data_gathering['end_time'] = None
+        data_gathering['alert_events'] = []
+        data_gathering['inference_times_ms'] = []
+        data_gathering['fps_samples'] = []
+        data_gathering['cpu_samples'] = []
+        data_gathering['memory_samples_mb'] = []
+        data_gathering['voltage_samples'] = []
+        data_gathering['temp_samples'] = []
+        data_gathering['perf_by_person_count'] = {}
+        data_gathering['_perf_count_accum'] = {}
+    print("[DATA GATHERING] Session started")
+    return jsonify({'success': True, 'message': 'Data gathering session started'})
+
+
+@app.route('/api/data-gathering/stop', methods=['POST'])
+def dg_stop():
+    """Stop the active data gathering session and save a copy of the report to the Pi."""
+    import datetime
+    with data_gathering_lock:
+        data_gathering['active'] = False
+        data_gathering['end_time'] = time.time()
+
+    # Generate and save a report file on the Pi
+    try:
+        summary = _dg_compute_summary()
+        text = _dg_format_report(summary)
+        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'field_test_reports')
+        os.makedirs(reports_dir, exist_ok=True)
+        filename = f"field_test_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        filepath = os.path.join(reports_dir, filename)
+        with open(filepath, 'w') as f:
+            f.write(text)
+        print(f"[DATA GATHERING] Session stopped. Report saved to: {filepath}")
+        saved_path = filepath
+    except Exception as e:
+        print(f"[DATA GATHERING] Session stopped (report save failed: {e})")
+        saved_path = None
+
+    return jsonify({
+        'success': True,
+        'message': 'Data gathering session stopped',
+        'report_saved_to': saved_path,
+    })
+
+
+@app.route('/api/data-gathering/status', methods=['GET'])
+def dg_status():
+    """Get lightweight status (active flag + uptime + key averages)."""
+    summary = _dg_compute_summary()
+    return jsonify({
+        'success': True,
+        'active': summary['active'],
+        'uptime_seconds': summary['uptime_seconds'],
+        'alert_count': summary['alert_count'],
+        'avg_inference_ms': summary['avg_inference_ms'],
+        'avg_fps': summary['avg_fps'],
+        'avg_cpu_percent': summary['avg_cpu_percent'],
+        'avg_memory_mb': summary['avg_memory_mb'],
+        'frames_sampled': summary['total_frames_sampled'],
+    })
+
+
+@app.route('/api/data-gathering/report', methods=['GET'])
+def dg_report():
+    """Return full JSON report of the current/last session."""
+    summary = _dg_compute_summary()
+    return jsonify({'success': True, 'report': summary})
+
+
+@app.route('/api/data-gathering/export', methods=['GET'])
+def dg_export():
+    """Return formatted plain-text report as a downloadable file."""
+    import datetime
+    from flask import Response as _Response
+    summary = _dg_compute_summary()
+    text = _dg_format_report(summary)
+    filename = f"cairetaker_field_test_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    return _Response(
+        text,
+        mimetype='text/plain',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+    )
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -2149,6 +2842,7 @@ if __name__ == '__main__':
         print("  GET  /api/camera/status - Camera & detector status")
         print("  GET  /api/active-falls - Get active fall alerts")
         print("  GET  /api/fall-events - Get fall event history")
+        print("  GET  /api/gait-events - Get gait alert history")
         print("  POST /switch_camera - Switch between cameras")
         print("  GET  /available_cameras - Get available cameras")
         print("="*60 + "\n")
