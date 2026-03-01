@@ -1258,6 +1258,10 @@ class GaitAnalyzer:
     - Input shape: (1, 34, 60) = (batch, channels, time)
     """
     
+    # Exponential Moving Average factor for keypoint smoothing.
+    # Lower = more smoothing (less jitter), higher = more responsive.
+    EMA_ALPHA = 0.4
+    
     def __init__(self, onnx_path):
         self.enabled = False
         self.session = None
@@ -1268,6 +1272,7 @@ class GaitAnalyzer:
         self.frame_counters = {}       # track_id -> frames since last analysis
         self.last_alert_time = {}      # track_id -> timestamp of last alert
         self.gait_results = {}         # track_id -> {'is_abnormal': bool, 'confidence': float}
+        self.smoothed_keypoints = {}   # track_id -> last EMA-smoothed (17, 2) array
         
         if not ONNX_AVAILABLE:
             print("[GaitAnalyzer] ONNX Runtime not available — gait analysis disabled")
@@ -1335,8 +1340,16 @@ class GaitAnalyzer:
         if track_id not in self.keypoint_buffers:
             self.keypoint_buffers[track_id] = deque(maxlen=Config.TCN_WINDOW)
             self.frame_counters[track_id] = 0
+            self.smoothed_keypoints[track_id] = kps_xy.copy()
         
-        self.keypoint_buffers[track_id].append(kps_xy)
+        # ---- EMA SMOOTHING: dampen YOLO pose jitter before buffering ----
+        # Without this, sub-pixel jitter on a stationary person creates
+        # noisy sequences the TCN interprets as micro-steps.
+        prev = self.smoothed_keypoints[track_id]
+        smoothed = self.EMA_ALPHA * kps_xy + (1.0 - self.EMA_ALPHA) * prev
+        self.smoothed_keypoints[track_id] = smoothed
+        
+        self.keypoint_buffers[track_id].append(smoothed)
         self.frame_counters[track_id] += 1
         
         # Only run analysis when buffer is full and stride interval reached
@@ -1354,19 +1367,28 @@ class GaitAnalyzer:
         window = np.array(list(buf), dtype=np.float32)
         
         # ---- MOTION GATE: skip classification if person is standing still ----
-        # Use NET displacement (start→end of window) instead of per-frame average.
-        # Standing still: per-frame jitter cancels out → net ≈ 0
-        # Walking (even slowly): progressive movement → net >> 0
+        # Two checks to reject jitter-as-motion:
+        #   1. Net displacement (start→end): cancels random jitter
+        #   2. Avg per-frame displacement: ensures sustained movement, not noise
         hip_centers = (window[:, Config.TCN_LEFT_HIP_IDX, :] + 
                        window[:, Config.TCN_RIGHT_HIP_IDX, :]) / 2.0
+        
+        # Check 1: Net displacement (existing)
         net_displacement = float(np.linalg.norm(hip_centers[-1] - hip_centers[0]))
         
-        if net_displacement < Config.TCN_MOTION_THRESHOLD:
-            # Person hasn't actually moved from their starting position
+        # Check 2: Average per-frame displacement — must show sustained movement
+        frame_deltas = np.linalg.norm(np.diff(hip_centers, axis=0), axis=1)
+        avg_frame_displacement = float(np.mean(frame_deltas))
+        
+        # Both must pass: person traveled AND individual frames show real steps
+        if (net_displacement < Config.TCN_MOTION_THRESHOLD
+                or avg_frame_displacement < 1.0):
+            # Person is stationary or jitter only
             result = {'is_abnormal': False, 'confidence': 0.0}
             self.gait_results[track_id] = result
             if Config.DEBUG_LOGGING:
-                print(f"[GaitAnalyzer] Person {track_id}: stationary (net={net_displacement:.1f}px < {Config.TCN_MOTION_THRESHOLD}px), skipping")
+                print(f"[GaitAnalyzer] Person {track_id}: stationary "
+                      f"(net={net_displacement:.1f}px, avg_frame={avg_frame_displacement:.1f}px), skipping")
             return result
         
         # Normalize (hip-centered) — matches training exactly
@@ -1415,6 +1437,7 @@ class GaitAnalyzer:
         self.frame_counters.pop(track_id, None)
         self.last_alert_time.pop(track_id, None)
         self.gait_results.pop(track_id, None)
+        self.smoothed_keypoints.pop(track_id, None)
     
     def get_result(self, track_id):
         """Get the latest gait result for a person (may be None)."""
@@ -1517,10 +1540,12 @@ class FallDetector:
                         'incident_id': None
                     }
                 
-                # SAME VALIDATION AS INFERENCE: Only check if 10+ keypoints visible
+                # STRUCTURAL VALIDATION: Require both shoulders and both knees visible
                 visible_count = np.sum(keypoints[:, 2] > 0.3)
+                has_both_shoulders = (keypoints[5, 2] > 0.3 and keypoints[6, 2] > 0.3)
+                has_both_knees = (keypoints[13, 2] > 0.3 and keypoints[14, 2] > 0.3)
                 
-                if visible_count >= 10:
+                if has_both_shoulders and has_both_knees:
                     # Normalize keypoints
                     keypoints_normalized = self.extract_features(keypoints, frame.shape)
                     
@@ -1630,6 +1655,36 @@ class FallDetector:
                             is_raw_fallen = False
                             confidence_tier = "BENDING"
                             display_state = "normal"
+                    
+                    # GEOMETRIC FALL HEURISTIC (catches facing-camera falls)
+                    # When someone lies facing the camera, the CNN sees a "standing"
+                    # skeleton but the bounding box is wide+flat and keypoints are
+                    # clustered near the ground.
+                    if not is_raw_fallen and raw_prediction != 1:  # Not already fallen, not sitting
+                        box_w = box[2] - box[0]
+                        box_h = box[3] - box[1]
+                        bbox_aspect = box_w / max(box_h, 1)
+                        
+                        # Keypoint vertical spread: low spread = lying flat
+                        visible_kps = keypoints[keypoints[:, 2] > 0.3]
+                        if len(visible_kps) >= 4:
+                            y_spread = (np.max(visible_kps[:, 1]) - np.min(visible_kps[:, 1])) / max(frame.shape[0], 1)
+                        else:
+                            y_spread = 1.0  # Default to high spread (assume standing)
+                        
+                        # Wide bbox + low vertical spread + low position = likely fallen
+                        hip_height = check_hip_position(keypoints, frame.shape)
+                        if (bbox_aspect > 1.5 and y_spread < 0.25
+                                and hip_height is not None and hip_height > 0.65):
+                            is_raw_fallen = True
+                            confidence_tier = "GEOMETRIC"
+                            display_state = "normal"
+                            prediction = 2
+                            fallen_confidence = max(fallen_confidence, 0.75)
+                            
+                            if _should_log:
+                                print(f"Person ID {track_id}: GEOMETRIC FALL DETECTED")
+                                print(f"  BBox aspect: {bbox_aspect:.2f}, Y-spread: {y_spread:.2f}, Hip height: {hip_height:.2f}")
                     
                     # TEMPORAL FALL DETECTION
                     current_time = time.time()
