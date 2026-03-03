@@ -285,7 +285,11 @@ class Config:
     TCN_IN_CHANNELS = 34          # 17 keypoints * 2 (x, y) — matches training
     TCN_LEFT_HIP_IDX = 11         # COCO keypoint index for left hip
     TCN_RIGHT_HIP_IDX = 12        # COCO keypoint index for right hip
-    TCN_MOTION_THRESHOLD = 5.0    # Min avg hip displacement (px/frame) to count as "walking"
+    TCN_MOTION_THRESHOLD = 15.0   # Min net hip displacement (px) over window to count as "walking"
+    TCN_AVG_FRAME_THRESHOLD = 2.5  # Min avg per-frame hip delta (px) for sustained movement
+    TCN_STILLNESS_STD_THRESHOLD = 3.0   # Max mean keypoint std-dev (px) to be "stationary"
+    TCN_LIMB_MOTION_STD_THRESHOLD = 2.0 # Min limb oscillation std to confirm walking
+    TCN_MIN_MOTION_WINDOWS = 5   # Consecutive motion-passing windows required before TCN runs
     
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
     CLASS_COLORS = {
@@ -297,7 +301,7 @@ class Config:
     }
     
     # Three-tier confidence thresholds
-    HIGH_CONFIDENCE_THRESHOLD = 0.70 # Confirmed fallen - triggers monitoring/alert (≥75%)
+    HIGH_CONFIDENCE_THRESHOLD = 0.65 # Confirmed fallen - triggers monitoring/alert (≥75%)
     LOW_CONFIDENCE_THRESHOLD = 0.50 # At risk - visual warning only (60-74%)
     # Below 0.60 = treated as normal (not fallen)
     NUM_KEYPOINTS = 17
@@ -1260,7 +1264,7 @@ class GaitAnalyzer:
     
     # Exponential Moving Average factor for keypoint smoothing.
     # Lower = more smoothing (less jitter), higher = more responsive.
-    EMA_ALPHA = 0.4
+    EMA_ALPHA = 0.25
     
     def __init__(self, onnx_path):
         self.enabled = False
@@ -1273,6 +1277,7 @@ class GaitAnalyzer:
         self.last_alert_time = {}      # track_id -> timestamp of last alert
         self.gait_results = {}         # track_id -> {'is_abnormal': bool, 'confidence': float}
         self.smoothed_keypoints = {}   # track_id -> last EMA-smoothed (17, 2) array
+        self.motion_window_counts = {} # track_id -> consecutive windows where motion gate passed
         
         if not ONNX_AVAILABLE:
             print("[GaitAnalyzer] ONNX Runtime not available — gait analysis disabled")
@@ -1367,29 +1372,75 @@ class GaitAnalyzer:
         window = np.array(list(buf), dtype=np.float32)
         
         # ---- MOTION GATE: skip classification if person is standing still ----
-        # Two checks to reject jitter-as-motion:
-        #   1. Net displacement (start→end): cancels random jitter
-        #   2. Avg per-frame displacement: ensures sustained movement, not noise
+        # Four layered checks to reject YOLO jitter-as-motion:
+        #   1. Keypoint variance stillness: overall pose stability
+        #   2. Net displacement (start→end): cancels random jitter
+        #   3. Avg per-frame displacement: ensures sustained movement
+        #   4. Limb oscillation: walking requires cyclic knee/ankle motion
+        
+        # -- Check 1: KEYPOINT VARIANCE STILLNESS --
+        # If all keypoints barely move across the window, person is definitively still.
+        # This catches slow drift that passes displacement checks.
+        kp_std = np.std(window, axis=0)  # (17, 2) std per joint per axis
+        mean_kp_std = float(np.mean(kp_std))  # single scalar
+        
+        if mean_kp_std < Config.TCN_STILLNESS_STD_THRESHOLD:
+            self.motion_window_counts[track_id] = 0  # Reset sustained motion
+            result = {'is_abnormal': False, 'confidence': 0.0}
+            self.gait_results[track_id] = result
+            if Config.DEBUG_LOGGING:
+                print(f"[GaitAnalyzer] Person {track_id}: stationary "
+                      f"(mean_kp_std={mean_kp_std:.2f}px < {Config.TCN_STILLNESS_STD_THRESHOLD}), skipping")
+            return result
+        
         hip_centers = (window[:, Config.TCN_LEFT_HIP_IDX, :] + 
                        window[:, Config.TCN_RIGHT_HIP_IDX, :]) / 2.0
         
-        # Check 1: Net displacement (existing)
+        # -- Check 2: Net displacement --
         net_displacement = float(np.linalg.norm(hip_centers[-1] - hip_centers[0]))
         
-        # Check 2: Average per-frame displacement — must show sustained movement
+        # -- Check 3: Average per-frame displacement --
         frame_deltas = np.linalg.norm(np.diff(hip_centers, axis=0), axis=1)
         avg_frame_displacement = float(np.mean(frame_deltas))
         
-        # Both must pass: person traveled AND individual frames show real steps
+        # Either failing means stationary
         if (net_displacement < Config.TCN_MOTION_THRESHOLD
-                or avg_frame_displacement < 1.0):
-            # Person is stationary or jitter only
+                or avg_frame_displacement < Config.TCN_AVG_FRAME_THRESHOLD):
+            self.motion_window_counts[track_id] = 0  # Reset sustained motion
             result = {'is_abnormal': False, 'confidence': 0.0}
             self.gait_results[track_id] = result
             if Config.DEBUG_LOGGING:
                 print(f"[GaitAnalyzer] Person {track_id}: stationary "
                       f"(net={net_displacement:.1f}px, avg_frame={avg_frame_displacement:.1f}px), skipping")
             return result
+        
+        # -- Check 4: LIMB OSCILLATION --
+        # Walking produces cyclic motion in knees (13,14) and ankles (15,16).
+        # If these joints are static, the person isn't stepping.
+        limb_indices = [13, 14, 15, 16]  # L-knee, R-knee, L-ankle, R-ankle
+        limb_positions = window[:, limb_indices, :]  # (T, 4, 2)
+        limb_deltas = np.diff(limb_positions, axis=0)  # (T-1, 4, 2)
+        limb_motion_std = float(np.mean(np.std(np.linalg.norm(limb_deltas, axis=2), axis=0)))
+        
+        if limb_motion_std < Config.TCN_LIMB_MOTION_STD_THRESHOLD:
+            self.motion_window_counts[track_id] = 0  # Reset sustained motion
+            result = {'is_abnormal': False, 'confidence': 0.0}
+            self.gait_results[track_id] = result
+            if Config.DEBUG_LOGGING:
+                print(f"[GaitAnalyzer] Person {track_id}: stationary "
+                      f"(limb_std={limb_motion_std:.2f}px < {Config.TCN_LIMB_MOTION_STD_THRESHOLD}), skipping")
+            return result
+        
+        # -- Check 5: SUSTAINED MOTION --
+        # Require motion to persist across multiple consecutive analysis windows.
+        # A brief turn/gesture passes one window but won't sustain for 3+.
+        self.motion_window_counts[track_id] = self.motion_window_counts.get(track_id, 0) + 1
+        
+        if self.motion_window_counts[track_id] < Config.TCN_MIN_MOTION_WINDOWS:
+            if Config.DEBUG_LOGGING:
+                print(f"[GaitAnalyzer] Person {track_id}: motion detected but not sustained "
+                      f"({self.motion_window_counts[track_id]}/{Config.TCN_MIN_MOTION_WINDOWS} windows), waiting")
+            return self.gait_results.get(track_id)
         
         # Normalize (hip-centered) — matches training exactly
         window_norm = self._normalize_keypoints(window)
@@ -1438,6 +1489,7 @@ class GaitAnalyzer:
         self.last_alert_time.pop(track_id, None)
         self.gait_results.pop(track_id, None)
         self.smoothed_keypoints.pop(track_id, None)
+        self.motion_window_counts.pop(track_id, None)
     
     def get_result(self, track_id):
         """Get the latest gait result for a person (may be None)."""

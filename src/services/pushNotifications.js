@@ -66,6 +66,80 @@ export function startFallAlarm(personId = 'Unknown', location = 'Unknown') {
   }, 3000);
 }
 
+// Store gait alarm state separately
+let gaitAlarmIntervalId = null;
+let isGaitAlarmActive = false;
+
+/**
+ * Send a local notification for abnormal gait
+ */
+async function sendLocalGaitNotification(personId, location) {
+  await Notifications.scheduleNotificationAsync({
+    content: {
+      title: '⚠️ ABNORMAL GAIT DETECTED',
+      body: `Person ${personId} at ${location} shows abnormal walking pattern. Please check on them.`,
+      sound: true,
+      priority: Notifications.AndroidNotificationPriority.HIGH,
+      vibrate: [0, 300, 200, 300],
+    },
+    trigger: null,
+  });
+
+  // Trigger device vibration
+  Vibration.vibrate([0, 300, 200, 300]);
+}
+
+/**
+ * Start continuous alarm for abnormal gait detection
+ * Sends notifications every 5 seconds until stopped
+ */
+export function startGaitAlarm(personId = 'Unknown', location = 'Unknown') {
+  if (isGaitAlarmActive) {
+    console.log('🔔 Gait alarm already active');
+    return;
+  }
+
+  isGaitAlarmActive = true;
+  console.log('🔔 Starting gait alarm');
+
+  // Send first notification immediately
+  sendLocalGaitNotification(personId, location);
+
+  // Then send every 5 seconds (less aggressive than fall alarm)
+  gaitAlarmIntervalId = setInterval(() => {
+    if (isGaitAlarmActive) {
+      sendLocalGaitNotification(personId, location);
+      console.log('🔔 Gait alarm: notification sent');
+    }
+  }, 5000);
+}
+
+/**
+ * Stop the gait alarm
+ */
+export function stopGaitAlarm() {
+  if (!isGaitAlarmActive) return;
+
+  isGaitAlarmActive = false;
+  if (gaitAlarmIntervalId) {
+    clearInterval(gaitAlarmIntervalId);
+    gaitAlarmIntervalId = null;
+  }
+  // Only cancel vibration if fall alarm is also not running
+  if (!isAlarmActive) {
+    Vibration.cancel();
+  }
+  console.log('🔕 Gait alarm stopped');
+  Notifications.dismissAllNotificationsAsync();
+}
+
+/**
+ * Check if gait alarm is currently active
+ */
+export function isGaitAlarmRunning() {
+  return isGaitAlarmActive;
+}
+
 /**
  * Stop the continuous fall alarm
  */
@@ -181,4 +255,7 @@ export default {
   startFallAlarm,
   stopFallAlarm,
   isAlarmRunning,
+  startGaitAlarm,
+  stopGaitAlarm,
+  isGaitAlarmRunning,
 };

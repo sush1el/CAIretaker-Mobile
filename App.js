@@ -71,10 +71,11 @@ function MainApp() {
   const notificationListener = useRef();
   const responseListener = useRef();
   const fallAlarmRef = useRef(false); // Track if alarm is running
+  const gaitAlarmRef = useRef(false); // Track if gait alarm is running
 
-  // Global fall monitoring - poll for active falls regardless of current screen
+  // Global fall & gait monitoring - poll for active alerts regardless of current screen
   useEffect(() => {
-    const checkForActiveFalls = async () => {
+    const checkForActiveAlerts = async () => {
       try {
         const result = await api.getActiveFalls();
         if (result.ok) {
@@ -82,7 +83,9 @@ function MainApp() {
           // This ensures alarm stops immediately when person recovers, not based on stale DB data
           const currentDetections = result.data.current_detections || [];
           const hasRealTimeFall = currentDetections.some(d => d.is_fall === true);
+          const hasRealTimeGait = currentDetections.some(d => d.gait_status === 'abnormal');
 
+          // --- FALL ALARM ---
           if (hasRealTimeFall && !fallAlarmRef.current) {
             // Found an active fall in real-time detection - start alarm
             const fallDetection = currentDetections.find(d => d.is_fall === true);
@@ -99,22 +102,39 @@ function MainApp() {
             pushNotifications.stopFallAlarm();
             fallAlarmRef.current = false;
           }
+
+          // --- GAIT ALARM ---
+          if (hasRealTimeGait && !gaitAlarmRef.current && !fallAlarmRef.current) {
+            // Gait alert detected — only alarm if no fall alarm is already active
+            const gaitDetection = currentDetections.find(d => d.gait_status === 'abnormal');
+            pushNotifications.startGaitAlarm(
+              gaitDetection?.id || 'Unknown',
+              'Room 1'
+            );
+            gaitAlarmRef.current = true;
+          } else if (!hasRealTimeGait && gaitAlarmRef.current) {
+            pushNotifications.stopGaitAlarm();
+            gaitAlarmRef.current = false;
+          }
         }
       } catch (error) {
-        console.log('Fall check error:', error);
+        console.log('Alert check error:', error);
       }
     };
 
-    // Poll every 3 seconds for active falls
-    const intervalId = setInterval(checkForActiveFalls, 3000);
+    // Poll every 3 seconds for active alerts
+    const intervalId = setInterval(checkForActiveAlerts, 3000);
 
     // Initial check
-    checkForActiveFalls();
+    checkForActiveAlerts();
 
     return () => {
       clearInterval(intervalId);
       if (fallAlarmRef.current) {
         pushNotifications.stopFallAlarm();
+      }
+      if (gaitAlarmRef.current) {
+        pushNotifications.stopGaitAlarm();
       }
     };
   }, []);

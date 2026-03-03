@@ -8,6 +8,7 @@ import { useTheme } from '../context/ThemeContext';
 
 // Vibration pattern: vibrate 500ms, pause 500ms (repeats)
 const FALL_VIBRATION_PATTERN = [0, 500, 500];
+const GAIT_VIBRATION_PATTERN = [0, 300, 300, 300, 300];
 
 export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
   const { theme, isDarkMode } = useTheme();
@@ -32,26 +33,30 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
   useEffect(() => {
     // ONLY vibrate when camera is actively detecting AND there's a fall
     const liveDetections = cameraStatus?.detections || [];
-    
+
     // Must have at least one detection AND one of them must be a fall
     const hasDetections = liveDetections.length > 0;
     const hasLiveFallDetection = hasDetections && liveDetections.some(d => d.is_fall === true);
-    
-    console.log('Vibration check:', { 
-      hasDetections, 
-      hasLiveFallDetection, 
+    const hasLiveGaitAlert = hasDetections && liveDetections.some(d => d.gait_status === 'abnormal');
+    const hasAlert = hasLiveFallDetection || hasLiveGaitAlert;
+
+    console.log('Vibration check:', {
+      hasDetections,
+      hasLiveFallDetection,
+      hasLiveGaitAlert,
       detectionsCount: liveDetections.length,
-      isVibrating: vibrationActiveRef.current 
+      isVibrating: vibrationActiveRef.current
     });
-    
-    if (hasLiveFallDetection && !vibrationActiveRef.current) {
+
+    if (hasAlert && !vibrationActiveRef.current) {
       vibrationActiveRef.current = true;
       setIsVibrating(true);
-      Vibration.vibrate(FALL_VIBRATION_PATTERN, true);
-      console.log('🔔 Fall alert: vibration started');
-    } else if (!hasLiveFallDetection && vibrationActiveRef.current) {
+      // Use fall pattern for falls, gait pattern for gait-only alerts
+      Vibration.vibrate(hasLiveFallDetection ? FALL_VIBRATION_PATTERN : GAIT_VIBRATION_PATTERN, true);
+      console.log(hasLiveFallDetection ? '🔔 Fall alert: vibration started' : '🔔 Gait alert: vibration started');
+    } else if (!hasAlert && vibrationActiveRef.current) {
       stopVibration();
-      console.log('🔕 Fall cleared: vibration stopped');
+      console.log('🔕 Alert cleared: vibration stopped');
     }
 
     return () => {
@@ -98,18 +103,18 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
       const result = await api.getCameraStatus();
       if (result.ok) {
         setCameraStatus(result.data);
-        
+
         // Check for new fall events and add to persistent logs
         if (result.data.detections) {
           result.data.detections.forEach(detection => {
             // Backend returns 'id' as the track_id, also check is_fall
             const trackId = detection.id || detection.track_id;
             if (detection.is_fall || detection.is_fallen) {
-              const existingLog = fallLogs.find(log => 
-                log.trackId === trackId && 
+              const existingLog = fallLogs.find(log =>
+                log.trackId === trackId &&
                 (Date.now() - log.timestamp) < 5000 // Same fall within 5 seconds
               );
-              
+
               if (!existingLog) {
                 setFallLogs(prev => [{
                   id: Date.now(),
@@ -121,10 +126,10 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
                     day: 'numeric',
                     year: 'numeric'
                   }),
-                  time: new Date().toLocaleTimeString('en-US', { 
-                    hour: 'numeric', 
+                  time: new Date().toLocaleTimeString('en-US', {
+                    hour: 'numeric',
                     minute: '2-digit',
-                    hour12: true 
+                    hour12: true
                   })
                 }, ...prev].slice(0, 50)); // Keep last 50 logs
               }
@@ -159,24 +164,27 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
     if (!cameraStatus || !cameraStatus.detections || cameraStatus.detections.length === 0) {
       return [];
     }
-    
+
     return cameraStatus.detections.map(detection => {
       // Backend returns 'id' as track_id
       const trackId = detection.id || detection.track_id;
       // Use the status directly from API if available
       let status = detection.status || 'Tracking';
-      
+
       // Override based on specific flags
       if (detection.is_fall || detection.is_fallen || detection.display_state === 'fallen') {
         status = 'Fall';
+      } else if (detection.gait_status === 'abnormal') {
+        status = 'Abnormal Gait';
       } else if (detection.is_at_risk) {
         status = 'At Risk';
       }
-      
+
       return {
         trackId: trackId,
         status: status,
         isFall: detection.is_fall || detection.is_fallen,
+        isGaitAlert: detection.gait_status === 'abnormal',
         isAtRisk: detection.is_at_risk,
         confidence: detection.confidence
       };
@@ -192,7 +200,7 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
     if (monitoringRoom !== 1) {
       return [];
     }
-    
+
     const now = new Date();
     const liveData = currentDetections.map(detection => ({
       id: detection.trackId,
@@ -205,13 +213,13 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
         day: 'numeric',
         year: 'numeric'
       }),
-      time: now.toLocaleTimeString('en-US', { 
-        hour: 'numeric', 
+      time: now.toLocaleTimeString('en-US', {
+        hour: 'numeric',
         minute: '2-digit',
-        hour12: true 
+        hour12: true
       })
     }));
-    
+
     // Add fall logs (persistent historical falls)
     const fallData = fallLogs.map(log => ({
       id: log.id,
@@ -222,7 +230,7 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
       date: log.date,
       time: log.time
     }));
-    
+
     // Combine: live detections first, then fall history
     return [...liveData, ...fallData];
   };
@@ -281,16 +289,16 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
           </View>
         )}
         {isVibrating && (
-          <TouchableOpacity 
-            style={styles.stopAlertButton} 
+          <TouchableOpacity
+            style={styles.stopAlertButton}
             onPress={stopVibration}
           >
             <FontAwesomeIcon icon={faExclamationTriangle} color="#FFF" size={16} />
             <Text style={styles.stopAlertText}>STOP ALERT</Text>
           </TouchableOpacity>
         )}
-        <TouchableOpacity 
-          style={styles.fullscreenButton} 
+        <TouchableOpacity
+          style={styles.fullscreenButton}
           onPress={() => setIsFullscreen(true)}
         >
           <FontAwesomeIcon icon={faExpand} color="#FFF" size={16} />
@@ -305,6 +313,8 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
       case 'Fall':
       case 'Fallen':
         return { bg: '#FFEBEE', text: '#D32F2F' }; // Red
+      case 'Abnormal Gait':
+        return { bg: '#FFF8E1', text: '#F57F17' }; // Amber/Yellow
       case 'At Risk':
         return { bg: '#FFF3E0', text: '#FF9800' }; // Orange
       case 'Tracking':
@@ -357,8 +367,8 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
               <FontAwesomeIcon icon={faCompress} color="#FFF" size={20} />
             </TouchableOpacity>
             {isVibrating && (
-              <TouchableOpacity 
-                style={styles.fullscreenStopAlert} 
+              <TouchableOpacity
+                style={styles.fullscreenStopAlert}
                 onPress={stopVibration}
               >
                 <FontAwesomeIcon icon={faExclamationTriangle} color="#FFF" size={16} />
@@ -394,16 +404,16 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
 
       <View style={styles.pillHeader}>
         <Text style={styles.pillHeaderText}>LIVE MONITORING</Text>
-        <FontAwesomeIcon icon={faCamera} color="#1E3A5F" size={16}/>
+        <FontAwesomeIcon icon={faCamera} color="#1E3A5F" size={16} />
       </View>
 
       {/* Room Activity Table - ID, Status, Date, Time */}
       <View style={styles.activitySection}>
         <View style={styles.activityHeader}>
           <Text style={styles.activityHeaderText}>ROOM {monitoringRoom} ACTIVITY</Text>
-          <FontAwesomeIcon icon={faChartBar} color="#FFF" size={14}/>
+          <FontAwesomeIcon icon={faChartBar} color="#FFF" size={14} />
         </View>
-        
+
         <View style={styles.activityTable}>
           {/* Table Header */}
           <View style={styles.tableHeader}>
@@ -420,9 +430,9 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
               <Text style={styles.tableHeaderText}>Time</Text>
             </View>
           </View>
-          
+
           {/* Table Rows */}
-          <ScrollView style={{maxHeight: 200}} nestedScrollEnabled>
+          <ScrollView style={{ maxHeight: 200 }} nestedScrollEnabled>
             {activityData.length > 0 ? (
               activityData.map((item, index) => {
                 const statusStyle = getStatusStyle(item.status);
@@ -432,8 +442,8 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
                       <Text style={styles.idText}>{item.trackId}</Text>
                     </View>
                     <View style={styles.columnCenter}>
-                      <View style={[styles.statusBadge, {backgroundColor: statusStyle.bg}]}>
-                        <Text style={[styles.statusBadgeText, {color: statusStyle.text}]}>{item.status}</Text>
+                      <View style={[styles.statusBadge, { backgroundColor: statusStyle.bg }]}>
+                        <Text style={[styles.statusBadgeText, { color: statusStyle.text }]}>{item.status}</Text>
                       </View>
                     </View>
                     <View style={styles.columnCenter}>
@@ -456,10 +466,10 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
 
       <View style={styles.paginationRow}>
         <TouchableOpacity style={styles.circleArrow} onPress={() => setMonitoringRoom(monitoringRoom <= 1 ? 3 : monitoringRoom - 1)}>
-            <FontAwesomeIcon icon={faChevronLeft} color="#FFF"/>
+          <FontAwesomeIcon icon={faChevronLeft} color="#FFF" />
         </TouchableOpacity>
         <TouchableOpacity style={styles.circleArrow} onPress={() => setMonitoringRoom(monitoringRoom >= 3 ? 1 : monitoringRoom + 1)}>
-            <FontAwesomeIcon icon={faChevronRight} color="#FFF"/>
+          <FontAwesomeIcon icon={faChevronRight} color="#FFF" />
         </TouchableOpacity>
       </View>
     </View>
