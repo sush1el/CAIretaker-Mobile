@@ -14,6 +14,7 @@
     "@fortawesome/free-solid-svg-icons": "^6.5.1",
     "@fortawesome/react-fontawesome": "^3.2.0",
     "@fortawesome/react-native-fontawesome": "^0.3.2",
+    "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-picker/picker": "^2.11.4",
     "expo": "~54.0.33",
     "expo-av": "~16.0.8",

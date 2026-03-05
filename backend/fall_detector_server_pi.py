@@ -228,7 +228,7 @@ class Config:
     
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     CNN_MODEL_PATH = os.path.join(BASE_DIR, "cnn_model_fall.pth")
-    YOLO_MODEL = os.path.join(BASE_DIR, "models", "yolov8s_pose.hef")
+    YOLO_MODEL = os.path.join(BASE_DIR, "models", "yolov8m_pose.hef")
     # ===========================================================================
     
     CONFIDENCE_THRESHOLD = 0.65
@@ -240,10 +240,13 @@ class Config:
     
     # PERFORMANCE SETTINGS
     YOLO_IMGSZ = 640              # YOLO inference resolution (must match HEF model input)
-    YOLO_CONF_THRESHOLD = 0.5     # YOLO detection confidence threshold
+    YOLO_CONF_THRESHOLD = 0.35    # YOLO detection confidence threshold
     YOLO_NMS_IOU_THRESHOLD = 0.45 # NMS IOU threshold for overlapping detections
     DEBUG_LOGGING = False          # Set True for verbose per-frame logging, False for production
     LOG_INTERVAL = 30              # Print status summary every N frames (when DEBUG_LOGGING is False)
+    
+    # HEURISTIC TOGGLES
+    ENABLE_BENDING_OVERRIDE = False # Set False to disable the leg-angle bending check
 
     # STREAM QUALITY PRESETS
     # Choose profile with environment variable: STREAM_PROFILE=pi5 or STREAM_PROFILE=pi5
@@ -280,7 +283,7 @@ class Config:
     TCN_MODEL_PATH = os.path.join(BASE_DIR, "models", "tcn_gait_model.onnx")
     TCN_WINDOW = 60               # Frames per analysis window (must match training)
     TCN_STRIDE = 15               # Frames between analysis attempts
-    TCN_THRESHOLD = 0.50          # Classification threshold (0 = normal, 1 = abnormal)
+    TCN_THRESHOLD = 0.70        # Classification threshold (0 = normal, 1 = abnormal)
     TCN_ALERT_COOLDOWN = 30       # Seconds between repeat gait alerts per person
     TCN_IN_CHANNELS = 34          # 17 keypoints * 2 (x, y) — matches training
     TCN_LEFT_HIP_IDX = 11         # COCO keypoint index for left hip
@@ -290,6 +293,25 @@ class Config:
     TCN_STILLNESS_STD_THRESHOLD = 3.0   # Max mean keypoint std-dev (px) to be "stationary"
     TCN_LIMB_MOTION_STD_THRESHOLD = 2.0 # Min limb oscillation std to confirm walking
     TCN_MIN_MOTION_WINDOWS = 5   # Consecutive motion-passing windows required before TCN runs
+    
+    # TCN FALL DETECTION SETTINGS (multi-class temporal fall classifier — ONNX)
+    # Runs in parallel with the single-frame CNN to add temporal context.
+    # Export from falltcntrain Colab notebook via torch.onnx.export.
+    TCN_FALL_MODEL_PATH = os.path.join(BASE_DIR, "models", "best_model_multiclass.onnx")
+    TCN_FALL_WINDOW = 30          # Frames per sliding window (~1 s at 30 fps)
+    TCN_FALL_STRIDE = 15          # Frames between inference attempts (50% overlap)
+    TCN_FALL_IN_CHANNELS = 51     # 17 keypoints * 3 (x, y, confidence)
+    TCN_FALL_N_CLASSES = 4        # ADL, Fall-Sideways, Fall-Forward, Fall-Backward
+    TCN_FALL_THRESHOLD = 0.45     # Min fall probability to consider TCN detection
+    TCN_FALL_BOOST = 0.10         # Confidence boost when CNN + TCN agree on fall
+    TCN_FALL_OVERRIDE_THRESHOLD = 0.60  # TCN fall prob above this can override CNN normal
+    TCN_FALL_CLASS_MAP = {0: 'ADL', 1: 'Fall-Sideways', 2: 'Fall-Forward', 3: 'Fall-Backward'}
+    TCN_FALL_CLASS_COLORS_BGR = {
+        0: (113, 204, 46),    # green  - ADL
+        1: (60, 76, 231),     # red    - Fall-Sideways
+        2: (34, 126, 230),    # orange - Fall-Forward
+        3: (173, 68, 142),    # purple - Fall-Backward
+    }
     
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
     CLASS_COLORS = {
@@ -301,7 +323,7 @@ class Config:
     }
     
     # Three-tier confidence thresholds
-    HIGH_CONFIDENCE_THRESHOLD = 0.65 # Confirmed fallen - triggers monitoring/alert (≥75%)
+    HIGH_CONFIDENCE_THRESHOLD = 0.60 # Confirmed fallen - triggers monitoring/alert (≥75%)
     LOW_CONFIDENCE_THRESHOLD = 0.50 # At risk - visual warning only (60-74%)
     # Below 0.60 = treated as normal (not fallen)
     NUM_KEYPOINTS = 17
@@ -1497,6 +1519,160 @@ class GaitAnalyzer:
 
 
 # ============================================================================
+# TCN FALL ANALYZER (multi-class temporal fall detection — ONNX Runtime)
+# ============================================================================
+
+class FallTCNAnalyzer:
+    """Real-time multi-class fall detection using the TCN ONNX model.
+    
+    For each tracked person, maintains a rolling buffer of normalised keypoints.
+    When the buffer reaches TCN_FALL_WINDOW frames, runs ONNX Runtime inference
+    to classify the window as ADL / Fall-Sideways / Fall-Forward / Fall-Backward.
+    
+    Normalisation matches the training script exactly:
+    - x coordinate divided by frame width
+    - y coordinate divided by frame height
+    - confidence kept as-is
+    - Flattened to 51-dim vector per frame
+    - Input shape: (1, 51, 30)
+    """
+    
+    def __init__(self, onnx_path):
+        self.enabled = False
+        self.session = None
+        self.input_name = None
+        
+        # Per-person state
+        self.keypoint_buffers = {}     # track_id -> deque of 51-dim vectors
+        self.frame_counters = {}       # track_id -> frames since last analysis
+        self.fall_results = {}         # track_id -> dict with class probs and label
+        
+        if not ONNX_AVAILABLE:
+            print("[FallTCNAnalyzer] ONNX Runtime not available — TCN fall detection disabled")
+            print("                  Install with: pip install onnxruntime")
+            return
+        
+        if not os.path.exists(onnx_path):
+            print(f"[FallTCNAnalyzer] Model not found at: {onnx_path}")
+            print("                  TCN fall detection disabled (CNN still active)")
+            print("                  Export from falltcntrain notebook via torch.onnx.export")
+            print("                  and copy best_model_multiclass.onnx to backend/models/")
+            return
+        
+        try:
+            self.session = ort.InferenceSession(
+                onnx_path,
+                providers=['CPUExecutionProvider']
+            )
+            self.input_name = self.session.get_inputs()[0].name
+            self.enabled = True
+            
+            inp = self.session.get_inputs()[0]
+            out = self.session.get_outputs()[0]
+            print("[FallTCNAnalyzer] TCN fall ONNX model loaded successfully")
+            print(f"  Input:  {inp.name} {inp.shape}")
+            print(f"  Output: {out.name} {out.shape}")
+            print(f"  Classes: {list(Config.TCN_FALL_CLASS_MAP.values())}")
+            print(f"  Window: {Config.TCN_FALL_WINDOW} frames, Stride: {Config.TCN_FALL_STRIDE}")
+        except Exception as e:
+            print(f"[FallTCNAnalyzer] Failed to load ONNX model: {e}")
+            print("                  TCN fall detection disabled (CNN still active)")
+            import traceback
+            traceback.print_exc()
+    
+    @staticmethod
+    def _softmax(x):
+        """Compute softmax along the last axis."""
+        e = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        return e / e.sum(axis=-1, keepdims=True)
+    
+    def feed_keypoints(self, track_id, keypoints, frame_shape):
+        """Feed a single frame's keypoints for a tracked person.
+        
+        Args:
+            track_id: integer person tracking ID
+            keypoints: (17, 3) numpy array [x, y, confidence] in pixel coords
+            frame_shape: (h, w, ...) tuple for normalisation
+        
+        Returns:
+            dict or None with keys:
+                'fall_detected': bool  (any fall class above threshold)
+                'fall_class': int      (0-3, argmax)
+                'fall_class_name': str
+                'fall_prob': float     (max fall probability)
+                'class_probs': list    (4 softmax probabilities)
+        """
+        if not self.enabled:
+            return None
+        
+        h, w = frame_shape[:2]
+        
+        # Normalise keypoints the same way as training:
+        # x /= width, y /= height, confidence unchanged → flatten to 51-dim
+        kp_norm = keypoints.copy().astype(np.float32)
+        kp_norm[:, 0] /= max(w, 1)
+        kp_norm[:, 1] /= max(h, 1)
+        kp_flat = kp_norm.flatten()  # (51,)
+        
+        # Initialise buffer for new person
+        if track_id not in self.keypoint_buffers:
+            self.keypoint_buffers[track_id] = deque(maxlen=Config.TCN_FALL_WINDOW)
+            self.frame_counters[track_id] = 0
+        
+        self.keypoint_buffers[track_id].append(kp_flat)
+        self.frame_counters[track_id] += 1
+        
+        buf = self.keypoint_buffers[track_id]
+        if len(buf) < Config.TCN_FALL_WINDOW:
+            return self.fall_results.get(track_id)
+        
+        if self.frame_counters[track_id] < Config.TCN_FALL_STRIDE:
+            return self.fall_results.get(track_id)
+        
+        # Reset stride counter
+        self.frame_counters[track_id] = 0
+        
+        # Build window: stack frames → (WINDOW, 51), transpose → (51, WINDOW)
+        window = np.array(list(buf), dtype=np.float32)  # (30, 51)
+        input_tensor = window.T[np.newaxis, :, :].astype(np.float32)  # (1, 51, 30)
+        
+        try:
+            outputs = self.session.run(None, {self.input_name: input_tensor})
+            logits = outputs[0][0]  # (4,) raw logits
+            probs = self._softmax(logits)  # (4,) softmax probabilities
+            
+            fall_probs = probs[1:]  # classes 1, 2, 3 are fall types
+            max_fall_prob = float(np.max(fall_probs))
+            pred_class = int(np.argmax(probs))
+            
+            result = {
+                'fall_detected': max_fall_prob >= Config.TCN_FALL_THRESHOLD,
+                'fall_class': pred_class,
+                'fall_class_name': Config.TCN_FALL_CLASS_MAP.get(pred_class, 'Unknown'),
+                'fall_prob': max_fall_prob,
+                'adl_prob': float(probs[0]),
+                'class_probs': [float(p) for p in probs],
+            }
+            self.fall_results[track_id] = result
+            return result
+            
+        except Exception as e:
+            if Config.DEBUG_LOGGING:
+                print(f"[FallTCNAnalyzer] Inference error for person {track_id}: {e}")
+            return self.fall_results.get(track_id)
+    
+    def get_result(self, track_id):
+        """Get the latest TCN fall result for a person (may be None)."""
+        return self.fall_results.get(track_id)
+    
+    def cleanup_person(self, track_id):
+        """Remove all state for a person who left the frame."""
+        self.keypoint_buffers.pop(track_id, None)
+        self.frame_counters.pop(track_id, None)
+        self.fall_results.pop(track_id, None)
+
+
+# ============================================================================
 # FALL DETECTOR CLASS
 # ============================================================================
 
@@ -1552,6 +1728,13 @@ class FallDetector:
         self.gait_analyzer = GaitAnalyzer(Config.TCN_MODEL_PATH)
         self.gait_alert_count = 0  # live count of people with abnormal gait
         
+        # ---- TCN Fall Analyzer (multi-class temporal fall detection — ONNX) ----
+        self.fall_tcn_analyzer = FallTCNAnalyzer(Config.TCN_FALL_MODEL_PATH)
+        if self.fall_tcn_analyzer.enabled:
+            print("TCN fall analyzer (ONNX) loaded — running in parallel with CNN")
+        else:
+            print("TCN fall analyzer disabled — CNN-only fall detection active")
+        
     def extract_features(self, keypoints, image_shape):
         """Extract normalized keypoint features (same as inference)"""
         h, w = image_shape[:2]
@@ -1591,8 +1774,24 @@ class FallDetector:
                         'is_fallen': False,
                         'incident_id': None
                     }
+                # ── TCN FALL DETECTION (temporal, runs in parallel) ──
+                # Feed TCN *before* the structural gate. TCN handles corrupted/missing
+                # keypoints better than the single-frame CNN, and needs a continuous
+                # 30-frame buffer. The structural gate drops frames during falls.
+                tcn_fall_result = self.fall_tcn_analyzer.feed_keypoints(
+                    track_id, keypoints, frame.shape
+                )
+                tcn_fall_detected = False
+                tcn_fall_class_name = 'ADL'
+                tcn_fall_prob = 0.0
                 
+                if tcn_fall_result and tcn_fall_result['fall_detected']:
+                    tcn_fall_detected = True
+                    tcn_fall_class_name = tcn_fall_result['fall_class_name']
+                    tcn_fall_prob = tcn_fall_result['fall_prob']
+
                 # STRUCTURAL VALIDATION: Require both shoulders and both knees visible
+                # (Only gates the CNN and geometric heuristics)
                 visible_count = np.sum(keypoints[:, 2] > 0.3)
                 has_both_shoulders = (keypoints[5, 2] > 0.3 and keypoints[6, 2] > 0.3)
                 has_both_knees = (keypoints[13, 2] > 0.3 and keypoints[14, 2] > 0.3)
@@ -1691,9 +1890,50 @@ class FallDetector:
                     
                     # Check for fall state changes
                     was_fallen = self.fall_states[track_id]['is_fallen']
+                    # (TCN was already fed outside the structural gate)
+                    # ── FUSION: CNN + TCN agreement logic ──
+                    if tcn_fall_detected and is_raw_fallen:
+                        # BOTH models agree → boost confidence
+                        fallen_confidence = min(1.0,
+                            fallen_confidence + Config.TCN_FALL_BOOST)
+                        if confidence_tier == "HIGH":
+                            confidence_tier = "HIGH+TCN"
+                        if _should_log:
+                            print(f"Person ID {track_id}: CNN+TCN AGREE on fall")
+                            print(f"   TCN: {tcn_fall_class_name} ({tcn_fall_prob:.2%})")
+                            print(f"   Boosted fallen confidence: {fallen_confidence:.2%}")
+                    
+                    elif tcn_fall_detected and not is_raw_fallen:
+                        # TCN sees fall but CNN does not → promote to at-risk
+                        # or override if TCN confidence is very high
+                        if tcn_fall_prob >= Config.TCN_FALL_OVERRIDE_THRESHOLD:
+                            is_raw_fallen = True
+                            prediction = 2
+                            fallen_confidence = tcn_fall_prob
+                            confidence_tier = "TCN_OVERRIDE"
+                            display_state = "normal"
+                            if _should_log:
+                                print(f"Person ID {track_id}: TCN OVERRIDE — "
+                                      f"{tcn_fall_class_name} ({tcn_fall_prob:.2%})")
+                        elif confidence_tier not in ("AT_RISK",):
+                            display_state = "at_risk"
+                            confidence_tier = "TCN_AT_RISK"
+                            if _should_log:
+                                print(f"Person ID {track_id}: TCN detects fall, CNN disagrees → AT_RISK")
+                                print(f"   TCN: {tcn_fall_class_name} ({tcn_fall_prob:.2%})")
+                    
+                    elif not tcn_fall_detected and is_raw_fallen:
+                        # CNN sees fall but TCN says ADL → note disagreement
+                        # (do NOT override CNN, but log it)
+                        if _should_log:
+                            adl_prob = tcn_fall_result['adl_prob'] if tcn_fall_result else 0.
+                            print(f"Person ID {track_id}: CNN=Fallen but TCN=ADL "
+                                  f"(ADL prob {adl_prob:.2%}) — keeping CNN decision")
                     
                     # BENDING DETECTION OVERRIDE
-                    if is_raw_fallen:
+                    # Skip if globally disabled, already confirmed fallen, or TCN strongly overridden
+                    if (Config.ENABLE_BENDING_OVERRIDE 
+                        and is_raw_fallen and not was_fallen and confidence_tier != "TCN_OVERRIDE"):
                         is_bending, bend_conf, reasons = is_bending_posture(keypoints, frame.shape)
                         
                         if is_bending and bend_conf > 0.5:
@@ -1712,7 +1952,8 @@ class FallDetector:
                     # When someone lies facing the camera, the CNN sees a "standing"
                     # skeleton but the bounding box is wide+flat and keypoints are
                     # clustered near the ground.
-                    if not is_raw_fallen and raw_prediction != 1:  # Not already fallen, not sitting
+                    # Skip if already fallen (either confirmed or just detected)
+                    if not is_raw_fallen and not was_fallen and raw_prediction != 1:  # Not fallen, not sitting
                         box_w = box[2] - box[0]
                         box_h = box[3] - box[1]
                         bbox_aspect = box_w / max(box_h, 1)
@@ -1792,11 +2033,21 @@ class FallDetector:
                                         location=room_name
                                     )
                                     
+                                    # Always advance state machine — even if DB
+                                    # returns None (duplicate active fall) so the
+                                    # monitoring timer stops and we don't get stuck.
+                                    self.fall_states[track_id]['is_fallen'] = True
+                                    
+                                    # Clear monitoring candidate so the timer
+                                    # in draw_results stops (no more negative countdown)
+                                    candidate['start_time'] = None
+                                    candidate['frame_count'] = 0
+                                    candidate['consecutive_fallen_frames'] = 0
+                                    
                                     if incident_id is None:
                                         # Person already has an active fall in DB — skip duplicate
                                         print(f"Person ID {track_id}: Active fall already exists in DB, skipping")
                                     else:
-                                        self.fall_states[track_id]['is_fallen'] = True
                                         self.fall_states[track_id]['incident_id'] = incident_id
                                         
                                         print(f"Incident logged (ID: {incident_id})")
@@ -1804,9 +2055,14 @@ class FallDetector:
                                         print(f"{'='*70}\n")
                                         
                                         # Send push notification to registered devices
+                                        # Include TCN fall type if available
+                                        tcn_r = self.fall_tcn_analyzer.get_result(track_id)
+                                        fall_type_str = ""
+                                        if tcn_r and tcn_r['fall_detected']:
+                                            fall_type_str = f" ({tcn_r['fall_class_name']})"
                                         send_expo_push_notification(
                                             "Fall Detected!",
-                                            f"Person ID {track_id} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
+                                            f"Person ID {track_id} has fallen{fall_type_str} at {room_name}. Confidence: {fallen_confidence:.0%}"
                                         )
                                 else:
                                     if _should_log:
@@ -1856,7 +2112,25 @@ class FallDetector:
                     status = "classified"
                     
                     # ---- GAIT ANALYSIS (TCN) ----
-                    gait_result = self.gait_analyzer.feed_keypoints(track_id, keypoints)
+                    # Only analyse gait when the person is upright and walking.
+                    # Skip when: confirmed fallen, sitting, or mid-monitoring
+                    # (non-walking frames would pollute the TCN buffer).
+                    is_confirmed_fallen = self.fall_states[track_id]['is_fallen']
+                    is_sitting = (prediction == 1)
+                    is_in_monitoring = (
+                        candidate is not None
+                        and candidate.get('start_time') is not None
+                    )
+                    
+                    if is_confirmed_fallen or is_sitting or is_in_monitoring:
+                        # Don't feed gait buffer — avoid polluting walking
+                        # analysis with fallen/sitting/monitoring frames.
+                        # Clear the buffer so stale data doesn't carry over.
+                        self.gait_analyzer.cleanup_person(track_id)
+                        gait_result = None
+                    else:
+                        gait_result = self.gait_analyzer.feed_keypoints(track_id, keypoints)
+                    
                     if gait_result and gait_result['is_abnormal']:
                         if self.gait_analyzer.should_alert(track_id):
                             room_name = Config.get_room_name(current_camera_index)
@@ -1900,6 +2174,9 @@ class FallDetector:
                 # Get latest gait result for this person (may be None)
                 gait_result_for_det = self.gait_analyzer.get_result(track_id)
                 
+                # Get latest TCN fall result for this person (may be None)
+                tcn_fall_for_det = self.fall_tcn_analyzer.get_result(track_id)
+                
                 detections.append({
                     'track_id': track_id,
                     'box': box,
@@ -1916,6 +2193,11 @@ class FallDetector:
                     'visible_count': visible_count,
                     'gait_status': 'abnormal' if (gait_result_for_det and gait_result_for_det['is_abnormal']) else 'normal',
                     'gait_confidence': gait_result_for_det['confidence'] if gait_result_for_det else 0.0,
+                    # TCN fall detection fields
+                    'tcn_fall_detected': tcn_fall_for_det['fall_detected'] if tcn_fall_for_det else False,
+                    'tcn_fall_class': tcn_fall_for_det['fall_class_name'] if tcn_fall_for_det else 'ADL',
+                    'tcn_fall_prob': tcn_fall_for_det['fall_prob'] if tcn_fall_for_det else 0.0,
+                    'tcn_fall_probs': tcn_fall_for_det['class_probs'] if tcn_fall_for_det else [1.0, 0.0, 0.0, 0.0],
                 })
         
         # Clean up tracking for people who left the frame
@@ -1929,6 +2211,7 @@ class FallDetector:
             if person_id in self.fall_candidates:
                 del self.fall_candidates[person_id]
             self.gait_analyzer.cleanup_person(person_id)
+            self.fall_tcn_analyzer.cleanup_person(person_id)
         
         # Update live gait alert count
         self.gait_alert_count = sum(
@@ -1976,8 +2259,18 @@ class FallDetector:
                 label = f"ID {track_id}: MONITORING ({remaining:.1f}s)"
                 box_thickness = 3
             elif is_fallen:
-                color = (0, 0, 255)  # RED for confirmed fall
-                label = f"ID {track_id}: FALLEN (ALERT)"
+                # Include TCN fall type in label if available
+                tcn_fall_cls = detection.get('tcn_fall_class', 'ADL')
+                if tcn_fall_cls != 'ADL' and detection.get('tcn_fall_detected'):
+                    tcn_color = Config.TCN_FALL_CLASS_COLORS_BGR.get(
+                        detection.get('tcn_fall_probs', [1,0,0,0]).index(max(detection.get('tcn_fall_probs', [1,0,0,0]))),
+                        (0, 0, 255)
+                    )
+                    color = tcn_color
+                    label = f"ID {track_id}: FALLEN - {tcn_fall_cls}"
+                else:
+                    color = (0, 0, 255)  # RED for confirmed fall
+                    label = f"ID {track_id}: FALLEN (ALERT)"
                 box_thickness = 4
             elif display_state == 'at_risk':
                 color = Config.CLASS_COLORS['at_risk']  # ORANGE
@@ -2021,6 +2314,7 @@ class FallDetector:
             # Draw gait status label (below bounding box)
             gait_status = detection.get('gait_status', 'normal')
             gait_conf = detection.get('gait_confidence', 0.0)
+            extra_label_offset = 0
             if gait_status == 'abnormal':
                 gait_color = Config.CLASS_COLORS['abnormal_gait']  # Yellow
                 gait_label = f"Abnormal Gait ({gait_conf:.0%})"
@@ -2029,6 +2323,22 @@ class FallDetector:
                 cv2.rectangle(frame, (x1, y2 + 2), (x1 + gait_label_size[0] + 4, gait_y + 2), gait_color, -1)
                 cv2.putText(frame, gait_label, (x1 + 2, gait_y - 2),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+                extra_label_offset = gait_label_size[1] + 12
+            
+            # Draw TCN fall status label (below gait label or below bbox)
+            tcn_fall_det = detection.get('tcn_fall_detected', False)
+            tcn_fall_cls = detection.get('tcn_fall_class', 'ADL')
+            tcn_fall_prob = detection.get('tcn_fall_prob', 0.0)
+            if tcn_fall_det and tcn_fall_cls != 'ADL':
+                tcn_class_idx = list(Config.TCN_FALL_CLASS_MAP.values()).index(tcn_fall_cls) if tcn_fall_cls in Config.TCN_FALL_CLASS_MAP.values() else 0
+                tcn_color = Config.TCN_FALL_CLASS_COLORS_BGR.get(tcn_class_idx, (0, 0, 255))
+                tcn_label = f"TCN: {tcn_fall_cls} ({tcn_fall_prob:.0%})"
+                tcn_label_size, _ = cv2.getTextSize(tcn_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                tcn_y = y2 + extra_label_offset + tcn_label_size[1] + 8
+                cv2.rectangle(frame, (x1, y2 + extra_label_offset + 2),
+                             (x1 + tcn_label_size[0] + 4, tcn_y + 2), tcn_color, -1)
+                cv2.putText(frame, tcn_label, (x1 + 2, tcn_y - 2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         
         return frame
 
@@ -2270,6 +2580,9 @@ def _frame_producer():
                             'incident_id': d.get('incident_id'),
                             'gait_status': d.get('gait_status', 'normal'),
                             'gait_confidence': d.get('gait_confidence', 0.0),
+                            'tcn_fall_detected': d.get('tcn_fall_detected', False),
+                            'tcn_fall_class': d.get('tcn_fall_class', 'ADL'),
+                            'tcn_fall_prob': d.get('tcn_fall_prob', 0.0),
                         }
                         for d in detections
                     ]
@@ -2509,14 +2822,22 @@ def health():
         cam_available = camera is not None
     
     gait_enabled = detector.gait_analyzer.enabled if detector else False
+    tcn_fall_enabled = detector.fall_tcn_analyzer.enabled if detector else False
+    
+    model_str = 'HailoNPU(YOLOv8m-pose) + CPU(Simple1DCNN)'
+    if tcn_fall_enabled:
+        model_str += ' + ONNX(TCN-Fall)'
+    if gait_enabled:
+        model_str += ' + ONNX(TCN-Gait)'
     
     return jsonify({
         'status': 'healthy',
         'detector_loaded': detector is not None,
         'camera_available': cam_available,
         'current_camera_index': current_camera_index,
-        'model_type': 'HailoNPU(YOLOv8m-pose) + CPU(Simple1DCNN)' + (' + ONNX(TCN-Gait)' if gait_enabled else ''),
+        'model_type': model_str,
         'gait_analysis_enabled': gait_enabled,
+        'tcn_fall_detection_enabled': tcn_fall_enabled,
     })
 
 

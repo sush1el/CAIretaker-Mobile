@@ -1,9 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, Switch, TouchableOpacity, StyleSheet, Alert, ActivityIndicator } from 'react-native';
+import { View, Text, Switch, TouchableOpacity, StyleSheet, Alert, ActivityIndicator, Platform } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faGear, faBrain, faMicrochip, faRotateRight, faPowerOff, faArrowsRotate, faFlask, faPlay, faStop, faFileExport } from '@fortawesome/free-solid-svg-icons';
+import { faGear, faBrain, faMicrochip, faRotateRight, faPowerOff, faArrowsRotate, faFlask, faPlay, faStop, faFileExport, faBell, faVolumeHigh } from '@fortawesome/free-solid-svg-icons';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
+import { Picker } from '@react-native-picker/picker';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Audio } from 'expo-av';
 import api from '../services/api';
 import { useTheme } from '../context/ThemeContext';
 
@@ -22,6 +25,75 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
   const [dgUptime, setDgUptime] = useState(0);          // seconds — ticked locally
   const [dgStatus, setDgStatus] = useState(null);       // last polled status object
   const dgUptimeRef = useRef(null);                     // interval for local timer
+
+  // ---- Audio Settings state ----
+  const [soundEnabled, setSoundEnabled] = useState(true);
+  const [selectedSound, setSelectedSound] = useState('sound1');
+  const [isPlayingPreview, setIsPlayingPreview] = useState(false);
+  const previewSoundRef = useRef(null);
+
+  // Load Audio Settings
+  useEffect(() => {
+    const loadAudioSettings = async () => {
+      try {
+        const enabledStr = await AsyncStorage.getItem('soundEnabled');
+        if (enabledStr !== null) setSoundEnabled(enabledStr === 'true');
+
+        const soundStr = await AsyncStorage.getItem('selectedSound');
+        if (soundStr !== null) setSelectedSound(soundStr);
+      } catch (e) {
+        console.log("Failed to load audio settings", e);
+      }
+    };
+    loadAudioSettings();
+
+    return () => {
+      if (previewSoundRef.current) {
+        previewSoundRef.current.unloadAsync();
+      }
+    };
+  }, []);
+
+  const toggleSound = async (value) => {
+    setSoundEnabled(value);
+    await AsyncStorage.setItem('soundEnabled', value.toString());
+  };
+
+  const changeSound = async (value) => {
+    setSelectedSound(value);
+    await AsyncStorage.setItem('selectedSound', value);
+  };
+
+  const playPreview = async () => {
+    try {
+      if (isPlayingPreview) return;
+      setIsPlayingPreview(true);
+
+      if (previewSoundRef.current) {
+        await previewSoundRef.current.unloadAsync();
+      }
+
+      await Audio.setAudioModeAsync({ playsInSilentModeIOS: true });
+
+      const soundFiles = {
+        sound1: require('../../assets/sounds/sound1.wav'),
+      };
+
+      const { sound } = await Audio.Sound.createAsync(soundFiles[selectedSound] || soundFiles.sound1);
+      previewSoundRef.current = sound;
+
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.didJustFinish) {
+          setIsPlayingPreview(false);
+        }
+      });
+
+      await sound.playAsync();
+    } catch (e) {
+      console.log("Failed to play preview", e);
+      setIsPlayingPreview(false);
+    }
+  };
 
   // Poll Pi health status every 3 seconds
   useEffect(() => {
@@ -93,27 +165,55 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
   }, [dgActive]);
 
   const dynamicStyles = {
-    pillHeader: { backgroundColor: theme.card, padding: 12, borderRadius: 30, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
-    pillHeaderText: { fontWeight: '800', color: theme.text, marginRight: 10, fontSize: 15 },
-    settingsGroupTitle: { fontWeight: 'bold', color: theme.text, marginLeft: 8, fontSize: 12 },
+    pillHeader: {
+      backgroundColor: theme.card,
+      padding: 14,
+      borderRadius: 30,
+      flexDirection: 'row',
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginBottom: 18,
+      elevation: 2,
+      shadowColor: theme.shadowColor,
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.1,
+      shadowRadius: 3,
+    },
+    pillHeaderText: { fontWeight: '800', color: theme.text, marginRight: 10, fontSize: 16, letterSpacing: 1 },
+    settingsGroupTitle: { fontWeight: '700', color: theme.text, marginLeft: 8, fontSize: 13 },
     settingsCard: {
       backgroundColor: theme.card,
-      borderRadius: 20,
-      paddingHorizontal: 20,
+      borderRadius: 16,
+      paddingHorizontal: 18,
+      paddingVertical: 4,
       borderWidth: isDarkMode ? 1 : 0,
       borderColor: theme.inputBorder,
+      elevation: 2,
+      shadowColor: theme.shadowColor,
+      shadowOffset: { width: 0, height: 1 },
+      shadowOpacity: 0.08,
+      shadowRadius: 4,
     },
-    settingsLabel: { color: theme.text, fontWeight: 'bold' },
+    settingsLabel: { color: theme.text, fontWeight: '600', fontSize: 14 },
+    settingsRow: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      paddingVertical: 14,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: theme.inputBorder,
+    },
     statusDot: {
-      width: 10,
-      height: 10,
+      width: 9,
+      height: 9,
       borderRadius: 5,
-      marginRight: 8,
+      marginRight: 7,
       backgroundColor: piStatus === 'Active' ? theme.success : piStatus === 'Rebooting...' ? theme.warning : theme.danger,
     },
     statusText: {
       color: piStatus === 'Active' ? theme.success : piStatus === 'Rebooting...' ? theme.warning : theme.danger,
-      fontWeight: 'bold',
+      fontWeight: '600',
+      fontSize: 13,
     },
   };
 
@@ -309,7 +409,7 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
           <Text style={dynamicStyles.settingsGroupTitle}>Hardware (Pi 5)</Text>
         </View>
         <View style={dynamicStyles.settingsCard}>
-          <View style={styles.settingsRow}>
+          <View style={dynamicStyles.settingsRow}>
             <Text style={dynamicStyles.settingsLabel}>System Health</Text>
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
               <View style={dynamicStyles.statusDot} />
@@ -317,7 +417,7 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
             </View>
           </View>
           <TouchableOpacity
-            style={styles.settingsRow}
+            style={dynamicStyles.settingsRow}
             onPress={handleReboot}
             disabled={isRebooting}
           >
@@ -329,7 +429,7 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
             )}
           </TouchableOpacity>
           <TouchableOpacity
-            style={styles.settingsRow}
+            style={dynamicStyles.settingsRow}
             onPress={handleRestartServices}
             disabled={isRestarting}
           >
@@ -341,7 +441,7 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
             )}
           </TouchableOpacity>
           <TouchableOpacity
-            style={[styles.settingsRow, { borderBottomWidth: 0 }]}
+            style={[dynamicStyles.settingsRow, { borderBottomWidth: 0 }]}
             onPress={handleShutdown}
             disabled={isShuttingDown}
           >
@@ -355,25 +455,94 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
         </View>
 
         {systemStats && (
-          <View style={[dynamicStyles.settingsCard, { marginTop: 15, paddingVertical: 10, paddingHorizontal: 20 }]}>
-            <View style={[styles.settingsRow, { marginBottom: 10 }]}>
+          <View style={[dynamicStyles.settingsCard, { marginTop: 12, paddingVertical: 6 }]}>
+            <View style={dynamicStyles.settingsRow}>
               <Text style={dynamicStyles.settingsLabel}>CPU Usage</Text>
-              <Text style={{ fontWeight: '600', color: theme.primary }}>{systemStats.cpu_usage}%</Text>
+              <Text style={[styles.statValue, { color: theme.primary }]}>{systemStats.cpu_usage}%</Text>
             </View>
-            <View style={[styles.settingsRow, { marginBottom: 10 }]}>
+            <View style={dynamicStyles.settingsRow}>
               <Text style={dynamicStyles.settingsLabel}>Memory Usage</Text>
-              <Text style={{ fontWeight: '600', color: theme.primary }}>{systemStats.memory_percent}%</Text>
+              <Text style={[styles.statValue, { color: theme.primary }]}>{systemStats.memory_percent}%</Text>
             </View>
-            <View style={[styles.settingsRow, { marginBottom: 10 }]}>
+            <View style={dynamicStyles.settingsRow}>
               <Text style={dynamicStyles.settingsLabel}>CPU Temp</Text>
-              <Text style={{ fontWeight: '600', color: theme.primary }}>{systemStats.temperature}{systemStats.temperature !== 'N/A' ? '°C' : ''}</Text>
+              <Text style={[styles.statValue, { color: theme.primary }]}>{systemStats.temperature}{systemStats.temperature !== 'N/A' ? '°C' : ''}</Text>
             </View>
-            <View style={[styles.settingsRow, { marginBottom: 0, borderBottomWidth: 0 }]}>
+            <View style={[dynamicStyles.settingsRow, { borderBottomWidth: 0 }]}>
               <Text style={dynamicStyles.settingsLabel}>Input Voltage</Text>
-              <Text style={{ fontWeight: '600', color: theme.primary }}>{systemStats.voltage}</Text>
+              <Text style={[styles.statValue, { color: theme.primary }]}>{systemStats.voltage}</Text>
             </View>
           </View>
         )}
+      </View>
+
+      {/* ===== AUDIO SETTINGS SECTION ===== */}
+      <View style={styles.settingsGroup}>
+        <View style={styles.settingsGroupHeader}>
+          <FontAwesomeIcon icon={faBell} color={theme.primary} size={14} />
+          <Text style={dynamicStyles.settingsGroupTitle}>Alert Audio</Text>
+        </View>
+
+        <View style={dynamicStyles.settingsCard}>
+          <View style={dynamicStyles.settingsRow}>
+            <Text style={dynamicStyles.settingsLabel}>Play Sound on Alert</Text>
+            <Switch
+              value={soundEnabled}
+              onValueChange={toggleSound}
+              trackColor={{ false: theme.inputBorder, true: theme.primary }}
+              thumbColor={theme.card}
+            />
+          </View>
+
+          <View style={[dynamicStyles.settingsRow, { borderBottomWidth: 0 }]}>
+            <Text style={dynamicStyles.settingsLabel}>Alarm Sound</Text>
+            <View style={{
+              backgroundColor: theme.background,
+              borderRadius: 10,
+              borderWidth: 1,
+              borderColor: theme.inputBorder,
+              overflow: 'hidden',
+            }}>
+              <Picker
+                selectedValue={selectedSound}
+                onValueChange={changeSound}
+                enabled={soundEnabled}
+                style={{
+                  width: 130,
+                  height: Platform.OS === 'ios' ? 40 : 42,
+                  color: soundEnabled ? theme.text : theme.textSecondary,
+                  backgroundColor: 'transparent',
+                }}
+                itemStyle={{ fontSize: 14, color: theme.text, height: 40 }}
+                dropdownIconColor={theme.text}
+              >
+                <Picker.Item label="Sound 1" value="sound1" />
+              </Picker>
+            </View>
+          </View>
+
+          <TouchableOpacity
+            style={[
+              styles.previewButton,
+              {
+                backgroundColor: soundEnabled ? theme.background : theme.inputBorder,
+                borderWidth: 1,
+                borderColor: theme.inputBorder,
+              }
+            ]}
+            onPress={playPreview}
+            disabled={!soundEnabled || isPlayingPreview}
+          >
+            {isPlayingPreview ? (
+              <ActivityIndicator size="small" color={theme.primary} />
+            ) : (
+              <FontAwesomeIcon icon={faVolumeHigh} color={soundEnabled ? theme.primary : theme.textSecondary} size={14} />
+            )}
+            <Text style={[styles.dgButtonText, { color: soundEnabled ? theme.primary : theme.textSecondary }]}>
+              {isPlayingPreview ? 'Playing...' : 'Preview Sound'}
+            </Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* ===== FIELD TEST SECTION ===== */}
@@ -385,7 +554,7 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
 
         <View style={dynamicStyles.settingsCard}>
           {/* Session Status */}
-          <View style={styles.settingsRow}>
+          <View style={dynamicStyles.settingsRow}>
             <Text style={dynamicStyles.settingsLabel}>Session Status</Text>
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
               <View style={[
@@ -402,7 +571,7 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
           </View>
 
           {/* Uptime Timer */}
-          <View style={styles.settingsRow}>
+          <View style={dynamicStyles.settingsRow}>
             <Text style={dynamicStyles.settingsLabel}>Uptime</Text>
             <Text style={{
               fontWeight: '700',
@@ -439,7 +608,7 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
           )}
 
           {/* Start / Stop Button */}
-          <View style={[styles.settingsRow, { borderBottomWidth: 0, paddingTop: 4 }]}>
+          <View style={[dynamicStyles.settingsRow, { borderBottomWidth: 0, paddingTop: 4, paddingBottom: 14 }]}>
             {dgActive ? (
               <TouchableOpacity
                 style={[styles.dgButton, { backgroundColor: theme.danger }]}
@@ -485,11 +654,27 @@ export default function Settings({ highSensitivity, setHighSensitivity, privacyM
 }
 
 const styles = StyleSheet.create({
-  pillHeader: { backgroundColor: '#FFF', padding: 12, borderRadius: 30, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', marginBottom: 15 },
-  pillHeaderText: { fontWeight: '800', color: '#1E3A5F', marginRight: 10, fontSize: 15 },
-  settingsGroup: { marginBottom: 20 },
-  settingsGroupHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8, marginLeft: 10 },
-  settingsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 15 },
+  settingsGroup: { marginBottom: 22 },
+  settingsGroupHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 10, marginLeft: 12 },
+
+  // System stats value
+  statValue: {
+    fontWeight: '700',
+    fontSize: 14,
+    color: '#1E3A5F',
+  },
+
+  // Audio preview button
+  previewButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 11,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    gap: 8,
+    marginBottom: 14,
+  },
 
   // Data Gathering
   dgButton: {
@@ -497,10 +682,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 10,
-    paddingHorizontal: 10,
-    borderRadius: 10,
-    gap: 6,
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    gap: 7,
   },
   dgButtonText: {
     color: '#FFF',

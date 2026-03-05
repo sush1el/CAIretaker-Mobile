@@ -7,6 +7,18 @@
 import * as Notifications from 'expo-notifications';
 import * as Device from 'expo-device';
 import { Platform, Vibration } from 'react-native';
+import { Audio } from 'expo-av';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+// Map of available sounds
+const SOUND_FILES = {
+  sound1: require('../../assets/sounds/sound1.wav'),
+};
+
+// Global audio state
+let currentSound = null;
+let appSoundEnabled = true;
+let appSelectedSound = 'sound1';
 
 // Store interval ID for continuous alarm
 let alarmIntervalId = null;
@@ -21,6 +33,65 @@ Notifications.setNotificationHandler({
     shouldSetBadge: true,
   }),
 });
+
+/**
+ * Helper to load sound settings
+ */
+async function loadAppSettings() {
+  try {
+    const enabledStr = await AsyncStorage.getItem('soundEnabled');
+    if (enabledStr !== null) {
+      appSoundEnabled = enabledStr === 'true';
+    }
+    const soundStr = await AsyncStorage.getItem('selectedSound');
+    if (soundStr !== null) {
+      appSelectedSound = soundStr;
+    }
+  } catch (e) {
+    console.log('Error loading sound settings in background service', e);
+  }
+}
+
+/**
+ * Helper to play repeating sound
+ */
+async function playAlarmAudio() {
+  if (!appSoundEnabled) return;
+
+  try {
+    if (currentSound) {
+      await currentSound.unloadAsync();
+    }
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: false,
+      playsInSilentModeIOS: true,
+      staysActiveInBackground: true,
+      shouldDuckAndroid: true,
+      playThroughEarpieceAndroid: false,
+    });
+    const source = SOUND_FILES[appSelectedSound] || SOUND_FILES.sound1;
+    const { sound } = await Audio.Sound.createAsync(source, { isLooping: true });
+    currentSound = sound;
+    await currentSound.playAsync();
+  } catch (e) {
+    console.log("Error playing alarm audio:", e);
+  }
+}
+
+/**
+ * Helper to stop repeating sound
+ */
+async function stopAlarmAudio() {
+  if (currentSound) {
+    try {
+      await currentSound.stopAsync();
+      await currentSound.unloadAsync();
+      currentSound = null;
+    } catch (e) {
+      console.log("Error stopping alarm audio:", e);
+    }
+  }
+}
 
 /**
  * Send a local notification (for continuous alarm)
@@ -45,7 +116,7 @@ async function sendLocalFallNotification(personId, location) {
  * Start continuous alarm for an active fall
  * Sends notifications every 3 seconds until stopped
  */
-export function startFallAlarm(personId = 'Unknown', location = 'Unknown') {
+export async function startFallAlarm(personId = 'Unknown', location = 'Unknown') {
   if (isAlarmActive) {
     console.log('🔔 Fall alarm already active');
     return;
@@ -53,6 +124,10 @@ export function startFallAlarm(personId = 'Unknown', location = 'Unknown') {
 
   isAlarmActive = true;
   console.log('🔔 Starting continuous fall alarm');
+
+  // Load latest settings and optionally start playing audio
+  await loadAppSettings();
+  await playAlarmAudio();
 
   // Send first notification immediately
   sendLocalFallNotification(personId, location);
@@ -93,7 +168,7 @@ async function sendLocalGaitNotification(personId, location) {
  * Start continuous alarm for abnormal gait detection
  * Sends notifications every 5 seconds until stopped
  */
-export function startGaitAlarm(personId = 'Unknown', location = 'Unknown') {
+export async function startGaitAlarm(personId = 'Unknown', location = 'Unknown') {
   if (isGaitAlarmActive) {
     console.log('🔔 Gait alarm already active');
     return;
@@ -101,6 +176,11 @@ export function startGaitAlarm(personId = 'Unknown', location = 'Unknown') {
 
   isGaitAlarmActive = true;
   console.log('🔔 Starting gait alarm');
+
+  // Load latest settings and optionally start playing audio
+  // Gait uses the same audio settings as fall
+  await loadAppSettings();
+  await playAlarmAudio();
 
   // Send first notification immediately
   sendLocalGaitNotification(personId, location);
@@ -125,9 +205,10 @@ export function stopGaitAlarm() {
     clearInterval(gaitAlarmIntervalId);
     gaitAlarmIntervalId = null;
   }
-  // Only cancel vibration if fall alarm is also not running
+  // Only cancel vibration and sound if fall alarm is also not running
   if (!isAlarmActive) {
     Vibration.cancel();
+    stopAlarmAudio();
   }
   console.log('🔕 Gait alarm stopped');
   Notifications.dismissAllNotificationsAsync();
@@ -156,8 +237,11 @@ export function stopFallAlarm() {
     alarmIntervalId = null;
   }
 
-  // Stop vibration
+  // Stop vibration and sound
   Vibration.cancel();
+  if (!isGaitAlarmActive) {
+    stopAlarmAudio();
+  }
   console.log('🔕 Fall alarm stopped');
 
   // Dismiss all notifications
