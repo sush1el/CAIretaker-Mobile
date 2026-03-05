@@ -37,6 +37,7 @@ import time
 from collections import deque, defaultdict
 import warnings
 import os
+import json
 import requests
 from picamera2 import Picamera2
 try:
@@ -64,6 +65,18 @@ except ImportError:
     print("       Install with: pip install onnxruntime")
 
 warnings.filterwarnings('ignore')
+
+
+def _get_env_float(name, default):
+    """Safely parse float env vars; fall back to default if invalid."""
+    raw = os.getenv(name, None)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        print(f"[WARN] Invalid float for {name}='{raw}', using default {default}")
+        return default
 
 try:
     import psutil as _psutil
@@ -280,7 +293,7 @@ class Config:
     TCN_MODEL_PATH = os.path.join(BASE_DIR, "models", "tcn_gait_model.onnx")
     TCN_WINDOW = 60               # Frames per analysis window (must match training)
     TCN_STRIDE = 15               # Frames between analysis attempts
-    TCN_THRESHOLD = 0.50          # Classification threshold (0 = normal, 1 = abnormal)
+    TCN_THRESHOLD = _get_env_float("TCN_THRESHOLD", 0.50)  # Abnormal-class probability threshold
     TCN_ALERT_COOLDOWN = 30       # Seconds between repeat gait alerts per person
     TCN_IN_CHANNELS = 34          # 17 keypoints * 2 (x, y) — matches training
     TCN_LEFT_HIP_IDX = 11         # COCO keypoint index for left hip
@@ -1265,11 +1278,47 @@ class GaitAnalyzer:
     # Exponential Moving Average factor for keypoint smoothing.
     # Lower = more smoothing (less jitter), higher = more responsive.
     EMA_ALPHA = 0.25
+
+    @staticmethod
+    def _load_threshold_from_config(onnx_path):
+        """Resolve deployment threshold from sidecar config when available.
+
+        Priority:
+        1) `TCN_THRESHOLD` env var via Config
+        2) JSON file with `best_threshold` (same folder as ONNX)
+        3) JSON file with `best_threshold` named `<onnx_basename>.json`
+        4) default Config.TCN_THRESHOLD
+        """
+        threshold = Config.TCN_THRESHOLD
+        candidates = [
+            os.path.join(os.path.dirname(onnx_path), "config.json"),
+            os.path.splitext(onnx_path)[0] + ".json",
+        ]
+
+        for cfg_path in candidates:
+            if not os.path.exists(cfg_path):
+                continue
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                val = cfg.get("best_threshold", None)
+                if val is None:
+                    continue
+                val = float(val)
+                if 0.0 <= val <= 1.0:
+                    print(f"[GaitAnalyzer] Using threshold {val:.2f} from {cfg_path}")
+                    return val
+            except Exception as e:
+                print(f"[GaitAnalyzer] Failed reading threshold from {cfg_path}: {e}")
+
+        print(f"[GaitAnalyzer] Using threshold {threshold:.2f} (Config/env)")
+        return threshold
     
     def __init__(self, onnx_path):
         self.enabled = False
         self.session = None
         self.input_name = None
+        self.threshold = Config.TCN_THRESHOLD
         
         # Per-person state
         self.keypoint_buffers = {}     # track_id -> deque of (17, 2) arrays
@@ -1296,6 +1345,7 @@ class GaitAnalyzer:
                 providers=['CPUExecutionProvider']
             )
             self.input_name = self.session.get_inputs()[0].name
+            self.threshold = self._load_threshold_from_config(onnx_path)
             self.enabled = True
             
             # Log model info
@@ -1304,6 +1354,7 @@ class GaitAnalyzer:
             print(f"[GaitAnalyzer] TCN model loaded successfully")
             print(f"  Input:  {inp.name} {inp.shape}")
             print(f"  Output: {out.name} {out.shape}")
+            print(f"  Threshold (abnormal): {self.threshold:.2f}")
         except Exception as e:
             print(f"[GaitAnalyzer] Failed to load model: {e}")
             print(f"               Gait analysis disabled (fall detection unaffected)")
@@ -1458,7 +1509,7 @@ class GaitAnalyzer:
             # Apply sigmoid to get probability
             prob = 1.0 / (1.0 + np.exp(-np.clip(logit, -50, 50)))
             
-            is_abnormal = prob >= Config.TCN_THRESHOLD
+            is_abnormal = prob >= self.threshold
             
             result = {
                 'is_abnormal': bool(is_abnormal),
