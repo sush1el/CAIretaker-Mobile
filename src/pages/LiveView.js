@@ -1,32 +1,59 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView, Vibration, Modal, Dimensions, StatusBar } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView, Vibration, Modal, StatusBar, useWindowDimensions } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faCamera, faChevronLeft, faChevronRight, faRefresh, faVideoCamera, faExclamationTriangle, faChartBar, faExpand, faCompress } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
+import * as ScreenOrientation from 'expo-screen-orientation';
 import api from '../services/api';
-import { useTheme } from '../context/ThemeContext';
 
 // Vibration pattern: vibrate 500ms, pause 500ms (repeats)
 const FALL_VIBRATION_PATTERN = [0, 500, 500];
 const GAIT_VIBRATION_PATTERN = [0, 300, 300, 300, 300];
+const CAMERA_ASPECT_RATIO = 16 / 9;
 
 export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
-  const { theme, isDarkMode } = useTheme();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const [cameraStatus, setCameraStatus] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [streamKey, setStreamKey] = useState(0);
   const [activeFalls, setActiveFalls] = useState([]);
-  const [currentTime, setCurrentTime] = useState(new Date());
   const [fallLogs, setFallLogs] = useState([]); // Persistent fall event logs
-  const [isVibrating, setIsVibrating] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const vibrationActiveRef = useRef(false);
+
+  const liveFps = Number.isFinite(Number(cameraStatus?.fps))
+    ? Number(cameraStatus.fps).toFixed(1)
+    : '--';
+
+  const fullscreenFrameStyle =
+    windowWidth / windowHeight > CAMERA_ASPECT_RATIO
+      ? { width: windowHeight * CAMERA_ASPECT_RATIO, height: windowHeight }
+      : { width: windowWidth, height: windowWidth / CAMERA_ASPECT_RATIO };
+
+  useEffect(() => {
+    const applyFullscreenOrientation = async () => {
+      try {
+        if (isFullscreen) {
+          await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
+        } else {
+          await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+        }
+      } catch (error) {
+        console.log('Orientation lock error:', error);
+      }
+    };
+
+    applyFullscreenOrientation();
+
+    return () => {
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(() => {});
+    };
+  }, [isFullscreen]);
 
   // Stop vibration (can be called manually or automatically)
   const stopVibration = () => {
     Vibration.cancel();
     vibrationActiveRef.current = false;
-    setIsVibrating(false);
   };
 
   // Continuous vibration when fall is detected
@@ -50,7 +77,6 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
 
     if (hasAlert && !vibrationActiveRef.current) {
       vibrationActiveRef.current = true;
-      setIsVibrating(true);
       // Use fall pattern for falls, gait pattern for gait-only alerts
       Vibration.vibrate(hasLiveFallDetection ? FALL_VIBRATION_PATTERN : GAIT_VIBRATION_PATTERN, true);
       console.log(hasLiveFallDetection ? '🔔 Fall alert: vibration started' : '🔔 Gait alert: vibration started');
@@ -70,12 +96,6 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
   // Initial data fetch
   useEffect(() => {
     checkCameraStatus();
-  }, []);
-
-  // Update time every second
-  useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
-    return () => clearInterval(timer);
   }, []);
 
   // Poll for camera status and detections
@@ -288,15 +308,6 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
             <Text style={styles.modelWarningText}>Model not loaded</Text>
           </View>
         )}
-        {isVibrating && (
-          <TouchableOpacity
-            style={styles.stopAlertButton}
-            onPress={stopVibration}
-          >
-            <FontAwesomeIcon icon={faExclamationTriangle} color="#FFF" size={16} />
-            <Text style={styles.stopAlertText}>STOP ALERT</Text>
-          </TouchableOpacity>
-        )}
         <TouchableOpacity
           style={styles.fullscreenButton}
           onPress={() => setIsFullscreen(true)}
@@ -329,7 +340,6 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
 
   // Fullscreen modal
   const renderFullscreenModal = () => {
-    const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
     return (
       <Modal
         visible={isFullscreen}
@@ -340,19 +350,18 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
       >
         <StatusBar hidden={isFullscreen} />
         <View style={styles.fullscreenOverlay}>
-          <View style={[
-            styles.fullscreenStreamContainer,
-            { width: screenHeight, height: screenWidth, transform: [{ rotate: '90deg' }] }
-          ]}>
-            <WebView
-              key={`fs-${streamKey}`}
-              source={{ uri: api.getCameraStreamUrl() }}
-              style={styles.fullscreenStream}
-              javaScriptEnabled={false}
-              scrollEnabled={false}
-              bounces={false}
-              onError={(e) => console.log('Fullscreen WebView error:', e.nativeEvent)}
-            />
+          <View style={styles.fullscreenStreamContainer}>
+            <View style={[styles.fullscreenFrame, fullscreenFrameStyle]}>
+              <WebView
+                key={`fs-${streamKey}`}
+                source={{ uri: api.getCameraStreamUrl() }}
+                style={styles.fullscreenStream}
+                javaScriptEnabled={false}
+                scrollEnabled={false}
+                bounces={false}
+                onError={(e) => console.log('Fullscreen WebView error:', e.nativeEvent)}
+              />
+            </View>
             <View style={styles.fullscreenTopBar}>
               <View style={styles.fullscreenLiveBadge}>
                 <View style={[styles.innerDot, { backgroundColor: '#4CAF50' }]} />
@@ -366,15 +375,6 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
             >
               <FontAwesomeIcon icon={faCompress} color="#FFF" size={20} />
             </TouchableOpacity>
-            {isVibrating && (
-              <TouchableOpacity
-                style={styles.fullscreenStopAlert}
-                onPress={stopVibration}
-              >
-                <FontAwesomeIcon icon={faExclamationTriangle} color="#FFF" size={16} />
-                <Text style={styles.stopAlertText}>STOP ALERT</Text>
-              </TouchableOpacity>
-            )}
           </View>
         </View>
       </Modal>
@@ -396,7 +396,7 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
           <FontAwesomeIcon icon={faRefresh} color="#1E3A5F" size={12} />
         </TouchableOpacity>
         <View style={styles.metaBadge}>
-          <Text style={styles.metaText}>FPS: 15</Text>
+          <Text style={styles.metaText}>FPS: {liveFps}</Text>
         </View>
       </View>
 
@@ -489,18 +489,16 @@ const styles = StyleSheet.create({
   startButtonText: { color: '#FFF', fontWeight: 'bold' },
   modelWarning: { position: 'absolute', bottom: 10, left: 10, flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.7)', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 10 },
   modelWarningText: { color: '#FFA000', fontSize: 10, marginLeft: 5 },
-  stopAlertButton: { position: 'absolute', top: 10, right: 10, flexDirection: 'row', alignItems: 'center', backgroundColor: '#D32F2F', paddingHorizontal: 15, paddingVertical: 10, borderRadius: 20 },
-  stopAlertText: { color: '#FFF', fontWeight: 'bold', fontSize: 12, marginLeft: 8 },
   fullscreenButton: { position: 'absolute', bottom: 10, right: 10, backgroundColor: 'rgba(0,0,0,0.6)', padding: 10, borderRadius: 12 },
-  fullscreenOverlay: { flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' },
-  fullscreenStreamContainer: { position: 'relative' },
+  fullscreenOverlay: { flex: 1, backgroundColor: '#000' },
+  fullscreenStreamContainer: { position: 'relative', flex: 1, width: '100%', height: '100%', justifyContent: 'center', alignItems: 'center' },
+  fullscreenFrame: { backgroundColor: '#000', overflow: 'hidden' },
   fullscreenStream: { flex: 1, backgroundColor: '#000' },
   fullscreenTopBar: { position: 'absolute', top: 15, left: 15, flexDirection: 'row', alignItems: 'center' },
   fullscreenLiveBadge: { backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, flexDirection: 'row', alignItems: 'center', marginRight: 10 },
   fullscreenLiveText: { color: '#FFF', fontWeight: 'bold', fontSize: 12 },
   fullscreenRoomText: { color: '#FFF', fontWeight: 'bold', fontSize: 14, textShadowColor: 'rgba(0,0,0,0.8)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
   fullscreenCloseButton: { position: 'absolute', bottom: 15, right: 15, backgroundColor: 'rgba(0,0,0,0.6)', padding: 12, borderRadius: 14 },
-  fullscreenStopAlert: { position: 'absolute', top: 15, right: 15, flexDirection: 'row', alignItems: 'center', backgroundColor: '#D32F2F', paddingHorizontal: 15, paddingVertical: 10, borderRadius: 20 },
   liveMetaRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15, alignItems: 'center' },
   liveBadge: { backgroundColor: '#1E3A5F', paddingHorizontal: 15, paddingVertical: 5, borderRadius: 20, flexDirection: 'row', alignItems: 'center' },
   innerDot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },

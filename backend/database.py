@@ -15,6 +15,15 @@ def init_db():
     """Initialize the database with required tables"""
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    def get_columns(table_name):
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        return {row[1] for row in cursor.fetchall()}
+
+    def add_column_if_missing(table_name, column_name, definition):
+        cols = get_columns(table_name)
+        if column_name not in cols:
+            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
     
     # Users table with role field       
     cursor.execute('''
@@ -30,6 +39,18 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    # Backward-compatible migrations for older databases.
+    add_column_if_missing('users', 'role', "TEXT DEFAULT 'user'")
+    add_column_if_missing('users', 'is_verified', 'INTEGER DEFAULT 0')
+    add_column_if_missing('users', 'is_active', 'INTEGER DEFAULT 1')
+    add_column_if_missing('users', 'created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+    add_column_if_missing('users', 'updated_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+
+    # Normalize existing rows that may have nulls after migration.
+    cursor.execute("UPDATE users SET role = 'user' WHERE role IS NULL")
+    cursor.execute("UPDATE users SET is_verified = 0 WHERE is_verified IS NULL")
+    cursor.execute("UPDATE users SET is_active = 1 WHERE is_active IS NULL")
     
     # OTP table for password reset and email verification
     cursor.execute('''
@@ -43,6 +64,10 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    add_column_if_missing('otp_codes', 'purpose', "TEXT DEFAULT 'password_reset'")
+    add_column_if_missing('otp_codes', 'is_used', 'INTEGER DEFAULT 0')
+    add_column_if_missing('otp_codes', 'created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
     
     # Sessions table (optional - for tracking active sessions)
     cursor.execute('''
@@ -71,6 +96,15 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    add_column_if_missing('fall_incidents', 'location', 'TEXT')
+    add_column_if_missing('fall_incidents', 'status', "TEXT DEFAULT 'active'")
+    add_column_if_missing('fall_incidents', 'type', "TEXT DEFAULT 'fall'")
+    add_column_if_missing('fall_incidents', 'resolved_at', 'REAL')
+    add_column_if_missing('fall_incidents', 'created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+
+    cursor.execute("UPDATE fall_incidents SET status = 'active' WHERE status IS NULL")
+    cursor.execute("UPDATE fall_incidents SET type = 'fall' WHERE type IS NULL")
     
     # Create default Super Admin if not exists
     cursor.execute('SELECT id FROM users WHERE role = ?', ('super_admin',))

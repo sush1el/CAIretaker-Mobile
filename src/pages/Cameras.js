@@ -1,18 +1,51 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Modal, Dimensions, StatusBar } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Modal, StatusBar, useWindowDimensions } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faCamera, faCirclePlay, faChevronLeft, faChevronRight, faArrowLeft, faRefresh, faVideoCamera, faExpand, faCompress } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
+import * as ScreenOrientation from 'expo-screen-orientation';
 import api from '../services/api';
 import { useTheme } from '../context/ThemeContext';
 
+const CAMERA_ASPECT_RATIO = 16 / 9;
+
 export default function Cameras({ setScreen, setMonitoringRoom }) {
   const { theme, isDarkMode } = useTheme();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const [selectedRoom, setSelectedRoom] = useState(null);
   const [cameraStatus, setCameraStatus] = useState(null);
   const [streamKey, setStreamKey] = useState(0);
   const [isStreamLoading, setIsStreamLoading] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+
+  const liveFps = Number.isFinite(Number(cameraStatus?.fps))
+    ? Number(cameraStatus.fps).toFixed(1)
+    : '--';
+
+  const fullscreenFrameStyle =
+    windowWidth / windowHeight > CAMERA_ASPECT_RATIO
+      ? { width: windowHeight * CAMERA_ASPECT_RATIO, height: windowHeight }
+      : { width: windowWidth, height: windowWidth / CAMERA_ASPECT_RATIO };
+
+  useEffect(() => {
+    const applyFullscreenOrientation = async () => {
+      try {
+        if (isFullscreen) {
+          await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
+        } else {
+          await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+        }
+      } catch (error) {
+        console.log('Orientation lock error:', error);
+      }
+    };
+
+    applyFullscreenOrientation();
+
+    return () => {
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(() => {});
+    };
+  }, [isFullscreen]);
 
   // Poll camera status when a room is selected
   useEffect(() => {
@@ -102,7 +135,6 @@ export default function Cameras({ setScreen, setMonitoringRoom }) {
   };
 
   const renderFullscreenModal = () => {
-    const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
     return (
       <Modal
         visible={isFullscreen}
@@ -113,19 +145,18 @@ export default function Cameras({ setScreen, setMonitoringRoom }) {
       >
         <StatusBar hidden={isFullscreen} />
         <View style={styles.fullscreenOverlay}>
-          <View style={[
-            styles.fullscreenStreamContainer,
-            { width: screenHeight, height: screenWidth, transform: [{ rotate: '90deg' }] }
-          ]}>
-            <WebView
-              key={`fs-${streamKey}`}
-              source={{ uri: api.getCameraStreamUrl() }}
-              style={styles.fullscreenStream}
-              javaScriptEnabled={false}
-              scrollEnabled={false}
-              bounces={false}
-              onError={(e) => console.log('Fullscreen WebView error:', e.nativeEvent)}
-            />
+          <View style={styles.fullscreenStreamContainer}>
+            <View style={[styles.fullscreenFrame, fullscreenFrameStyle]}>
+              <WebView
+                key={`fs-${streamKey}`}
+                source={{ uri: api.getCameraStreamUrl() }}
+                style={styles.fullscreenStream}
+                javaScriptEnabled={false}
+                scrollEnabled={false}
+                bounces={false}
+                onError={(e) => console.log('Fullscreen WebView error:', e.nativeEvent)}
+              />
+            </View>
             <View style={styles.fullscreenTopBar}>
               <View style={styles.fullscreenLiveBadge}>
                 <View style={[styles.innerDot, { backgroundColor: '#4CAF50' }]} />
@@ -201,7 +232,7 @@ export default function Cameras({ setScreen, setMonitoringRoom }) {
               <FontAwesomeIcon icon={faRefresh} color={theme.primary} size={12} />
             </TouchableOpacity>
             <View style={dynamicStyles.metaBadge}>
-              <Text style={dynamicStyles.metaText}>FPS: 15</Text>
+              <Text style={dynamicStyles.metaText}>FPS: {liveFps}</Text>
             </View>
           </View>
           {renderInlineCameraFeed()}
@@ -239,8 +270,9 @@ const styles = StyleSheet.create({
   startButton: { marginTop: 15, backgroundColor: '#1E3A5F', paddingHorizontal: 20, paddingVertical: 10, borderRadius: 20 },
   startButtonText: { color: '#FFF', fontWeight: 'bold' },
   fullscreenButton: { position: 'absolute', bottom: 10, right: 10, backgroundColor: 'rgba(0,0,0,0.6)', padding: 10, borderRadius: 12 },
-  fullscreenOverlay: { flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' },
-  fullscreenStreamContainer: { position: 'relative' },
+  fullscreenOverlay: { flex: 1, backgroundColor: '#000' },
+  fullscreenStreamContainer: { position: 'relative', flex: 1, width: '100%', height: '100%', justifyContent: 'center', alignItems: 'center' },
+  fullscreenFrame: { backgroundColor: '#000', overflow: 'hidden' },
   fullscreenStream: { flex: 1, backgroundColor: '#000' },
   fullscreenTopBar: { position: 'absolute', top: 15, left: 15, flexDirection: 'row', alignItems: 'center' },
   fullscreenLiveBadge: { backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, flexDirection: 'row', alignItems: 'center', marginRight: 10 },

@@ -4,7 +4,7 @@
     "slug": "CAIretaker-Mobile",
     "version": "1.0.0",
     "scheme": "cairetakerapp",
-    "orientation": "portrait",
+    "orientation": "default",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,

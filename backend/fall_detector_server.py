@@ -1266,6 +1266,52 @@ def get_status():
         })
 
 
+@app.route('/api/camera/start', methods=['POST'])
+def start_camera():
+    """Start camera capture (mobile app compatibility endpoint)."""
+    global current_camera_index
+
+    data = request.get_json(silent=True) or {}
+    requested_index = data.get('camera_index', current_camera_index)
+
+    try:
+        requested_index = int(requested_index)
+    except (TypeError, ValueError):
+        requested_index = current_camera_index
+
+    success = initialize_camera(requested_index)
+    return jsonify({
+        'success': success,
+        'message': f'Camera {requested_index} started' if success else f'Failed to start camera {requested_index}',
+        'camera_index': current_camera_index,
+    }), (200 if success else 500)
+
+
+@app.route('/api/camera/stop', methods=['POST'])
+def stop_camera():
+    """Stop camera capture (mobile app compatibility endpoint)."""
+    global camera, camera_initialized
+
+    with camera_lock:
+        if camera is not None:
+            try:
+                camera.release()
+            except Exception:
+                pass
+            camera = None
+        camera_initialized = False
+
+    with status_lock:
+        current_status['people_detected'] = 0
+        current_status['detections'] = []
+        current_status['fps'] = 0
+
+    return jsonify({
+        'success': True,
+        'message': 'Camera stopped',
+    })
+
+
 @app.route('/health')
 def health():
     """Health check endpoint"""

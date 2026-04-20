@@ -67,11 +67,12 @@ function MainApp() {
   const [userRole, setUserRole] = useState('user'); // Default role
 
   // Push notification state
-  const [expoPushToken, setExpoPushToken] = useState('');
   const notificationListener = useRef();
   const responseListener = useRef();
   const fallAlarmRef = useRef(false); // Track if alarm is running
   const gaitAlarmRef = useRef(false); // Track if gait alarm is running
+  const isNotificationModalVisibleRef = useRef(false);
+  const lastNotificationAlertAtRef = useRef(0);
 
   // Global fall & gait monitoring - poll for active alerts regardless of current screen
   useEffect(() => {
@@ -147,7 +148,6 @@ function MainApp() {
     // Register for push notifications (may fail in Expo Go SDK 53+)
     pushNotifications.registerForPushNotificationsAsync().then(token => {
       if (token) {
-        setExpoPushToken(token);
         console.log('Push token registered:', token);
         api.registerPushToken(token).catch(err =>
           console.log('Could not register token with backend:', err.message)
@@ -165,11 +165,44 @@ function MainApp() {
     // Listen for notifications received while app is foregrounded
     notificationListener.current = pushNotifications.addNotificationReceivedListener(notification => {
       const { title, body } = notification.request.content;
-      // Show alert for fall detection
-      Alert.alert(title || 'Alert', body, [
-        { text: 'View', onPress: () => setCurrentScreen('LiveView') },
-        { text: 'Dismiss', style: 'cancel' }
-      ]);
+      const now = Date.now();
+      const isInCooldown = now - lastNotificationAlertAtRef.current < 5000;
+
+      // Prevent stacked/overlapping modals when notifications are continuous.
+      if (isNotificationModalVisibleRef.current || isInCooldown) {
+        return;
+      }
+
+      isNotificationModalVisibleRef.current = true;
+      lastNotificationAlertAtRef.current = now;
+
+      const closeModal = () => {
+        isNotificationModalVisibleRef.current = false;
+        lastNotificationAlertAtRef.current = Date.now();
+      };
+
+      Alert.alert(
+        title || 'Alert',
+        body || 'A new alert was detected.',
+        [
+          {
+            text: 'View',
+            onPress: () => {
+              setCurrentScreen('LiveView');
+              closeModal();
+            }
+          },
+          {
+            text: 'Close',
+            style: 'cancel',
+            onPress: closeModal
+          }
+        ],
+        {
+          cancelable: true,
+          onDismiss: closeModal,
+        }
+      );
     });
 
     // Listen for notification taps (app in background)

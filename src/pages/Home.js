@@ -1,14 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Modal, Dimensions, StatusBar, Alert } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Modal, StatusBar, Alert, useWindowDimensions } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faCamera, faTriangleExclamation, faChevronDown, faPersonWalking, faArrowLeft, faRefresh, faVideoCamera, faExpand, faCompress, faChartBar } from '@fortawesome/free-solid-svg-icons';
+import { faCamera, faTriangleExclamation, faChevronDown, faPersonWalking, faArrowLeft, faRefresh, faVideoCamera, faExpand, faCompress, faChartBar, faTrash } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
+import * as ScreenOrientation from 'expo-screen-orientation';
 import api from '../services/api';
 import { useTheme } from '../context/ThemeContext';
 import AlertCard from '../components/AlertCard';
 
+const CAMERA_ASPECT_RATIO = 16 / 9;
+
 export default function Home({ setScreen, setMonitoringRoom }) {
   const { theme, isDarkMode } = useTheme();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
   const [hasActiveFall, setHasActiveFall] = useState(false);
   const [activeFallCount, setActiveFallCount] = useState(0);
   const [fallEvents, setFallEvents] = useState([]);
@@ -17,7 +21,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const [sortType, setSortType] = useState('latestDate');
   const [showSortDropdown, setShowSortDropdown] = useState(false);
   const [homeLogsClearedAt, setHomeLogsClearedAt] = useState(null);
-  const [lastUpdate, setLastUpdate] = useState(Date.now());
   const [gaitAlertCount, setGaitAlertCount] = useState(0);
   const isPolling = useRef(false);
 
@@ -26,6 +29,35 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   const [streamKey, setStreamKey] = useState(0);
   const [isStreamLoading, setIsStreamLoading] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+
+  const liveFps = Number.isFinite(Number(cameraStatus?.fps))
+    ? Number(cameraStatus.fps).toFixed(1)
+    : '--';
+
+  const fullscreenFrameStyle =
+    windowWidth / windowHeight > CAMERA_ASPECT_RATIO
+      ? { width: windowHeight * CAMERA_ASPECT_RATIO, height: windowHeight }
+      : { width: windowWidth, height: windowWidth / CAMERA_ASPECT_RATIO };
+
+  useEffect(() => {
+    const applyFullscreenOrientation = async () => {
+      try {
+        if (isFullscreen) {
+          await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
+        } else {
+          await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+        }
+      } catch (error) {
+        console.log('Orientation lock error:', error);
+      }
+    };
+
+    applyFullscreenOrientation();
+
+    return () => {
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP).catch(() => {});
+    };
+  }, [isFullscreen]);
 
   useEffect(() => {
     fetchData();
@@ -58,7 +90,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
           setHasActiveFall(hasLiveFall);
           setActiveFallCount(liveFallCount);
           setGaitAlertCount(statusResult.ok ? (statusResult.data.gait_alerts || 0) : 0);
-          setLastUpdate(Date.now());
         }
 
         const eventsResult = await api.getFallEvents();
@@ -154,7 +185,8 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       const isGait = event.type === 'at_risk';
 
       return {
-        incidentId: event.id || index,
+        incidentId: event.id ?? event.incident_id ?? null,
+        rowKey: `${event.id ?? event.incident_id ?? 'no-id'}-${event.timestamp ?? 'no-ts'}-${index}`,
         roomNo: `Room ${roomNum}`,
         status: isGait ? 'Gait' : 'Fall',
         eventType: event.type,
@@ -228,6 +260,37 @@ export default function Home({ setScreen, setMonitoringRoom }) {
     );
   };
 
+  const handleDeleteLog = async (log) => {
+    if (!log.incidentId) {
+      Alert.alert('Unable to Delete', 'This log does not have a valid incident ID.');
+      return;
+    }
+
+    Alert.alert(
+      'Delete Log',
+      `Delete ${log.roomNo} ${log.status.toLowerCase()} log from ${log.date} ${log.time}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const result = await api.deleteFallEvent(log.incidentId);
+              if (result.ok) {
+                setFallEvents(prev => prev.filter(item => (item.id ?? item.incident_id) !== log.incidentId));
+              } else {
+                Alert.alert('Delete Failed', result.data?.error || 'Failed to delete log.');
+              }
+            } catch (error) {
+              Alert.alert('Delete Failed', 'Unable to connect to server.');
+            }
+          }
+        }
+      ]
+    );
+  };
+
   const renderInlineCameraFeed = () => {
     if (selectedRoom !== 1) {
       return (
@@ -280,7 +343,6 @@ export default function Home({ setScreen, setMonitoringRoom }) {
   };
 
   const renderFullscreenModal = () => {
-    const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
     return (
       <Modal
         visible={isFullscreen}
@@ -291,19 +353,18 @@ export default function Home({ setScreen, setMonitoringRoom }) {
       >
         <StatusBar hidden={isFullscreen} />
         <View style={styles.fullscreenOverlay}>
-          <View style={[
-            styles.fullscreenStreamContainer,
-            { width: screenHeight, height: screenWidth, transform: [{ rotate: '90deg' }] }
-          ]}>
-            <WebView
-              key={`fs-${streamKey}`}
-              source={{ uri: api.getCameraStreamUrl() }}
-              style={styles.fullscreenStream}
-              javaScriptEnabled={false}
-              scrollEnabled={false}
-              bounces={false}
-              onError={(e) => console.log('Fullscreen WebView error:', e.nativeEvent)}
-            />
+          <View style={styles.fullscreenStreamContainer}>
+            <View style={[styles.fullscreenFrame, fullscreenFrameStyle]}>
+              <WebView
+                key={`fs-${streamKey}`}
+                source={{ uri: api.getCameraStreamUrl() }}
+                style={styles.fullscreenStream}
+                javaScriptEnabled={false}
+                scrollEnabled={false}
+                bounces={false}
+                onError={(e) => console.log('Fullscreen WebView error:', e.nativeEvent)}
+              />
+            </View>
             <View style={styles.fullscreenTopBar}>
               <View style={styles.fullscreenLiveBadge}>
                 <View style={[styles.innerDot, { backgroundColor: '#4CAF50' }]} />
@@ -505,7 +566,7 @@ export default function Home({ setScreen, setMonitoringRoom }) {
               <FontAwesomeIcon icon={faRefresh} color={theme.primary} size={12} />
             </TouchableOpacity>
             <View style={dynamicStyles.metaBadge}>
-              <Text style={dynamicStyles.metaText}>FPS: 15</Text>
+              <Text style={dynamicStyles.metaText}>FPS: {liveFps}</Text>
             </View>
           </View>
           {renderInlineCameraFeed()}
@@ -614,10 +675,13 @@ export default function Home({ setScreen, setMonitoringRoom }) {
             <View style={styles.columnCenter}>
               <Text style={styles.logHeaderText}>Time</Text>
             </View>
+            <View style={styles.columnAction}>
+              <Text style={styles.logHeaderText}>Action</Text>
+            </View>
           </View>
 
           {recentLogs.slice(0, 5).map((log, index) => (
-            <View key={`log-${index}-${log.incidentId || 'no-id'}-${log.date}-${log.time}`} style={dynamicStyles.logRow}>
+            <View key={log.rowKey || `log-${index}`} style={dynamicStyles.logRow}>
               <View style={styles.columnCenter}>
                 <Text style={dynamicStyles.logText}>{log.roomNo}</Text>
               </View>
@@ -631,6 +695,15 @@ export default function Home({ setScreen, setMonitoringRoom }) {
               </View>
               <View style={styles.columnCenter}>
                 <Text style={dynamicStyles.logText}>{log.time}</Text>
+              </View>
+              <View style={styles.columnAction}>
+                <TouchableOpacity
+                  style={[styles.deleteButton, !log.incidentId && styles.deleteButtonDisabled]}
+                  onPress={() => handleDeleteLog(log)}
+                  disabled={!log.incidentId}
+                >
+                  <FontAwesomeIcon icon={faTrash} size={11} color={log.incidentId ? '#FFFFFF' : '#A0A0A0'} />
+                </TouchableOpacity>
               </View>
             </View>
           ))}
@@ -679,8 +752,9 @@ const styles = StyleSheet.create({
   startButton: { marginTop: 15, backgroundColor: '#1E3A5F', paddingHorizontal: 20, paddingVertical: 10, borderRadius: 20 },
   startButtonText: { color: '#FFF', fontWeight: 'bold' },
   fullscreenButton: { position: 'absolute', bottom: 10, right: 10, backgroundColor: 'rgba(0,0,0,0.6)', padding: 10, borderRadius: 12 },
-  fullscreenOverlay: { flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' },
-  fullscreenStreamContainer: { position: 'relative' },
+  fullscreenOverlay: { flex: 1, backgroundColor: '#000' },
+  fullscreenStreamContainer: { position: 'relative', flex: 1, width: '100%', height: '100%', justifyContent: 'center', alignItems: 'center' },
+  fullscreenFrame: { backgroundColor: '#000', overflow: 'hidden' },
   fullscreenStream: { flex: 1, backgroundColor: '#000' },
   fullscreenTopBar: { position: 'absolute', top: 15, left: 15, flexDirection: 'row', alignItems: 'center' },
   fullscreenLiveBadge: { backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, flexDirection: 'row', alignItems: 'center', marginRight: 10 },
@@ -694,10 +768,13 @@ const styles = StyleSheet.create({
   sortDropdownItem: { paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#F0F0F0' },
   logHeaderText: { color: '#FFF', fontWeight: 'bold', fontSize: 12 },
   columnCenter: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  columnAction: { width: 60, alignItems: 'center', justifyContent: 'center' },
   tagBadge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12, backgroundColor: '#EEE' },
   tagFall: { backgroundColor: '#FF3B30' },
   tagGait: { backgroundColor: '#F57C00' },
   tagText: { fontSize: 11, fontWeight: '700', color: '#FFF', letterSpacing: 0.5 },
+  deleteButton: { backgroundColor: '#D32F2F', borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6 },
+  deleteButtonDisabled: { backgroundColor: '#E0E0E0' },
   hiddenStream: { position: 'absolute', width: 1, height: 1, opacity: 0, overflow: 'hidden' },
   logsActionsRow: {
     flexDirection: 'row',
