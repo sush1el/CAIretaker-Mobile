@@ -45,6 +45,15 @@ except Exception as _fr_err:
     FACE_RECOGNITION_AVAILABLE = False
     print(f"[FaceRec] Unavailable: {_fr_err}")
 
+# ONNX Runtime for TCN gait model inference
+try:
+    import onnxruntime as ort
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
+    print("[WARN] onnxruntime not installed — gait analysis disabled")
+    print("       Install with: pip install onnxruntime")
+
 app = Flask(__name__)
 CORS(app)
 
@@ -104,14 +113,31 @@ class Config:
     FALL_CONFIRMATION_TIME = 0.5  # Seconds person must stay fallen before alert
     FALL_CONFIRMATION_FRAMES = 3  # Minimum consecutive frames in fallen state
     
+    # Class configuration from your trained model
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
     CLASS_COLORS = {
-        0: (0, 255, 0),      # Standing - Green
+        0: (0, 255, 0),      # Standing - Green (BGR)
         1: (255, 255, 0),    # Sitting - Yellow (cyan in BGR)
         2: (0, 0, 255),      # Fallen (High Confidence) - Red
-        'at_risk': (0, 165, 255)  # At Risk (Low Confidence) - Orange
+        'at_risk': (0, 165, 255), # At Risk (Low Confidence) - Orange
+        'abnormal_gait': (0, 255, 255)  # Abnormal Gait - Yellow
     }
     
+    # ---- GAIT ANALYSIS (TCN) ----
+    TCN_GAIT_MODEL_PATH = os.path.join(BASE_DIR, "models", "tcn_gait_model.onnx")
+    TCN_WINDOW = 60               # Frames per analysis window (must match training)
+    TCN_STRIDE = 15               # Frames between analysis attempts
+    TCN_THRESHOLD = 0.50          # Abnormal-class probability threshold
+    TCN_ALERT_COOLDOWN = 30       # Seconds between repeat gait alerts per person
+    TCN_IN_CHANNELS = 34          # 17 keypoints * 2 (x, y) — matches training
+    TCN_LEFT_HIP_IDX = 11         # COCO keypoint index for left hip
+    TCN_RIGHT_HIP_IDX = 12        # COCO keypoint index for right hip
+    TCN_MOTION_THRESHOLD = 15.0   # Min net hip displacement (px) over window to count as "walking"
+    TCN_AVG_FRAME_THRESHOLD = 2.5  # Min avg per-frame hip delta (px) for sustained movement
+    TCN_STILLNESS_STD_THRESHOLD = 3.0   # Max mean keypoint std-dev (px) to be "stationary"
+    TCN_LIMB_MOTION_STD_THRESHOLD = 2.0 # Min limb oscillation std to confirm walking
+    TCN_MIN_MOTION_WINDOWS = 5   # Consecutive motion-passing windows required before TCN runs
+
     # Three-tier confidence thresholds
     HIGH_CONFIDENCE_THRESHOLD = 0.70 # Confirmed fallen - triggers monitoring/alert (≥75%)
     LOW_CONFIDENCE_THRESHOLD = 0.50 # At risk - visual warning only (60-74%)
@@ -598,8 +624,29 @@ class FallDetector:
         
         checkpoint = torch.load(Config.CNN_MODEL_PATH, map_location=self.device)
         self.cnn_model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = torch.load(Config.CNN_MODEL_PATH, map_location=self.device)
+        self.cnn_model.load_state_dict(checkpoint['model_state_dict'])
         self.cnn_model.eval()
         print(f"✓ CNN model loaded (epoch: {checkpoint.get('epoch', 'N/A')}, val_acc: {checkpoint.get('val_acc', 0):.2f}%)")
+        
+        # Add to FallDetector.__init__
+        TCN_MODEL_PATH = os.path.join(Config.BASE_DIR, "models", "best_model_multiclass.pt")
+        
+        self.tcn_fall_model = None
+        if os.path.exists(TCN_MODEL_PATH):
+            try:
+                from tcn_fall_model import TCN
+                self.tcn_fall_model = TCN(in_channels=51, n_classes=4).to(self.device)
+                ckpt = torch.load(TCN_MODEL_PATH, map_location=self.device)
+                self.tcn_fall_model.load_state_dict(ckpt['model'])
+                self.tcn_fall_model.eval()
+                print(f"✓ TCN fall model loaded (Val F1={ckpt['val_f1']:.4f})")
+            except Exception as e:
+                print(f"[WARN] Failed to load TCN model: {e}")
+                self.tcn_fall_model = None
+                
+        # Rolling keypoint buffer per track_id — 30 frames × 51 features
+        self.tcn_kp_buffers = defaultdict(lambda: deque(maxlen=30))
         
         # Prediction smoothing per track ID
         self.prediction_buffers = defaultdict(lambda: deque(maxlen=Config.SMOOTHING_WINDOW))
@@ -634,6 +681,30 @@ class FallDetector:
         self._face_rec_counters = {}   # track_id -> frames since last recognition run
         self._person_labels    = {}    # track_id -> latest resolved display label
         
+    def _get_tcn_fall_score(self, track_id) -> tuple:
+        """
+        Returns (is_fall, fall_direction, confidence)
+        fall_direction: 'sideways' | 'forward' | 'backward' | None
+        """
+        buf = self.tcn_kp_buffers[track_id]
+        if len(buf) < 30 or self.tcn_fall_model is None:
+            return False, None, 0.0
+
+        # Shape: (51, 30) — matches training format
+        window = np.stack(buf, axis=1).astype(np.float32)
+        x = torch.tensor(window).unsqueeze(0).to(self.device)  # (1, 51, 30)
+
+        with torch.no_grad():
+            logits = self.tcn_fall_model(x)
+            probs  = torch.softmax(logits, dim=1)[0].cpu().numpy()
+
+        pred = int(np.argmax(probs))
+        conf = float(probs[pred])
+
+        direction_map = {1: 'sideways', 2: 'forward', 3: 'backward'}
+        is_fall = pred > 0
+        return is_fall, direction_map.get(pred), conf
+
     def extract_features(self, keypoints, image_shape):
         """Extract normalized keypoint features (same as inference)"""
         h, w = image_shape[:2]
@@ -714,15 +785,53 @@ class FallDetector:
                     
                     # Initialize fall state for new person
                     if track_id not in self.fall_states:
+                        # Inherit profile name from a recently lost track if close enough (fixes ID switch during fall)
+                        new_cx = (box[0] + box[2]) / 2
+                        new_cy = (box[1] + box[3]) / 2
+                        best_dist = float('inf')
+                        best_old_id = None
+                        
+                        for old_id, state in self.fall_states.items():
+                            if old_id not in current_person_ids and 'last_box' in state:
+                                old_box = state['last_box']
+                                old_cx = (old_box[0] + old_box[2]) / 2
+                                old_cy = (old_box[1] + old_box[3]) / 2
+                                dist = ((new_cx - old_cx)**2 + (new_cy - old_cy)**2)**0.5
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best_old_id = old_id
+                                    
+                        if best_old_id is not None and best_dist < max(frame.shape[0], frame.shape[1]) * 0.4:
+                            if best_old_id in self._person_labels:
+                                self._person_labels[track_id] = self._person_labels[best_old_id]
+                                if track_id not in self._face_rec_counters:
+                                    self._face_rec_counters[track_id] = self._face_rec_counters.get(best_old_id, 0)
+                                # Re-resolve display label using inherited _person_labels
+                                display_label = self._person_labels[track_id]
+                                
                         self.fall_states[track_id] = {
                             'is_fallen': False,
-                            'incident_id': None
+                            'incident_id': None,
+                            'last_box': box
                         }
+                    else:
+                        self.fall_states[track_id]['last_box'] = box
                     
                     # SAME VALIDATION AS INFERENCE: Only check if 10+ keypoints visible
                     visible_count = np.sum(keypoints[:, 2] > 0.3)
                     
                     if visible_count >= 10:
+                        has_both_shoulders = (keypoints[5, 2] > 0.3 and keypoints[6, 2] > 0.3)
+                        has_both_knees = (keypoints[13, 2] > 0.3 and keypoints[14, 2] > 0.3)
+                        if has_both_shoulders and has_both_knees:
+                            # Flatten keypoints to 51-dim and push into TCN buffer
+                            kp_flat = keypoints.flatten().astype(np.float32)   # (17,3) → (51,)
+                            # normalize x,y same way as training script
+                            kp_flat_norm = kp_flat.copy()
+                            kp_flat_norm[0::3] /= frame.shape[1]   # x coords
+                            kp_flat_norm[1::3] /= frame.shape[0]   # y coords
+                            self.tcn_kp_buffers[track_id].append(kp_flat_norm)
+
                         # Normalize keypoints
                         keypoints_normalized = self.extract_features(keypoints, frame.shape)
                         
@@ -757,53 +866,75 @@ class FallDetector:
                         # THREE-TIER CONFIDENCE SYSTEM
                         fallen_confidence = probabilities[0][2].item()
                         
+                        # Current CNN result
+                        cnn_fallen = (raw_prediction == 2)  # bool from Simple1DCNN
+                        cnn_conf   = fallen_confidence
+
+                        # New TCN result
+                        tcn_fallen, fall_direction, tcn_conf = self._get_tcn_fall_score(track_id)
+
+                        # Option C — Weighted score fusion (recommended)
+                        # Combine confidence scores with tunable weights
+                        ALPHA = 0.6   # weight for CNN (reactive, per-frame)
+                        BETA  = 0.4   # weight for TCN (temporal, directional)
+                        fused_score = (ALPHA * (cnn_conf if cnn_fallen else 0.0) +
+                                       BETA  * (tcn_conf if tcn_fallen else 0.0))
+                        is_confirmed_fall = fused_score >= 0.50
+
                         # Initialize variables
                         display_state = "normal"
                         confidence_tier = "N/A"
                         is_raw_fallen = False
-                        
-                        if raw_prediction == 2:  # Model predicts fallen class
-                            if fallen_confidence >= Config.HIGH_CONFIDENCE_THRESHOLD:
-                                is_raw_fallen = True
-                                confidence_tier = "HIGH"
-                                display_state = "normal"
+                        _should_log = (self.fall_candidates[track_id]['start_time'] is None)
+
+                        if is_confirmed_fall:
+                            is_raw_fallen = True
+                            confidence_tier = "HIGH"
+                            display_state = "normal"
+                            
+                            # Log the fall direction if available
+                            if fall_direction and _should_log:
+                                print(f"Person ID {track_id}: Fall direction detected as {fall_direction.upper()}")
                                 
-                            elif fallen_confidence >= Config.LOW_CONFIDENCE_THRESHOLD:
-                                is_raw_fallen = False
-                                confidence_tier = "AT_RISK"
-                                display_state = "at_risk"
-                                
-                                print(f"⚠️ Person ID {track_id}: AT RISK (Medium confidence)")
-                                print(f"   Fallen confidence: {fallen_confidence:.2%}")
-                                
-                                self.at_risk_log.append({
-                                    'timestamp': time.time(),
-                                    'person_id': track_id,
-                                    'confidence': fallen_confidence,
-                                    'reason': 'medium_confidence_fallen'
-                                })
-                                
-                                # NOTE: At Risk database logging disabled until gait analysis is implemented
-                                # db.log_at_risk_event() is available but not used yet
-                                
-                            else:
-                                is_raw_fallen = False
-                                confidence_tier = "REJECTED"
-                                display_state = "normal"
-                                
-                                print(f"❌ Person ID {track_id}: Fallen REJECTED (low confidence)")
-                                print(f"   Fallen confidence: {fallen_confidence:.2%}")
-                                
+                            # Stash direction info for push notifications later
+                            self.fall_states[track_id]['fall_direction'] = fall_direction
+                            self.fall_states[track_id]['fused_score'] = fused_score
+
+                        elif (cnn_fallen and cnn_conf >= Config.LOW_CONFIDENCE_THRESHOLD) or \
+                             (tcn_fallen and tcn_conf >= Config.LOW_CONFIDENCE_THRESHOLD):
+                            is_raw_fallen = False
+                            confidence_tier = "AT_RISK"
+                            display_state = "at_risk"
+
+                            if _should_log:
+                                print(f"Person ID {track_id}: AT RISK (Medium confidence)")
+                                print(f"   Fused confidence: {fused_score:.2%}")
+
+                            self.at_risk_log.append({
+                                'timestamp': time.time(),
+                                'person_id': track_id,
+                                'person_label': display_label,
+                                'confidence': fused_score,
+                                'reason': 'medium_confidence_fallen'
+                            })
+
+                        else:
+                            is_raw_fallen = False
+                            confidence_tier = "REJECTED"
+                            display_state = "normal"
+
+                            if _should_log and (cnn_fallen or tcn_fallen):
+                                print(f"Person ID {track_id}: Fallen REJECTED (low confidence)")
+                                print(f"   Fused confidence: {fused_score:.2%}")
+
+                            if cnn_fallen or tcn_fallen:
                                 self.rejected_log.append({
                                     'timestamp': time.time(),
                                     'person_id': track_id,
-                                    'confidence': fallen_confidence,
+                                    'person_label': display_label,
+                                    'confidence': fused_score,
                                     'reason': 'very_low_confidence'
                                 })
-                        else:
-                            is_raw_fallen = False
-                            confidence_tier = "N/A"
-                            display_state = "normal"
                         
                         # Override smoothed prediction for rejected/at-risk falls
                         if raw_prediction == 2 and not is_raw_fallen:
@@ -896,9 +1027,13 @@ class FallDetector:
                                             print(f"{'='*70}\n")
                                             
                                             # Send push notification to registered devices
+                                            fall_direction = self.fall_states[track_id].get('fall_direction')
+                                            fused_score = self.fall_states[track_id].get('fused_score', fallen_confidence)
+                                            direction_str = f" ({fall_direction})" if fall_direction else ""
+                                            
                                             send_expo_push_notification(
                                                 "🚨 Fall Detected!",
-                                                f"{display_label} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
+                                                f"{display_label} has fallen{direction_str} at {room_name}. Confidence: {fused_score:.0%}"
                                             )
                                     else:
                                         print(f"ℹ️ Person ID {track_id}: Fall already confirmed")

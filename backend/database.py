@@ -537,15 +537,15 @@ class FallIncidentDB:
             conn.close()
 
     # ---------- log an at-risk event ----------
-    def log_at_risk_event(self, person_id, confidence, location):
+    def log_at_risk_event(self, person_id, confidence, location, person_label=None):
         """Log an at-risk (abnormal gait) detection"""
         import time as _time
         conn = self._get_conn()
         try:
             cur = conn.execute(
-                '''INSERT INTO fall_incidents (person_id, confidence, location, timestamp, status, type)
-                   VALUES (?, ?, ?, ?, 'logged', 'at_risk')''',
-                (person_id, confidence, location, _time.time())
+                '''INSERT INTO fall_incidents (person_id, confidence, location, timestamp, status, type, person_label)
+                   VALUES (?, ?, ?, ?, 'logged', 'at_risk', ?)''',
+                (person_id, confidence, location, _time.time(), person_label)
             )
             conn.commit()
             return cur.lastrowid
