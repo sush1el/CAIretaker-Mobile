@@ -32,8 +32,18 @@ from collections import deque, defaultdict
 import warnings
 import os
 import requests
+import sys
 
 warnings.filterwarnings('ignore')
+
+# Face recognition (optional — graceful degradation if insightface missing)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from face_recognizer import FaceRecognizer
+    FACE_RECOGNITION_AVAILABLE = True
+except Exception as _fr_err:
+    FACE_RECOGNITION_AVAILABLE = False
+    print(f"[FaceRec] Unavailable: {_fr_err}")
 
 app = Flask(__name__)
 CORS(app)
@@ -83,8 +93,8 @@ class Config:
     #   - yolo11n-pose.pt in backend/models/ folder
     
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    CNN_MODEL_PATH = os.path.join(BASE_DIR, "..", "cnn_model_fall.pth")
-    YOLO_MODEL = os.path.join(BASE_DIR, "models", "yolo11n-pose.pt")
+    CNN_MODEL_PATH = os.path.join(BASE_DIR,"models", "cnn_model_fall.pth")
+    YOLO_MODEL = os.path.join(BASE_DIR, "models", "yolo11m-pose.pt")
     # ===========================================================================
     
     CONFIDENCE_THRESHOLD = 0.65
@@ -109,7 +119,12 @@ class Config:
     NUM_KEYPOINTS = 17
     NUM_COORDS = 3
     NUM_SPATIAL_FEATURES = 7
-    
+
+    # ---- FACE RECOGNITION ----
+    FACE_RECOGNITION_ENABLED   = True
+    FACE_RECOGNITION_THRESHOLD = 0.40   # cosine similarity cutoff
+    FACE_RECOGNITION_INTERVAL  = 5      # run every N frames per track_id (CPU budget)
+
     # Camera to Room Name Mapping
     # Add more entries as you add more cameras
     CAMERA_ROOMS = {
@@ -602,6 +617,22 @@ class FallDetector:
         # Track at-risk detections for analytics
         self.at_risk_log = []
         self.rejected_log = []
+
+        # ---- Face Recognition ----
+        self.face_recognizer = None
+        if Config.FACE_RECOGNITION_ENABLED and FACE_RECOGNITION_AVAILABLE:
+            print("Loading face recognizer (InsightFace MobileFaceNet)...")
+            self.face_recognizer = FaceRecognizer(
+                threshold=Config.FACE_RECOGNITION_THRESHOLD,
+                is_pi=False,
+            )
+            print("✓ Face recognizer loaded")
+        else:
+            print("ℹ Face recognition disabled (set FACE_RECOGNITION_ENABLED=True to enable)")
+
+        # face rec frame counter & persistent label per track_id
+        self._face_rec_counters = {}   # track_id -> frames since last recognition run
+        self._person_labels    = {}    # track_id -> latest resolved display label
         
     def extract_features(self, keypoints, image_shape):
         """Extract normalized keypoint features (same as inference)"""
@@ -613,6 +644,38 @@ class FallDetector:
         
         return normalized
     
+    def _get_display_label(self, track_id: int, slot_index: int, box, frame) -> str:
+        """
+        Resolve the display label for a tracked person.
+
+        slot_index: 1-based position of this person in the current frame's
+                    detection list (resets every frame — never exceeds the
+                    number of people currently visible).
+
+        Logic:
+          1. Every FACE_RECOGNITION_INTERVAL frames, re-run InsightFace.
+          2. If recognised → store name in self._person_labels[track_id].
+          3. If not recognised (yet) → fall back to "Person {slot_index}".
+        """
+        slot_label = f"Person {slot_index}"
+
+        if self.face_recognizer is None or not self.face_recognizer.enabled:
+            return slot_label
+
+        counter = self._face_rec_counters.get(track_id, 0) + 1
+        self._face_rec_counters[track_id] = counter
+
+        if counter >= Config.FACE_RECOGNITION_INTERVAL:
+            self._face_rec_counters[track_id] = 0
+            label, is_known, _sim = self.face_recognizer.identify(box, frame)
+            if is_known:
+                self._person_labels[track_id] = label
+            else:
+                # Clear stale name if person is no longer recognised
+                self._person_labels.pop(track_id, None)
+
+        return self._person_labels.get(track_id, slot_label)
+
     def detect(self, frame):
         """Detect pose and classify activity with tracking (same logic as inference but multi-person)"""
         results = self.pose_model.track(frame, persist=True, verbose=False, conf=0.5)
@@ -632,16 +695,22 @@ class FallDetector:
                     return detections
                 
                 track_ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
-                
+
+                # Build ordered list of (idx, keypoints, box, box_conf, track_id)
+                # so slot numbers are stable within this frame
+                frame_persons = []
                 for idx, keypoints in enumerate(keypoints_data):
-                    # Skip if idx exceeds available boxes
                     if idx >= len(boxes.xyxy):
                         continue
-                    
                     box = boxes.xyxy[idx].cpu().numpy()
                     box_conf = boxes.conf[idx].cpu().numpy()
                     track_id = int(track_ids[idx]) if track_ids is not None else idx
-                    
+                    frame_persons.append((idx, keypoints, box, box_conf, track_id))
+
+                for slot_index, (idx, keypoints, box, box_conf, track_id) in enumerate(frame_persons, start=1):
+                    # Resolve slot-based display label with optional face recognition
+                    display_label = self._get_display_label(track_id, slot_index, box, frame)
+
                     current_person_ids.add(track_id)
                     
                     # Initialize fall state for new person
@@ -803,7 +872,7 @@ class FallDetector:
                                         print(f"🚨🚨🚨 CONFIRMED FALL ALERT 🚨🚨🚨")
                                         print(f"{'='*70}")
                                         room_name = Config.get_room_name(current_camera_index)
-                                        print(f"Person ID: {track_id}")
+                                        print(f"Person: {display_label} (track_id={track_id})")
                                         print(f"Location: {room_name}")
                                         print(f"Fallen Confidence: {fallen_confidence:.2%}")
                                         print(f"Time Fallen: {elapsed_time:.2f}s")
@@ -812,12 +881,13 @@ class FallDetector:
                                         incident_id = db.log_fall_incident(
                                             person_id=track_id,
                                             confidence=fallen_confidence,
-                                            location=room_name
+                                            location=room_name,
+                                            person_label=display_label,
                                         )
                                         
                                         if incident_id is None:
                                             # Person already has an active fall in DB — skip duplicate
-                                            print(f"ℹ️ Person ID {track_id}: Active fall already exists in DB, skipping")
+                                            print(f"ℹ️ {display_label}: Active fall already exists in DB, skipping")
                                         else:
                                             self.fall_states[track_id]['is_fallen'] = True
                                             self.fall_states[track_id]['incident_id'] = incident_id
@@ -829,7 +899,7 @@ class FallDetector:
                                             # Send push notification to registered devices
                                             send_expo_push_notification(
                                                 "🚨 Fall Detected!",
-                                                f"Person ID {track_id} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
+                                                f"{display_label} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
                                             )
                                     else:
                                         print(f"ℹ️ Person ID {track_id}: Fall already confirmed")
@@ -890,6 +960,7 @@ class FallDetector:
                     
                     detections.append({
                         'track_id': track_id,
+                        'display_label': display_label,
                         'box': box,
                         'box_conf': float(box_conf),
                         'keypoints': keypoints,
@@ -908,12 +979,15 @@ class FallDetector:
         disappeared_ids = set(self.fall_states.keys()) - current_person_ids
         for person_id in disappeared_ids:
             if self.fall_states[person_id]['is_fallen']:
-                print(f"⚠ Person ID {person_id} with active fall left frame")
+                lbl = self._person_labels.get(person_id, f"Person (track={person_id})")
+                print(f"⚠ {lbl} with active fall left frame")
             del self.fall_states[person_id]
             if person_id in self.prediction_buffers:
                 del self.prediction_buffers[person_id]
             if person_id in self.fall_candidates:
                 del self.fall_candidates[person_id]
+            self._face_rec_counters.pop(person_id, None)
+            self._person_labels.pop(person_id, None)
         
         return detections
     
@@ -931,6 +1005,7 @@ class FallDetector:
         
         for detection in detections:
             track_id = detection['track_id']
+            display_label = detection.get('display_label', f'Person {track_id}')
             box = detection['box']
             keypoints = detection['keypoints']
             prediction = detection['prediction']
@@ -947,29 +1022,29 @@ class FallDetector:
             candidate = self.fall_candidates.get(track_id)
             is_monitoring = candidate is not None and candidate.get('start_time') is not None
             
-            # Determine color and label
+            # Determine color and label (use display_label instead of raw track_id)
             if is_monitoring and not is_fallen:
                 elapsed = current_time - candidate['start_time']
                 remaining = Config.FALL_CONFIRMATION_TIME - elapsed
                 color = (0, 165, 255)  # ORANGE for monitoring
-                label = f"ID {track_id}: MONITORING ({remaining:.1f}s)"
+                label = f"{display_label}: MONITORING ({remaining:.1f}s)"
                 box_thickness = 3
             elif is_fallen:
                 color = (0, 0, 255)  # RED for confirmed fall
-                label = f"ID {track_id}: FALLEN (ALERT)"
+                label = f"{display_label}: FALLEN (ALERT)"
                 box_thickness = 4
             elif display_state == 'at_risk':
                 color = Config.CLASS_COLORS['at_risk']  # ORANGE
-                label = f"ID {track_id}: At Risk ({fallen_confidence:.0%})"
+                label = f"{display_label}: At Risk ({fallen_confidence:.0%})"
                 box_thickness = 2
             elif prediction is not None:
                 color = Config.CLASS_COLORS.get(prediction, (255, 255, 255))
                 class_name = Config.CLASS_NAMES.get(prediction, "Unknown")
-                label = f"ID {track_id}: {class_name} ({confidence:.0%})"
+                label = f"{display_label}: {class_name} ({confidence:.0%})"
                 box_thickness = 2
             else:
                 color = (128, 128, 128)  # GRAY for tracking only
-                label = f"ID {track_id}: Tracking ({visible_count} kpts)"
+                label = f"{display_label}: Tracking ({visible_count} kpts)"
                 box_thickness = 2
             
             # Draw bounding box
@@ -1148,6 +1223,7 @@ def generate_frames():
                     current_status['detections'] = [
                         {
                             'id': d['track_id'],
+                            'label': d.get('display_label', f"Person {i+1}"),
                             'status': 'At Risk' if d.get('display_state') == 'at_risk' else Config.CLASS_NAMES.get(d['prediction'], 'Tracking') if d['status'] == 'classified' else 'Tracking',
                             'confidence': d['confidence'],
                             'confidence_tier': d.get('confidence_tier', 'N/A'),
@@ -1155,7 +1231,7 @@ def generate_frames():
                             'is_at_risk': d.get('display_state') == 'at_risk',
                             'incident_id': d.get('incident_id')
                         }
-                        for d in detections
+                        for i, d in enumerate(detections)
                     ]
                     
                 frame_count += 1
@@ -1455,6 +1531,260 @@ def clear_all_incidents():
             'success': False,
             'error': str(e)
         }), 500
+
+
+# ============================================================================
+# FACE PROFILE ENDPOINTS
+# ============================================================================
+
+@app.route('/api/profiles', methods=['GET'])
+def list_profiles():
+    """List all enrolled face profiles."""
+    if detector and detector.face_recognizer:
+        profiles = detector.face_recognizer.get_all_profiles()
+    else:
+        from database import FaceProfileDB as _FPDB
+        profiles = _FPDB().get_all_profiles()
+    return jsonify({'success': True, 'profiles': profiles, 'count': len(profiles)})
+
+
+@app.route('/api/profiles', methods=['POST'])
+def enroll_profile():
+    """
+    Enroll a face profile.
+
+    Body (JSON): {"name": "Maria", "track_id": 3}
+    The server grabs the latest frame and the bounding box for track_id,
+    extracts the embedding, and saves it.
+    """
+    if detector is None or detector.face_recognizer is None:
+        return jsonify({'success': False, 'error': 'Face recognizer not available'}), 503
+
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    track_id = data.get('track_id')
+
+    if not name:
+        return jsonify({'success': False, 'error': 'name is required'}), 400
+    if track_id is None:
+        return jsonify({'success': False, 'error': 'track_id is required'}), 400
+
+    try:
+        track_id = int(track_id)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'track_id must be an integer'}), 400
+
+    # Grab the latest frame
+    with camera_lock:
+        if camera is None or not camera.isOpened():
+            return jsonify({'success': False, 'error': 'Camera not available'}), 503
+        ok, frame = camera.read()
+    if not ok or frame is None:
+        return jsonify({'success': False, 'error': 'Could not read frame'}), 503
+
+    # Find the bounding box for this track_id from the latest status
+    with status_lock:
+        dets = current_status.get('detections', [])
+
+    # Match track_id in the live detector's fall_states (has box info from detect())
+    # We re-detect on the current frame to get a fresh box.
+    raw_dets = detector.detect(frame)
+    box = None
+    for d in raw_dets:
+        if d['track_id'] == track_id:
+            box = d['box']
+            break
+
+    if box is None:
+        return jsonify({'success': False, 'error': f'track_id {track_id} not found in current frame'}), 404
+
+    success = detector.face_recognizer.enroll(name, box, frame)
+    if success:
+        return jsonify({'success': True, 'message': f"Profile '{name}' enrolled successfully"})
+    return jsonify({'success': False, 'error': 'Enrollment failed (no face detected in crop)'}), 422
+
+
+@app.route('/api/profiles/<string:name>', methods=['DELETE'])
+def delete_profile(name):
+    """Delete a named face profile."""
+    if detector and detector.face_recognizer:
+        deleted = detector.face_recognizer.delete_profile(name)
+    else:
+        from database import FaceProfileDB as _FPDB
+        deleted = _FPDB().delete_profile(name)
+
+    if deleted:
+        return jsonify({'success': True, 'message': f"Profile '{name}' deleted"})
+    return jsonify({'success': False, 'error': f"Profile '{name}' not found"}), 404
+
+
+@app.route('/api/profiles/reload', methods=['POST'])
+def reload_profiles():
+    """Force-reload face profiles from the database (e.g. after remote edits)."""
+    if detector and detector.face_recognizer:
+        detector.face_recognizer.reload_profiles()
+        return jsonify({'success': True, 'message': 'Profiles reloaded'})
+    return jsonify({'success': False, 'error': 'Face recognizer not available'}), 503
+
+
+@app.route('/api/profiles/enroll-image', methods=['POST'])
+def enroll_profile_from_image():
+    """
+    Enroll a face profile from a base64-encoded JPEG image.
+
+    Body (JSON):
+        {
+            "name":  "Maria",
+            "image": "<base64-encoded JPEG bytes>"
+        }
+
+    The endpoint decodes the image, runs InsightFace to extract the ArcFace
+    embedding, and upserts the profile in the database.
+    Returns the number of successful embeddings saved.
+    """
+    import base64
+
+    # Ensure the face recognizer is available (fall back to standalone instance)
+    face_rec = detector.face_recognizer if (detector and detector.face_recognizer) else None
+    if face_rec is None:
+        # Try to build a standalone recognizer (useful during development / when
+        # the camera hasn't been initialised yet)
+        try:
+            face_rec = FaceRecognizer()
+        except Exception as _e:
+            return jsonify({'success': False, 'error': f'Face recognizer not available: {_e}'}), 503
+
+    if not face_rec.enabled:
+        return jsonify({'success': False, 'error': 'InsightFace not installed on this server'}), 503
+
+    data = request.get_json() or {}
+    name  = (data.get('name') or '').strip()
+    b64   = (data.get('image') or '').strip()
+
+    if not name:
+        return jsonify({'success': False, 'error': 'name is required'}), 400
+    if not b64:
+        return jsonify({'success': False, 'error': 'image (base64) is required'}), 400
+
+    # Strip the data-URI prefix if present (e.g. "data:image/jpeg;base64,...")
+    if ',' in b64:
+        b64 = b64.split(',', 1)[1]
+
+    try:
+        img_bytes = base64.b64decode(b64)
+        img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("cv2.imdecode returned None — unsupported format?")
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Could not decode image: {e}'}), 400
+
+    # Run embedding extraction directly on the full image
+    # (no bounding-box crop needed — the photo IS the face crop from the app)
+    emb = face_rec.extract_embedding(frame)
+    if emb is None:
+        return jsonify({
+            'success': False,
+            'error': 'No face detected in the provided image. Please retake the photo.',
+            'hint': 'Ensure the face is well-lit, centered, and clearly visible.'
+        }), 422
+
+    profile_id = face_rec.face_db.add_or_update_profile(name, emb)
+    if profile_id > 0:
+        # Also reload in-memory cache of the live detector if running
+        if detector and detector.face_recognizer and detector.face_recognizer is not face_rec:
+            detector.face_recognizer.reload_profiles()
+        return jsonify({
+            'success': True,
+            'message': f"Profile '{name}' enrolled successfully",
+            'profile_id': profile_id,
+        })
+    return jsonify({'success': False, 'error': 'Failed to save profile to database'}), 500
+
+
+@app.route('/api/profiles/enroll-image/multi', methods=['POST'])
+def enroll_profile_multi_angle():
+    """
+    Enroll a face profile from multiple base64-encoded JPEG images (different angles).
+
+    Body (JSON):
+        {
+            "name":   "Maria",
+            "images": ["<base64 JPEG>", "<base64 JPEG>", ...]
+        }
+
+    Each image is processed independently.  The embeddings that InsightFace
+    successfully extracts are averaged and L2-normalised before saving —
+    this produces a more robust representation that handles pose variation.
+    """
+    import base64
+
+    face_rec = detector.face_recognizer if (detector and detector.face_recognizer) else None
+    if face_rec is None:
+        try:
+            face_rec = FaceRecognizer()
+        except Exception as _e:
+            return jsonify({'success': False, 'error': f'Face recognizer not available: {_e}'}), 503
+
+    if not face_rec.enabled:
+        return jsonify({'success': False, 'error': 'InsightFace not installed on this server'}), 503
+
+    data   = request.get_json() or {}
+    name   = (data.get('name') or '').strip()
+    images = data.get('images') or []
+
+    if not name:
+        return jsonify({'success': False, 'error': 'name is required'}), 400
+    if not images:
+        return jsonify({'success': False, 'error': 'images list is required'}), 400
+
+    embeddings = []
+    failed     = 0
+
+    for b64 in images:
+        b64 = (b64 or '').strip()
+        if ',' in b64:
+            b64 = b64.split(',', 1)[1]
+        try:
+            img_bytes = base64.b64decode(b64)
+            img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            if frame is None:
+                failed += 1
+                continue
+            emb = face_rec.extract_embedding(frame)
+            if emb is not None:
+                embeddings.append(emb)
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+    if not embeddings:
+        return jsonify({
+            'success': False,
+            'error': f'No faces detected in any of the {len(images)} images.',
+            'hint': 'Ensure each photo shows a clear, well-lit face.'
+        }), 422
+
+    # Average + L2-normalise
+    avg_emb  = np.mean(embeddings, axis=0)
+    norm_val = np.linalg.norm(avg_emb)
+    if norm_val > 1e-8:
+        avg_emb = avg_emb / norm_val
+
+    profile_id = face_rec.face_db.add_or_update_profile(name, avg_emb)
+    if profile_id > 0:
+        if detector and detector.face_recognizer and detector.face_recognizer is not face_rec:
+            detector.face_recognizer.reload_profiles()
+        return jsonify({
+            'success': True,
+            'message': f"Profile '{name}' enrolled from {len(embeddings)}/{len(images)} images",
+            'profile_id': profile_id,
+            'embeddings_used': len(embeddings),
+            'embeddings_failed': failed,
+        })
+    return jsonify({'success': False, 'error': 'Failed to save profile to database'}), 500
 
 
 # ============================================================================

@@ -39,6 +39,7 @@ import warnings
 import os
 import json
 import requests
+import sys
 from picamera2 import Picamera2
 try:
     from libcamera import controls
@@ -63,6 +64,15 @@ except ImportError:
     ONNX_AVAILABLE = False
     print("[WARN] onnxruntime not installed — gait analysis disabled")
     print("       Install with: pip install onnxruntime")
+
+# Face recognition (optional — graceful degradation if insightface missing)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from face_recognizer import FaceRecognizer
+    FACE_RECOGNITION_AVAILABLE = True
+except Exception as _fr_err:
+    FACE_RECOGNITION_AVAILABLE = False
+    print(f"[FaceRec] Unavailable: {_fr_err}")
 
 warnings.filterwarnings('ignore')
 
@@ -320,6 +330,11 @@ class Config:
     NUM_KEYPOINTS = 17
     NUM_COORDS = 3
     NUM_SPATIAL_FEATURES = 7
+
+    # ---- FACE RECOGNITION ----
+    FACE_RECOGNITION_ENABLED   = True
+    FACE_RECOGNITION_THRESHOLD = 0.40   # cosine similarity cutoff
+    FACE_RECOGNITION_INTERVAL  = 10     # run every N frames per track_id (Pi CPU budget)
     
     # Camera to Room Name Mapping
     # Add more entries as you add more cameras
@@ -1602,6 +1617,22 @@ class FallDetector:
         # ---- TCN Gait Analyzer ----
         self.gait_analyzer = GaitAnalyzer(Config.TCN_MODEL_PATH)
         self.gait_alert_count = 0  # live count of people with abnormal gait
+
+        # ---- Face Recognition ----
+        self.face_recognizer = None
+        if Config.FACE_RECOGNITION_ENABLED and FACE_RECOGNITION_AVAILABLE:
+            print("Loading face recognizer (InsightFace MobileFaceNet) — Pi mode...")
+            self.face_recognizer = FaceRecognizer(
+                threshold=Config.FACE_RECOGNITION_THRESHOLD,
+                is_pi=True,   # uses smaller det_size for Pi CPU
+            )
+            print("✓ Face recognizer loaded")
+        else:
+            print("ℹ Face recognition disabled")
+
+        # per-track face recognition counters and resolved labels
+        self._face_rec_counters = {}   # track_id -> frames since last recognition
+        self._person_labels    = {}    # track_id -> resolved display label
         
     def extract_features(self, keypoints, image_shape):
         """Extract normalized keypoint features (same as inference)"""
@@ -1612,6 +1643,29 @@ class FallDetector:
         normalized[:, 1] = normalized[:, 1] / h
         
         return normalized
+
+    def _get_display_label(self, track_id: int, slot_index: int, box, frame) -> str:
+        """
+        Resolve the display label for a tracked person.
+        slot_index: 1-based position in the current frame's detection list.
+        """
+        slot_label = f"Person {slot_index}"
+
+        if self.face_recognizer is None or not self.face_recognizer.enabled:
+            return slot_label
+
+        counter = self._face_rec_counters.get(track_id, 0) + 1
+        self._face_rec_counters[track_id] = counter
+
+        if counter >= Config.FACE_RECOGNITION_INTERVAL:
+            self._face_rec_counters[track_id] = 0
+            label, is_known, _sim = self.face_recognizer.identify(box, frame)
+            if is_known:
+                self._person_labels[track_id] = label
+            else:
+                self._person_labels.pop(track_id, None)
+
+        return self._person_labels.get(track_id, slot_label)
     
     def detect(self, frame):
         """Detect pose and classify activity with tracking (same logic as inference but multi-person)"""
@@ -1626,360 +1680,372 @@ class FallDetector:
         
         detections = []
         current_person_ids = set()
-        
+
+        # Build ordered list so slot numbers are stable within this frame
+        frame_persons = []
         if hailo_detections and len(hailo_detections) > 0:
             for idx, hailo_det in enumerate(hailo_detections):
-                box = hailo_det['box']
+                box      = hailo_det['box']
                 box_conf = hailo_det['confidence']
-                keypoints = hailo_det['keypoints']  # (17, 3) array
-                track_id = track_ids[idx] if idx < len(track_ids) else idx
+                keypoints = hailo_det['keypoints']
+                track_id  = track_ids[idx] if idx < len(track_ids) else idx
+                frame_persons.append((idx, hailo_det, box, box_conf, keypoints, track_id))
+
+        for slot_index, (idx, hailo_det, box, box_conf, keypoints, track_id) in enumerate(frame_persons, start=1):
+            # Resolve slot-based display label (with optional face recognition)
+            display_label = self._get_display_label(track_id, slot_index, box, frame)
                 
-                current_person_ids.add(track_id)
+            current_person_ids.add(track_id)
                 
-                # Initialize fall state for new person
-                if track_id not in self.fall_states:
-                    self.fall_states[track_id] = {
-                        'is_fallen': False,
-                        'incident_id': None
-                    }
-                
-                # STRUCTURAL VALIDATION: Require both shoulders and both knees visible
-                visible_count = np.sum(keypoints[:, 2] > 0.3)
-                has_both_shoulders = (keypoints[5, 2] > 0.3 and keypoints[6, 2] > 0.3)
-                has_both_knees = (keypoints[13, 2] > 0.3 and keypoints[14, 2] > 0.3)
-                
-                if has_both_shoulders and has_both_knees:
-                    # Normalize keypoints
-                    keypoints_normalized = self.extract_features(keypoints, frame.shape)
-                    
-                    # Prepare tensor
-                    keypoints_tensor = torch.tensor(
-                        keypoints_normalized.reshape(1, Config.NUM_KEYPOINTS, Config.NUM_COORDS),
-                        dtype=torch.float32
-                    ).to(self.device)
-                    
-                    # Forward pass (Simple1DCNN only takes keypoints)
-                    with torch.no_grad():
-                        outputs = self.cnn_model(keypoints_tensor)
-                        probabilities = torch.softmax(outputs, dim=1)
-                        confidence_val, predicted = torch.max(probabilities, 1)
-                        
-                        # Store RAW prediction BEFORE smoothing
-                        raw_prediction = predicted.item()
-                        raw_confidence = confidence_val.item()
-                    
-                    # Smooth predictions per track ID (for display purposes)
-                    self.prediction_buffers[track_id].append(raw_prediction)
-                    if len(self.prediction_buffers[track_id]) >= Config.SMOOTHING_WINDOW // 2:
-                        smoothed_prediction = max(set(self.prediction_buffers[track_id]), 
-                                       key=self.prediction_buffers[track_id].count)
-                    else:
-                        smoothed_prediction = raw_prediction
-                    
-                    # Use smoothed for display
-                    prediction = smoothed_prediction
-                    confidence = raw_confidence
-                    
-                    # THREE-TIER CONFIDENCE SYSTEM
-                    fallen_confidence = probabilities[0][2].item()
-                    
-                    # Initialize variables
-                    display_state = "normal"
-                    confidence_tier = "N/A"
-                    is_raw_fallen = False
-                    
-                    if raw_prediction == 2:  # Model predicts fallen class
-                        if fallen_confidence >= Config.HIGH_CONFIDENCE_THRESHOLD:
-                            is_raw_fallen = True
-                            confidence_tier = "HIGH"
-                            display_state = "normal"
-                            
-                        elif fallen_confidence >= Config.LOW_CONFIDENCE_THRESHOLD:
-                            is_raw_fallen = False
-                            confidence_tier = "AT_RISK"
-                            display_state = "at_risk"
-                            
-                            if _should_log:
-                                print(f"Person ID {track_id}: AT RISK (Medium confidence)")
-                                print(f"   Fallen confidence: {fallen_confidence:.2%}")
-                            
-                            self.at_risk_log.append({
-                                'timestamp': time.time(),
-                                'person_id': track_id,
-                                'confidence': fallen_confidence,
-                                'reason': 'medium_confidence_fallen'
-                            })
-                            
-                            # NOTE: At Risk database logging disabled until gait analysis is implemented
-                            # db.log_at_risk_event() is available but not used yet
-                            
-                        else:
-                            is_raw_fallen = False
-                            confidence_tier = "REJECTED"
-                            display_state = "normal"
-                            
-                            if _should_log:
-                                print(f"Person ID {track_id}: Fallen REJECTED (low confidence)")
-                                print(f"   Fallen confidence: {fallen_confidence:.2%}")
-                            
-                            self.rejected_log.append({
-                                'timestamp': time.time(),
-                                'person_id': track_id,
-                                'confidence': fallen_confidence,
-                                'reason': 'very_low_confidence'
-                            })
+            # Initialize fall state for new person
+            if track_id not in self.fall_states:
+                self.fall_states[track_id] = {
+                    'is_fallen': False,
+                    'incident_id': None
+                }
+
+            # STRUCTURAL VALIDATION: Require both shoulders and both knees visible
+            visible_count = np.sum(keypoints[:, 2] > 0.3)
+            has_both_shoulders = (keypoints[5, 2] > 0.3 and keypoints[6, 2] > 0.3)
+            has_both_knees = (keypoints[13, 2] > 0.3 and keypoints[14, 2] > 0.3)
+
+            if has_both_shoulders and has_both_knees:
+                # Normalize keypoints
+                keypoints_normalized = self.extract_features(keypoints, frame.shape)
+
+                # Prepare tensor
+                keypoints_tensor = torch.tensor(
+                    keypoints_normalized.reshape(1, Config.NUM_KEYPOINTS, Config.NUM_COORDS),
+                    dtype=torch.float32
+                ).to(self.device)
+
+                # Forward pass (Simple1DCNN only takes keypoints)
+                with torch.no_grad():
+                    outputs = self.cnn_model(keypoints_tensor)
+                    probabilities = torch.softmax(outputs, dim=1)
+                    confidence_val, predicted = torch.max(probabilities, 1)
+
+                    # Store RAW prediction BEFORE smoothing
+                    raw_prediction = predicted.item()
+                    raw_confidence = confidence_val.item()
+
+                # Smooth predictions per track ID (for display purposes)
+                self.prediction_buffers[track_id].append(raw_prediction)
+                if len(self.prediction_buffers[track_id]) >= Config.SMOOTHING_WINDOW // 2:
+                    smoothed_prediction = max(set(self.prediction_buffers[track_id]), 
+                                   key=self.prediction_buffers[track_id].count)
+                else:
+                    smoothed_prediction = raw_prediction
+
+                # Use smoothed for display
+                prediction = smoothed_prediction
+                confidence = raw_confidence
+
+                # THREE-TIER CONFIDENCE SYSTEM
+                fallen_confidence = probabilities[0][2].item()
+
+                # Initialize variables
+                display_state = "normal"
+                confidence_tier = "N/A"
+                is_raw_fallen = False
+
+                if raw_prediction == 2:  # Model predicts fallen class
+                    if fallen_confidence >= Config.HIGH_CONFIDENCE_THRESHOLD:
+                        is_raw_fallen = True
+                        confidence_tier = "HIGH"
+                        display_state = "normal"
+
+                    elif fallen_confidence >= Config.LOW_CONFIDENCE_THRESHOLD:
+                        is_raw_fallen = False
+                        confidence_tier = "AT_RISK"
+                        display_state = "at_risk"
+
+                        if _should_log:
+                            print(f"Person ID {track_id}: AT RISK (Medium confidence)")
+                            print(f"   Fallen confidence: {fallen_confidence:.2%}")
+
+                        self.at_risk_log.append({
+                            'timestamp': time.time(),
+                            'person_id': track_id,
+                            'confidence': fallen_confidence,
+                            'reason': 'medium_confidence_fallen'
+                        })
+
+                        # NOTE: At Risk database logging disabled until gait analysis is implemented
+                        # db.log_at_risk_event() is available but not used yet
+
                     else:
                         is_raw_fallen = False
-                        confidence_tier = "N/A"
+                        confidence_tier = "REJECTED"
                         display_state = "normal"
-                    
-                    # Override smoothed prediction for rejected/at-risk falls
-                    if raw_prediction == 2 and not is_raw_fallen:
-                        if confidence_tier == "AT_RISK":
-                            pass
-                        else:
-                            prediction = 0  # Override to Standing
-                    
-                    # Check for fall state changes
-                    was_fallen = self.fall_states[track_id]['is_fallen']
-                    
-                    # BENDING DETECTION OVERRIDE
-                    if is_raw_fallen:
-                        is_bending, bend_conf, reasons = is_bending_posture(keypoints, frame.shape)
-                        
-                        if is_bending and bend_conf > 0.5:
-                            if _should_log:
-                                print(f"Person ID {track_id}: Detected BENDING (not fallen)")
-                                print(f"  Confidence: {bend_conf:.2f}")
-                                print(f"  Reasons: {', '.join(reasons)}")
-                            
-                            prediction = 0
-                            confidence = bend_conf
-                            is_raw_fallen = False
-                            confidence_tier = "BENDING"
-                            display_state = "normal"
-                    
-                    # GEOMETRIC FALL HEURISTIC (catches facing-camera falls)
-                    # When someone lies facing the camera, the CNN sees a "standing"
-                    # skeleton but the bounding box is wide+flat and keypoints are
-                    # clustered near the ground.
-                    if not is_raw_fallen and raw_prediction != 1:  # Not already fallen, not sitting
-                        box_w = box[2] - box[0]
-                        box_h = box[3] - box[1]
-                        bbox_aspect = box_w / max(box_h, 1)
-                        
-                        # Keypoint vertical spread: low spread = lying flat
-                        visible_kps = keypoints[keypoints[:, 2] > 0.3]
-                        if len(visible_kps) >= 4:
-                            y_spread = (np.max(visible_kps[:, 1]) - np.min(visible_kps[:, 1])) / max(frame.shape[0], 1)
-                        else:
-                            y_spread = 1.0  # Default to high spread (assume standing)
-                        
-                        # Wide bbox + low vertical spread + low position = likely fallen
-                        hip_height = check_hip_position(keypoints, frame.shape)
-                        if (bbox_aspect > 1.5 and y_spread < 0.25
-                                and hip_height is not None and hip_height > 0.65):
-                            is_raw_fallen = True
-                            confidence_tier = "GEOMETRIC"
-                            display_state = "normal"
-                            prediction = 2
-                            fallen_confidence = max(fallen_confidence, 0.75)
-                            
-                            if _should_log:
-                                print(f"Person ID {track_id}: GEOMETRIC FALL DETECTED")
-                                print(f"  BBox aspect: {bbox_aspect:.2f}, Y-spread: {y_spread:.2f}, Hip height: {hip_height:.2f}")
-                    
-                    # TEMPORAL FALL DETECTION
-                    current_time = time.time()
-                    candidate = self.fall_candidates[track_id]
-                    
-                    if is_raw_fallen:
-                        if was_fallen:
-                            if _should_log:
-                                print(f"Person ID {track_id}: Maintaining FALLEN state")
-                            
-                        elif candidate['start_time'] is None:
-                            candidate['start_time'] = current_time
-                            candidate['frame_count'] = 1
-                            candidate['consecutive_fallen_frames'] = 1
-                            
-                            if self.fall_states[track_id]['is_fallen']:
-                                print(f"WARNING: is_fallen was True, forcing False for monitoring")
-                            self.fall_states[track_id]['is_fallen'] = False
-                            
-                            print(f"\n{'='*60}")
-                            print(f"MONITORING STARTED - Person ID {track_id}")
-                            print(f"{'='*60}")
-                            print(f"Fallen confidence: {fallen_confidence:.2%} (HIGH - >=70%)")
-                            print(f"Confirmation requirements:")
-                            print(f"  Time: {Config.FALL_CONFIRMATION_TIME}s")
-                            print(f"  Frames: {Config.FALL_CONFIRMATION_FRAMES} consecutive")
-                            print(f"Status: MONITORING IN PROGRESS...")
-                            print(f"{'='*60}\n")
-                        
-                        else:
-                            candidate['frame_count'] += 1
-                            candidate['consecutive_fallen_frames'] += 1
-                            elapsed_time = current_time - candidate['start_time']
-                            
-                            time_threshold_met = elapsed_time >= Config.FALL_CONFIRMATION_TIME
-                            frames_threshold_met = candidate['consecutive_fallen_frames'] >= Config.FALL_CONFIRMATION_FRAMES
-                            
-                            if time_threshold_met and frames_threshold_met:
-                                if not self.fall_states[track_id]['is_fallen']:
-                                    room_name = Config.get_room_name(current_camera_index)
-                                    print(f"\n{'='*70}")
-                                    print(f"CONFIRMED FALL ALERT")
-                                    print(f"{'='*70}")
-                                    print(f"Person ID: {track_id}")
-                                    print(f"Location: {room_name}")
-                                    print(f"Fallen Confidence: {fallen_confidence:.2%}")
-                                    print(f"Time Fallen: {elapsed_time:.2f}s")
-                                    print(f"")
-                                    
-                                    incident_id = db.log_fall_incident(
-                                        person_id=track_id,
-                                        confidence=fallen_confidence,
-                                        location=room_name
-                                    )
-                                    
-                                    if incident_id is None:
-                                        # Person already has an active fall in DB — skip duplicate
-                                        print(f"Person ID {track_id}: Active fall already exists in DB, skipping")
-                                    else:
-                                        self.fall_states[track_id]['is_fallen'] = True
-                                        self.fall_states[track_id]['incident_id'] = incident_id
-                                        
-                                        print(f"Incident logged (ID: {incident_id})")
-                                        print(f"ALERT TRIGGERED - Caregivers must respond")
-                                        print(f"{'='*70}\n")
-                                        
-                                        # Send push notification to registered devices
-                                        send_expo_push_notification(
-                                            "Fall Detected!",
-                                            f"Person ID {track_id} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
-                                        )
-                                else:
-                                    if _should_log:
-                                        print(f"Person ID {track_id}: Fall already confirmed")
-                            else:
-                                remaining_time = max(0, Config.FALL_CONFIRMATION_TIME - elapsed_time)
-                                remaining_frames = max(0, Config.FALL_CONFIRMATION_FRAMES - candidate['consecutive_fallen_frames'])
-                                
-                                if _should_log:
-                                    print(f"Person ID {track_id}: MONITORING IN PROGRESS")
-                                    print(f"   Time: {elapsed_time:.2f}s / {Config.FALL_CONFIRMATION_TIME}s")
-                                    print(f"   Frames: {candidate['consecutive_fallen_frames']} / {Config.FALL_CONFIRMATION_FRAMES}")
-                    
-                    else:
-                        if candidate['start_time'] is not None:
-                            elapsed = current_time - candidate['start_time']
-                            
-                            print(f"\n{'='*60}")
-                            print(f"RECOVERY DETECTED - Person ID {track_id}")
-                            print(f"{'='*60}")
-                            print(f"Fallen duration: {elapsed:.2f}s")
-                            print(f"Result: NO ALERT - Person recovered before confirmation")
-                            print(f"Monitoring: RESET")
-                            print(f"{'='*60}\n")
-                            
-                            candidate['start_time'] = None
-                            candidate['frame_count'] = 0
-                            candidate['consecutive_fallen_frames'] = 0
-                        
-                        if was_fallen:
-                            print(f"\n{'='*70}")
-                            print(f"RECOVERY CONFIRMED")
-                            print(f"{'='*70}")
-                            print(f"Person ID: {track_id}")
-                            print(f"Status: Person has stood up and recovered")
-                            
-                            if self.fall_states[track_id]['incident_id'] is not None:
-                                db.resolve_fall_for_person(track_id)
-                                print(f"Incident {self.fall_states[track_id]['incident_id']} marked as RESOLVED")
-                            
-                            self.fall_states[track_id]['is_fallen'] = False
-                            self.fall_states[track_id]['incident_id'] = None
-                            
-                            print(f"Person ID {track_id} returned to normal monitoring")
-                            print(f"{'='*70}\n")
-                    
-                    status = "classified"
-                    
-                    # ---- GAIT ANALYSIS (TCN) ----
-                    gait_result = self.gait_analyzer.feed_keypoints(track_id, keypoints)
-                    if gait_result and gait_result['is_abnormal']:
-                        if self.gait_analyzer.should_alert(track_id):
-                            room_name = Config.get_room_name(current_camera_index)
-                            gait_conf = gait_result['confidence']
-                            
-                            print(f"\n{'='*60}")
-                            print(f"ABNORMAL GAIT DETECTED - Person ID {track_id}")
-                            print(f"{'='*60}")
-                            print(f"Location: {room_name}")
-                            print(f"Confidence: {gait_conf:.2%}")
-                            print(f"{'='*60}\n")
-                            
-                            # Log to database
-                            db.log_at_risk_event(
-                                person_id=track_id,
-                                confidence=gait_conf,
-                                location=room_name
-                            )
-                            
-                            # Send push notification
-                            send_expo_push_notification(
-                                "Abnormal Gait Detected",
-                                f"Person ID {track_id} at {room_name} — Confidence: {gait_conf:.0%}"
-                            )
-                            
-                            self.gait_analyzer.mark_alerted(track_id)
+
+                        if _should_log:
+                            print(f"Person ID {track_id}: Fallen REJECTED (low confidence)")
+                            print(f"   Fallen confidence: {fallen_confidence:.2%}")
+
+                        self.rejected_log.append({
+                            'timestamp': time.time(),
+                            'person_id': track_id,
+                            'confidence': fallen_confidence,
+                            'reason': 'very_low_confidence'
+                        })
                 else:
-                    prediction = None
-                    confidence = 0.0
-                    status = "insufficient_keypoints"
-                    
-                    if track_id in self.fall_candidates:
-                        candidate = self.fall_candidates[track_id]
-                        if candidate['start_time'] is not None:
+                    is_raw_fallen = False
+                    confidence_tier = "N/A"
+                    display_state = "normal"
+
+                # Override smoothed prediction for rejected/at-risk falls
+                if raw_prediction == 2 and not is_raw_fallen:
+                    if confidence_tier == "AT_RISK":
+                        pass
+                    else:
+                        prediction = 0  # Override to Standing
+
+                # Check for fall state changes
+                was_fallen = self.fall_states[track_id]['is_fallen']
+
+                # BENDING DETECTION OVERRIDE
+                if is_raw_fallen:
+                    is_bending, bend_conf, reasons = is_bending_posture(keypoints, frame.shape)
+
+                    if is_bending and bend_conf > 0.5:
+                        if _should_log:
+                            print(f"Person ID {track_id}: Detected BENDING (not fallen)")
+                            print(f"  Confidence: {bend_conf:.2f}")
+                            print(f"  Reasons: {', '.join(reasons)}")
+
+                        prediction = 0
+                        confidence = bend_conf
+                        is_raw_fallen = False
+                        confidence_tier = "BENDING"
+                        display_state = "normal"
+
+                # GEOMETRIC FALL HEURISTIC (catches facing-camera falls)
+                # When someone lies facing the camera, the CNN sees a "standing"
+                # skeleton but the bounding box is wide+flat and keypoints are
+                # clustered near the ground.
+                if not is_raw_fallen and raw_prediction != 1:  # Not already fallen, not sitting
+                    box_w = box[2] - box[0]
+                    box_h = box[3] - box[1]
+                    bbox_aspect = box_w / max(box_h, 1)
+
+                    # Keypoint vertical spread: low spread = lying flat
+                    visible_kps = keypoints[keypoints[:, 2] > 0.3]
+                    if len(visible_kps) >= 4:
+                        y_spread = (np.max(visible_kps[:, 1]) - np.min(visible_kps[:, 1])) / max(frame.shape[0], 1)
+                    else:
+                        y_spread = 1.0  # Default to high spread (assume standing)
+
+                    # Wide bbox + low vertical spread + low position = likely fallen
+                    hip_height = check_hip_position(keypoints, frame.shape)
+                    if (bbox_aspect > 1.5 and y_spread < 0.25
+                            and hip_height is not None and hip_height > 0.65):
+                        is_raw_fallen = True
+                        confidence_tier = "GEOMETRIC"
+                        display_state = "normal"
+                        prediction = 2
+                        fallen_confidence = max(fallen_confidence, 0.75)
+
+                        if _should_log:
+                            print(f"Person ID {track_id}: GEOMETRIC FALL DETECTED")
+                            print(f"  BBox aspect: {bbox_aspect:.2f}, Y-spread: {y_spread:.2f}, Hip height: {hip_height:.2f}")
+
+                # TEMPORAL FALL DETECTION
+                current_time = time.time()
+                candidate = self.fall_candidates[track_id]
+
+                if is_raw_fallen:
+                    if was_fallen:
+                        if _should_log:
+                            print(f"Person ID {track_id}: Maintaining FALLEN state")
+
+                    elif candidate['start_time'] is None:
+                        candidate['start_time'] = current_time
+                        candidate['frame_count'] = 1
+                        candidate['consecutive_fallen_frames'] = 1
+
+                        if self.fall_states[track_id]['is_fallen']:
+                            print(f"WARNING: is_fallen was True, forcing False for monitoring")
+                        self.fall_states[track_id]['is_fallen'] = False
+
+                        print(f"\n{'='*60}")
+                        print(f"MONITORING STARTED - Person ID {track_id}")
+                        print(f"{'='*60}")
+                        print(f"Fallen confidence: {fallen_confidence:.2%} (HIGH - >=70%)")
+                        print(f"Confirmation requirements:")
+                        print(f"  Time: {Config.FALL_CONFIRMATION_TIME}s")
+                        print(f"  Frames: {Config.FALL_CONFIRMATION_FRAMES} consecutive")
+                        print(f"Status: MONITORING IN PROGRESS...")
+                        print(f"{'='*60}\n")
+
+                    else:
+                        candidate['frame_count'] += 1
+                        candidate['consecutive_fallen_frames'] += 1
+                        elapsed_time = current_time - candidate['start_time']
+
+                        time_threshold_met = elapsed_time >= Config.FALL_CONFIRMATION_TIME
+                        frames_threshold_met = candidate['consecutive_fallen_frames'] >= Config.FALL_CONFIRMATION_FRAMES
+
+                        if time_threshold_met and frames_threshold_met:
+                            if not self.fall_states[track_id]['is_fallen']:
+                                room_name = Config.get_room_name(current_camera_index)
+                                print(f"{'='*70}")
+                                print(f"CONFIRMED FALL ALERT")
+                                print(f"{'='*70}")
+                                print(f"Person: {display_label} (track_id={track_id})")
+                                print(f"Location: {room_name}")
+                                print(f"Fallen Confidence: {fallen_confidence:.2%}")
+                                print(f"Time Fallen: {elapsed_time:.2f}s")
+                                print(f"")
+
+                                incident_id = db.log_fall_incident(
+                                    person_id=track_id,
+                                    confidence=fallen_confidence,
+                                    location=room_name,
+                                    person_label=display_label,
+                                )
+
+                                if incident_id is None:
+                                    # Person already has an active fall in DB — skip duplicate
+                                    print(f"{display_label}: Active fall already exists in DB, skipping")
+                                else:
+                                    self.fall_states[track_id]['is_fallen'] = True
+                                    self.fall_states[track_id]['incident_id'] = incident_id
+
+                                    print(f"Incident logged (ID: {incident_id})")
+                                    print(f"ALERT TRIGGERED - Caregivers must respond")
+                                    print(f"{'='*70}\n")
+
+                                    # Send push notification to registered devices
+                                    send_expo_push_notification(
+                                        "Fall Detected!",
+                                        f"{display_label} has fallen at {room_name}. Confidence: {fallen_confidence:.0%}"
+                                    )
+                            else:
+                                if _should_log:
+                                    print(f"Person ID {track_id}: Fall already confirmed")
+                        else:
+                            remaining_time = max(0, Config.FALL_CONFIRMATION_TIME - elapsed_time)
+                            remaining_frames = max(0, Config.FALL_CONFIRMATION_FRAMES - candidate['consecutive_fallen_frames'])
+
                             if _should_log:
-                                print(f"Person ID {track_id}: Keypoints lost during monitoring, resetting")
-                            candidate['start_time'] = None
-                            candidate['frame_count'] = 0
-                            candidate['consecutive_fallen_frames'] = 0
+                                print(f"Person ID {track_id}: MONITORING IN PROGRESS")
+                                print(f"   Time: {elapsed_time:.2f}s / {Config.FALL_CONFIRMATION_TIME}s")
+                                print(f"   Frames: {candidate['consecutive_fallen_frames']} / {Config.FALL_CONFIRMATION_FRAMES}")
+
+                else:
+                    if candidate['start_time'] is not None:
+                        elapsed = current_time - candidate['start_time']
+
+                        print(f"\n{'='*60}")
+                        print(f"RECOVERY DETECTED - Person ID {track_id}")
+                        print(f"{'='*60}")
+                        print(f"Fallen duration: {elapsed:.2f}s")
+                        print(f"Result: NO ALERT - Person recovered before confirmation")
+                        print(f"Monitoring: RESET")
+                        print(f"{'='*60}\n")
+
+                        candidate['start_time'] = None
+                        candidate['frame_count'] = 0
+                        candidate['consecutive_fallen_frames'] = 0
+
+                    if was_fallen:
+                        print(f"\n{'='*70}")
+                        print(f"RECOVERY CONFIRMED")
+                        print(f"{'='*70}")
+                        print(f"Person ID: {track_id}")
+                        print(f"Status: Person has stood up and recovered")
+
+                        if self.fall_states[track_id]['incident_id'] is not None:
+                            db.resolve_fall_for_person(track_id)
+                            print(f"Incident {self.fall_states[track_id]['incident_id']} marked as RESOLVED")
+
+                        self.fall_states[track_id]['is_fallen'] = False
+                        self.fall_states[track_id]['incident_id'] = None
+
+                        print(f"Person ID {track_id} returned to normal monitoring")
+                        print(f"{'='*70}\n")
+
+                status = "classified"
+
+                # ---- GAIT ANALYSIS (TCN) ----
+                gait_result = self.gait_analyzer.feed_keypoints(track_id, keypoints)
+                if gait_result and gait_result['is_abnormal']:
+                    if self.gait_analyzer.should_alert(track_id):
+                        room_name = Config.get_room_name(current_camera_index)
+                        gait_conf = gait_result['confidence']
+
+                        print(f"\n{'='*60}")
+                        print(f"ABNORMAL GAIT DETECTED - {display_label} (track_id={track_id})")
+                        print(f"{'='*60}")
+                        print(f"Location: {room_name}")
+                        print(f"Confidence: {gait_conf:.2%}")
+                        print(f"{'='*60}\n")
+
+                        # Log to database
+                        db.log_at_risk_event(
+                            person_id=track_id,
+                            confidence=gait_conf,
+                            location=room_name
+                        )
+
+                        # Send push notification
+                        send_expo_push_notification(
+                            "Abnormal Gait Detected",
+                            f"{display_label} at {room_name} — Confidence: {gait_conf:.0%}"
+                        )
+
+                        self.gait_analyzer.mark_alerted(track_id)
+            else:
+                prediction = None
+                confidence = 0.0
+                status = "insufficient_keypoints"
+
+                if track_id in self.fall_candidates:
+                    candidate = self.fall_candidates[track_id]
+                    if candidate['start_time'] is not None:
+                        if _should_log:
+                            print(f"Person ID {track_id}: Keypoints lost during monitoring, resetting")
+                        candidate['start_time'] = None
+                        candidate['frame_count'] = 0
+                        candidate['consecutive_fallen_frames'] = 0
                 
-                # Get latest gait result for this person (may be None)
-                gait_result_for_det = self.gait_analyzer.get_result(track_id)
+            # Get latest gait result for this person (may be None)
+            gait_result_for_det = self.gait_analyzer.get_result(track_id)
                 
-                detections.append({
-                    'track_id': track_id,
-                    'box': box,
-                    'box_conf': float(box_conf),
-                    'keypoints': keypoints,
-                    'prediction': prediction,
-                    'display_state': display_state if 'display_state' in locals() else "normal",
-                    'confidence': float(confidence),
-                    'confidence_tier': confidence_tier if 'confidence_tier' in locals() else "N/A",
-                    'fallen_confidence': fallen_confidence if 'fallen_confidence' in locals() else 0.0,
-                    'status': status,
-                    'is_fallen': self.fall_states[track_id]['is_fallen'],
-                    'incident_id': self.fall_states[track_id].get('incident_id'),
-                    'visible_count': visible_count,
-                    'gait_status': 'abnormal' if (gait_result_for_det and gait_result_for_det['is_abnormal']) else 'normal',
-                    'gait_confidence': gait_result_for_det['confidence'] if gait_result_for_det else 0.0,
-                })
+            detections.append({
+                'track_id': track_id,
+                'display_label': display_label,
+                'box': box,
+                'box_conf': float(box_conf),
+                'keypoints': keypoints,
+                'prediction': prediction,
+                'display_state': display_state if 'display_state' in locals() else "normal",
+                'confidence': float(confidence),
+                'confidence_tier': confidence_tier if 'confidence_tier' in locals() else "N/A",
+                'fallen_confidence': fallen_confidence if 'fallen_confidence' in locals() else 0.0,
+                'status': status,
+                'is_fallen': self.fall_states[track_id]['is_fallen'],
+                'incident_id': self.fall_states[track_id].get('incident_id'),
+                'visible_count': visible_count,
+                'gait_status': 'abnormal' if (gait_result_for_det and gait_result_for_det['is_abnormal']) else 'normal',
+                'gait_confidence': gait_result_for_det['confidence'] if gait_result_for_det else 0.0,
+            })
         
         # Clean up tracking for people who left the frame
         disappeared_ids = set(self.fall_states.keys()) - current_person_ids
         for person_id in disappeared_ids:
             if self.fall_states[person_id]['is_fallen']:
-                print(f"⚠ Person ID {person_id} with active fall left frame")
+                lbl = self._person_labels.get(person_id, f"Person (track={person_id})")
+                print(f"⚠ {lbl} with active fall left frame")
             del self.fall_states[person_id]
             if person_id in self.prediction_buffers:
                 del self.prediction_buffers[person_id]
             if person_id in self.fall_candidates:
                 del self.fall_candidates[person_id]
             self.gait_analyzer.cleanup_person(person_id)
+            self._face_rec_counters.pop(person_id, None)
+            self._person_labels.pop(person_id, None)
         
         # Update live gait alert count
         self.gait_alert_count = sum(
@@ -2003,6 +2069,7 @@ class FallDetector:
         
         for detection in detections:
             track_id = detection['track_id']
+            display_label = detection.get('display_label', f'Person {track_id}')
             box = detection['box']
             keypoints = detection['keypoints']
             prediction = detection['prediction']
@@ -2019,29 +2086,29 @@ class FallDetector:
             candidate = self.fall_candidates.get(track_id)
             is_monitoring = candidate is not None and candidate.get('start_time') is not None
             
-            # Determine color and label
+            # Determine color and label (use display_label)
             if is_monitoring and not is_fallen:
                 elapsed = current_time - candidate['start_time']
                 remaining = Config.FALL_CONFIRMATION_TIME - elapsed
                 color = (0, 165, 255)  # ORANGE for monitoring
-                label = f"ID {track_id}: MONITORING ({remaining:.1f}s)"
+                label = f"{display_label}: MONITORING ({remaining:.1f}s)"
                 box_thickness = 3
             elif is_fallen:
                 color = (0, 0, 255)  # RED for confirmed fall
-                label = f"ID {track_id}: FALLEN (ALERT)"
+                label = f"{display_label}: FALLEN (ALERT)"
                 box_thickness = 4
             elif display_state == 'at_risk':
                 color = Config.CLASS_COLORS['at_risk']  # ORANGE
-                label = f"ID {track_id}: At Risk ({fallen_confidence:.0%})"
+                label = f"{display_label}: At Risk ({fallen_confidence:.0%})"
                 box_thickness = 2
             elif prediction is not None:
                 color = Config.CLASS_COLORS.get(prediction, (255, 255, 255))
                 class_name = Config.CLASS_NAMES.get(prediction, "Unknown")
-                label = f"ID {track_id}: {class_name} ({confidence:.0%})"
+                label = f"{display_label}: {class_name} ({confidence:.0%})"
                 box_thickness = 2
             else:
                 color = (128, 128, 128)  # GRAY for tracking only
-                label = f"ID {track_id}: Tracking ({visible_count} kpts)"
+                label = f"{display_label}: Tracking ({visible_count} kpts)"
                 box_thickness = 2
             
             # Draw bounding box
@@ -3024,6 +3091,256 @@ def dg_export():
         mimetype='text/plain',
         headers={'Content-Disposition': f'attachment; filename="{filename}"'}
     )
+
+
+# ============================================================================
+# FACE PROFILE ENDPOINTS
+# ============================================================================
+
+@app.route('/api/profiles', methods=['GET'])
+def list_profiles():
+    """List all enrolled face profiles."""
+    if detector and detector.face_recognizer:
+        profiles = detector.face_recognizer.get_all_profiles()
+    else:
+        from database import FaceProfileDB as _FPDB
+        profiles = _FPDB().get_all_profiles()
+    return jsonify({'success': True, 'profiles': profiles, 'count': len(profiles)})
+
+
+@app.route('/api/profiles', methods=['POST'])
+def enroll_profile():
+    """
+    Enroll a face profile.
+
+    Body (JSON): {"name": "Maria", "track_id": 3}
+    The server grabs the latest frame and the bounding box for track_id,
+    extracts the embedding, and saves it.
+    """
+    if detector is None or detector.face_recognizer is None:
+        return jsonify({'success': False, 'error': 'Face recognizer not available'}), 503
+
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    track_id = data.get('track_id')
+
+    if not name:
+        return jsonify({'success': False, 'error': 'name is required'}), 400
+    if track_id is None:
+        return jsonify({'success': False, 'error': 'track_id is required'}), 400
+
+    try:
+        track_id = int(track_id)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'track_id must be an integer'}), 400
+
+    # Grab the latest frame (requires picamera2 active)
+    with camera_lock:
+        if camera is None:
+            return jsonify({'success': False, 'error': 'Camera not available'}), 503
+        try:
+            # We capture an unscaled image directly or take from the latest detection
+            pass
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 503
+
+    # On Pi, it's safer to re-read from frame_buffer or use the latest capture
+    # Actually, we don't have a simple camera.read() on Pi, so we should fetch the current frame from the buffer,
+    # decode it to BGR, and use it.
+    last_frame_bytes, _ = frame_buffer.wait_and_get(-1, timeout=0.1)
+    if not last_frame_bytes:
+        return jsonify({'success': False, 'error': 'No recent frame available'}), 503
+
+    import cv2
+    import numpy as np
+    nparr = np.frombuffer(last_frame_bytes, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        return jsonify({'success': False, 'error': 'Could not decode frame'}), 503
+
+    # Re-detect on the current frame to get a fresh box.
+    raw_dets = detector.detect(frame)
+    box = None
+    for d in raw_dets:
+        if d['track_id'] == track_id:
+            box = d['box']
+            break
+
+    if box is None:
+        return jsonify({'success': False, 'error': f'track_id {track_id} not found in current frame'}), 404
+
+    success = detector.face_recognizer.enroll(name, box, frame)
+    if success:
+        return jsonify({'success': True, 'message': f"Profile '{name}' enrolled successfully"})
+    return jsonify({'success': False, 'error': 'Enrollment failed (no face detected in crop)'}), 422
+
+
+@app.route('/api/profiles/<string:name>', methods=['DELETE'])
+def delete_profile(name):
+    """Delete a named face profile."""
+    if detector and detector.face_recognizer:
+        deleted = detector.face_recognizer.delete_profile(name)
+    else:
+        from database import FaceProfileDB as _FPDB
+        deleted = _FPDB().delete_profile(name)
+
+    if deleted:
+        return jsonify({'success': True, 'message': f"Profile '{name}' deleted"})
+    return jsonify({'success': False, 'error': f"Profile '{name}' not found"}), 404
+
+
+@app.route('/api/profiles/reload', methods=['POST'])
+def reload_profiles():
+    """Force-reload face profiles from the database (e.g. after remote edits)."""
+    if detector and detector.face_recognizer:
+        detector.face_recognizer.reload_profiles()
+        return jsonify({'success': True, 'message': 'Profiles reloaded'})
+    return jsonify({'success': False, 'error': 'Face recognizer not available'}), 503
+
+
+@app.route('/api/profiles/enroll-image', methods=['POST'])
+def enroll_profile_from_image():
+    """
+    Enroll a face profile from a base64-encoded JPEG image.
+
+    Body (JSON):
+        {
+            "name":  "Maria",
+            "image": "<base64-encoded JPEG bytes>"
+        }
+    """
+    import base64
+
+    face_rec = detector.face_recognizer if (detector and detector.face_recognizer) else None
+    if face_rec is None:
+        try:
+            face_rec = FaceRecognizer(is_pi=True)
+        except Exception as _e:
+            return jsonify({'success': False, 'error': f'Face recognizer not available: {_e}'}), 503
+
+    if not face_rec.enabled:
+        return jsonify({'success': False, 'error': 'InsightFace not installed on this server'}), 503
+
+    data = request.get_json() or {}
+    name  = (data.get('name') or '').strip()
+    b64   = (data.get('image') or '').strip()
+
+    if not name:
+        return jsonify({'success': False, 'error': 'name is required'}), 400
+    if not b64:
+        return jsonify({'success': False, 'error': 'image (base64) is required'}), 400
+
+    if ',' in b64:
+        b64 = b64.split(',', 1)[1]
+
+    try:
+        img_bytes = base64.b64decode(b64)
+        img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("cv2.imdecode returned None — unsupported format?")
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Could not decode image: {e}'}), 400
+
+    emb = face_rec.extract_embedding(frame)
+    if emb is None:
+        return jsonify({
+            'success': False,
+            'error': 'No face detected in the provided image. Please retake the photo.',
+            'hint': 'Ensure the face is well-lit, centered, and clearly visible.'
+        }), 422
+
+    profile_id = face_rec.face_db.add_or_update_profile(name, emb)
+    if profile_id > 0:
+        if detector and detector.face_recognizer and detector.face_recognizer is not face_rec:
+            detector.face_recognizer.reload_profiles()
+        return jsonify({
+            'success': True,
+            'message': f"Profile '{name}' enrolled successfully",
+            'profile_id': profile_id,
+        })
+    return jsonify({'success': False, 'error': 'Failed to save profile to database'}), 500
+
+
+@app.route('/api/profiles/enroll-image/multi', methods=['POST'])
+def enroll_profile_multi_angle():
+    """
+    Enroll a face profile from multiple base64-encoded JPEG images.
+
+    Body (JSON):
+        {
+            "name":   "Maria",
+            "images": ["<base64 JPEG>", "<base64 JPEG>", ...]
+        }
+    """
+    import base64
+
+    face_rec = detector.face_recognizer if (detector and detector.face_recognizer) else None
+    if face_rec is None:
+        try:
+            face_rec = FaceRecognizer(is_pi=True)
+        except Exception as _e:
+            return jsonify({'success': False, 'error': f'Face recognizer not available: {_e}'}), 503
+
+    if not face_rec.enabled:
+        return jsonify({'success': False, 'error': 'InsightFace not installed on this server'}), 503
+
+    data   = request.get_json() or {}
+    name   = (data.get('name') or '').strip()
+    images = data.get('images') or []
+
+    if not name:
+        return jsonify({'success': False, 'error': 'name is required'}), 400
+    if not images:
+        return jsonify({'success': False, 'error': 'images list is required'}), 400
+
+    embeddings = []
+    failed     = 0
+
+    for b64 in images:
+        b64 = (b64 or '').strip()
+        if ',' in b64:
+            b64 = b64.split(',', 1)[1]
+        try:
+            img_bytes = base64.b64decode(b64)
+            img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            if frame is None:
+                failed += 1
+                continue
+            emb = face_rec.extract_embedding(frame)
+            if emb is not None:
+                embeddings.append(emb)
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+    if not embeddings:
+        return jsonify({
+            'success': False,
+            'error': f'No faces detected in any of the {len(images)} images.',
+            'hint': 'Ensure each photo shows a clear, well-lit face.'
+        }), 422
+
+    avg_emb  = np.mean(embeddings, axis=0)
+    norm_val = np.linalg.norm(avg_emb)
+    if norm_val > 1e-8:
+        avg_emb = avg_emb / norm_val
+
+    profile_id = face_rec.face_db.add_or_update_profile(name, avg_emb)
+    if profile_id > 0:
+        if detector and detector.face_recognizer and detector.face_recognizer is not face_rec:
+            detector.face_recognizer.reload_profiles()
+        return jsonify({
+            'success': True,
+            'message': f"Profile '{name}' enrolled from {len(embeddings)}/{len(images)} images",
+            'profile_id': profile_id,
+            'embeddings_used': len(embeddings),
+            'embeddings_failed': failed,
+        })
+    return jsonify({'success': False, 'error': 'Failed to save profile to database'}), 500
 
 
 # ============================================================================

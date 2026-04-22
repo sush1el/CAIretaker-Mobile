@@ -59,6 +59,10 @@ export const API_CONFIG = {
     DATA_GATHERING_EXPORT: '/api/data-gathering/export',
     // Push token registration on the camera server
     PUSH_TOKEN_CAMERA: '/api/push-token',
+    // Face Profiling (camera server)
+    PROFILES: '/api/profiles',
+    PROFILES_ENROLL_IMAGE: '/api/profiles/enroll-image',
+    PROFILES_ENROLL_MULTI: '/api/profiles/enroll-image/multi',
   },
   TIMEOUT: 10000, // 10 seconds
 };
@@ -420,6 +424,50 @@ class APIService {
     return this.cameraRequest(API_CONFIG.ENDPOINTS.PUSH_TOKEN_CAMERA, {
       method: 'POST',
       body: JSON.stringify({ token }),
+    });
+  }
+
+  // ==================== FACE PROFILING METHODS ====================
+
+  /** Fetch all enrolled face profiles from the camera server. */
+  async getProfiles() {
+    return this.cameraRequest(`${API_CONFIG.ENDPOINTS.PROFILES}?_t=${Date.now()}`, {
+      method: 'GET',
+    });
+  }
+
+  /**
+   * Enroll a face profile using a single base64-encoded JPEG image.
+   * @param {string} name  - Display name for the resident
+   * @param {string} image - Base64-encoded JPEG (may include data: URI prefix)
+   */
+  async enrollProfileFromImage(name, image) {
+    return this.cameraRequest(API_CONFIG.ENDPOINTS.PROFILES_ENROLL_IMAGE, {
+      method: 'POST',
+      body: JSON.stringify({ name, image }),
+    });
+  }
+
+  /**
+   * Enroll a face profile from multiple images (different angles).
+   * The server averages all successfully extracted embeddings.
+   * @param {string}   name   - Display name for the resident
+   * @param {string[]} images - Array of base64-encoded JPEGs
+   */
+  async enrollProfileMultiAngle(name, images) {
+    return this.cameraRequest(API_CONFIG.ENDPOINTS.PROFILES_ENROLL_MULTI, {
+      method: 'POST',
+      body: JSON.stringify({ name, images }),
+    });
+  }
+
+  /**
+   * Delete an enrolled face profile by name.
+   * @param {string} name - Profile name to delete
+   */
+  async deleteProfile(name) {
+    return this.cameraRequest(`${API_CONFIG.ENDPOINTS.PROFILES}/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
     });
   }
 }

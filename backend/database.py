@@ -93,7 +93,8 @@ def init_db():
             status TEXT DEFAULT 'active',
             type TEXT DEFAULT 'fall',
             resolved_at REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            person_label TEXT
         )
     ''')
 
@@ -102,9 +103,21 @@ def init_db():
     add_column_if_missing('fall_incidents', 'type', "TEXT DEFAULT 'fall'")
     add_column_if_missing('fall_incidents', 'resolved_at', 'REAL')
     add_column_if_missing('fall_incidents', 'created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+    add_column_if_missing('fall_incidents', 'person_label', 'TEXT')
 
     cursor.execute("UPDATE fall_incidents SET status = 'active' WHERE status IS NULL")
     cursor.execute("UPDATE fall_incidents SET type = 'fall' WHERE type IS NULL")
+
+    # Face profiles table — stores one embedding per named person
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS face_profiles (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL UNIQUE,
+            embedding  BLOB NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     
     # Create default Super Admin if not exists
     cursor.execute('SELECT id FROM users WHERE role = ?', ('super_admin',))
@@ -476,6 +489,7 @@ class FallIncidentDB:
             'status': row['status'],
             'type': row['type'],
             'resolved_at': row['resolved_at'],
+            'person_label': row['person_label'] if 'person_label' in row.keys() else None,
         }
 
     # ---------- check for active fall ----------
@@ -492,10 +506,11 @@ class FallIncidentDB:
             conn.close()
 
     # ---------- log a new fall ----------
-    def log_fall_incident(self, person_id, confidence, location):
+    def log_fall_incident(self, person_id, confidence, location, person_label=None):
         """
         Log a new fall incident.
         Returns the incident id, or None if the person already has an active fall.
+        person_label: optional human-readable name (e.g. "Maria" or "Person 1")
         """
         if self.has_active_fall(person_id):
             print(f"DB: Person {person_id} already has an active fall — skipping duplicate log")
@@ -505,13 +520,15 @@ class FallIncidentDB:
         conn = self._get_conn()
         try:
             cur = conn.execute(
-                '''INSERT INTO fall_incidents (person_id, confidence, location, timestamp, status, type)
-                   VALUES (?, ?, ?, ?, 'active', 'fall')''',
-                (person_id, confidence, location, _time.time())
+                '''INSERT INTO fall_incidents
+                       (person_id, confidence, location, timestamp, status, type, person_label)
+                   VALUES (?, ?, ?, ?, 'active', 'fall', ?)''',
+                (person_id, confidence, location, _time.time(), person_label)
             )
             conn.commit()
             incident_id = cur.lastrowid
-            print(f"DB: Fall incident {incident_id} logged for person {person_id}")
+            lbl = f" ({person_label})" if person_label else ""
+            print(f"DB: Fall incident {incident_id} logged for person {person_id}{lbl}")
             return incident_id
         except Exception as e:
             print(f"DB ERROR (log_fall_incident): {e}")
@@ -639,3 +656,150 @@ class FallIncidentDB:
 # Initialize database when module is imported
 if __name__ == '__main__':
     init_db()
+
+
+# ==================== FACE PROFILE OPERATIONS ====================
+
+class FaceProfileDB:
+    """
+    SQLite-backed store for named face embeddings (MobileFaceNet / InsightFace).
+
+    Each profile holds:
+    - name:      human-readable label (unique)
+    - embedding: float32 numpy array serialised as raw bytes (BLOB)
+
+    Recognition is performed by cosine-similarity comparison against all
+    stored embeddings. The match is returned when similarity >= threshold.
+    """
+
+    def __init__(self, db_path=None, threshold: float = 0.40):
+        self.db_path   = db_path or Config.DATABASE_PATH
+        self.threshold = threshold
+        # In-memory cache: name -> np.ndarray embedding
+        self._cache: dict = {}
+        # Ensure the table exists and populate cache
+        init_db()
+        self._load_cache()
+
+    # ------------------------------------------------------------------ #
+    # Private helpers                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _load_cache(self):
+        """Reload all embeddings from DB into memory."""
+        import numpy as np
+        conn = self._get_conn()
+        try:
+            rows = conn.execute('SELECT name, embedding FROM face_profiles').fetchall()
+            self._cache = {
+                row['name']: np.frombuffer(row['embedding'], dtype=np.float32).copy()
+                for row in rows
+            }
+            print(f"[FaceProfileDB] Loaded {len(self._cache)} face profile(s) into cache")
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _cosine_similarity(a, b):
+        """Cosine similarity between two 1-D vectors (range -1 to 1)."""
+        import numpy as np
+        denom = np.linalg.norm(a) * np.linalg.norm(b)
+        if denom < 1e-8:
+            return 0.0
+        return float(np.dot(a, b) / denom)
+
+    # ------------------------------------------------------------------ #
+    # Public API                                                           #
+    # ------------------------------------------------------------------ #
+
+    def get_all_profiles(self) -> list:
+        """Return list of {id, name} dicts (embedding excluded for network efficiency)."""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                'SELECT id, name, created_at, updated_at FROM face_profiles ORDER BY name'
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def add_or_update_profile(self, name: str, embedding) -> int:
+        """
+        Insert or replace a face profile.
+        embedding: numpy float32 array of shape (N,)
+        Returns the row id.
+        """
+        import numpy as np
+        emb = np.array(embedding, dtype=np.float32)
+        blob = emb.tobytes()
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                '''INSERT INTO face_profiles (name, embedding, updated_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(name) DO UPDATE SET
+                       embedding   = excluded.embedding,
+                       updated_at  = CURRENT_TIMESTAMP''',
+                (name, blob)
+            )
+            conn.commit()
+            profile_id = cur.lastrowid or conn.execute(
+                'SELECT id FROM face_profiles WHERE name = ?', (name,)
+            ).fetchone()['id']
+            self._cache[name] = emb
+            print(f"[FaceProfileDB] Profile '{name}' saved (id={profile_id})")
+            return profile_id
+        except Exception as e:
+            print(f"[FaceProfileDB] ERROR add_or_update_profile: {e}")
+            return -1
+        finally:
+            conn.close()
+
+    def delete_profile(self, name: str) -> bool:
+        """Delete a profile by name. Returns True if a row was deleted."""
+        conn = self._get_conn()
+        try:
+            cur = conn.execute('DELETE FROM face_profiles WHERE name = ?', (name,))
+            conn.commit()
+            self._cache.pop(name, None)
+            deleted = cur.rowcount > 0
+            if deleted:
+                print(f"[FaceProfileDB] Profile '{name}' deleted")
+            return deleted
+        except Exception as e:
+            print(f"[FaceProfileDB] ERROR delete_profile: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def find_match(self, embedding) -> tuple:
+        """
+        Compare embedding against all stored profiles.
+
+        Returns:
+            (name, similarity)  if best match >= self.threshold
+            (None, 0.0)         if no match found or cache is empty
+        """
+        if not self._cache:
+            return None, 0.0
+
+        best_name = None
+        best_sim  = -1.0
+        for name, stored_emb in self._cache.items():
+            sim = self._cosine_similarity(embedding, stored_emb)
+            if sim > best_sim:
+                best_sim  = sim
+                best_name = name
+
+        if best_sim >= self.threshold:
+            return best_name, best_sim
+        return None, best_sim
+
+    def reload(self):
+        """Force-reload embeddings from DB (call after external edits)."""
+        self._load_cache()

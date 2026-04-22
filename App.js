@@ -42,6 +42,7 @@ import Settings from './src/pages/Settings';
 import LiveView from './src/pages/LiveView';
 import Logs from './src/pages/Logs';
 import UserManagement from './src/pages/UserManagement';
+import Profiling from './src/pages/Profiling';
 
 // Services
 import api from './src/services/api';
@@ -286,6 +287,8 @@ function MainApp() {
         return <Logs />;
       case 'UserManagement':
         return <UserManagement />;
+      case 'Profiling':
+        return <Profiling />;
       default:
         return <Home setScreen={setCurrentScreen} setMonitoringRoom={setMonitoringRoom} />;
     }

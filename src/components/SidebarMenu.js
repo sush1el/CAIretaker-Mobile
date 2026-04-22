@@ -2,7 +2,7 @@ import React from 'react';
 import { View, Text, TouchableOpacity, Modal, ScrollView, Image, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
-import { faHouse, faChartBar, faCamera, faCircleQuestion, faGear, faRightFromBracket, faUsers } from '@fortawesome/free-solid-svg-icons';
+import { faHouse, faChartBar, faCamera, faCircleQuestion, faGear, faRightFromBracket, faUsers, faIdCard } from '@fortawesome/free-solid-svg-icons';
 import { useTheme } from '../context/ThemeContext';
 
 const SidebarMenu = ({ isOpen, onClose, setScreen, onLogoutPress, userRole = 'user' }) => {
@@ -13,18 +13,19 @@ const SidebarMenu = ({ isOpen, onClose, setScreen, onLogoutPress, userRole = 'us
     { id: 1, icon: faHouse, label: 'Home', screen: 'Home' },
     { id: 2, icon: faChartBar, label: 'System Logs', screen: 'Logs' },
     { id: 3, icon: faCamera, label: 'Cameras', screen: 'Cameras' },
-    { id: 4, icon: faCircleQuestion, label: 'FAQs', screen: 'FAQs' },
-    { id: 5, icon: faGear, label: 'Settings', screen: 'Settings' },
+    { id: 4, icon: faIdCard, label: 'Face Profiling', screen: 'Profiling' },
+    { id: 5, icon: faCircleQuestion, label: 'FAQs', screen: 'FAQs' },
+    { id: 6, icon: faGear, label: 'Settings', screen: 'Settings' },
   ];
   
   // Additional menu items for super admin
   const adminMenuItems = [
-    { id: 6, icon: faUsers, label: 'User Management', screen: 'UserManagement' },
+    { id: 7, icon: faUsers, label: 'User Management', screen: 'UserManagement' },
   ];
   
   // Combine menu items based on user role
   const menuItems = userRole === 'super_admin' 
-    ? [...baseMenuItems.slice(0, 4), ...adminMenuItems, baseMenuItems[4]] 
+    ? [...baseMenuItems.slice(0, 5), ...adminMenuItems, baseMenuItems[5]] 
     : baseMenuItems;
 
   return (

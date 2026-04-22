@@ -381,6 +381,48 @@ def get_profile():
     else:
         return jsonify(result), 404
 
+
+# ==================== FACE PROFILING ENDPOINTS ====================
+
+@app.route('/api/profiles', methods=['GET'])
+@jwt_required()
+def get_face_profiles():
+    """Get all enrolled face profiles from the database."""
+    from database import FaceProfileDB
+    db = FaceProfileDB()
+    profiles = db.get_all_profiles()
+    return jsonify({
+        'success': True,
+        'profiles': profiles,
+        'count': len(profiles)
+    })
+
+@app.route('/api/profiles/<string:name>', methods=['DELETE'])
+@jwt_required()
+def delete_face_profile(name):
+    """Delete a named face profile."""
+    from database import FaceProfileDB
+    import requests
+    db = FaceProfileDB()
+    deleted = db.delete_profile(name)
+    
+    if deleted:
+        # Try to tell the active detector to reload its cache
+        try:
+            # Try PC server port
+            requests.post('http://localhost:5001/api/profiles/reload', timeout=0.5)
+        except:
+            pass
+        try:
+            # Try Pi server port
+            requests.post('http://localhost:5002/api/profiles/reload', timeout=0.5)
+        except:
+            pass
+            
+        return jsonify({'success': True, 'message': f"Profile '{name}' deleted"})
+    else:
+        return jsonify({'success': False, 'error': f"Profile '{name}' not found"}), 404
+
 # ==================== USER MANAGEMENT ENDPOINTS (Super Admin Only) ====================
 
 def require_super_admin():
