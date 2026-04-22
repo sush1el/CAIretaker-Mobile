@@ -644,35 +644,34 @@ class FallDetector:
         
         return normalized
     
-    def _get_display_label(self, track_id: int, slot_index: int, box, frame) -> str:
+    def _get_display_label(self, track_id: int, slot_index: int, box, frame, keypoints=None) -> str:
         """
         Resolve the display label for a tracked person.
 
         slot_index: 1-based position of this person in the current frame's
-                    detection list (resets every frame — never exceeds the
-                    number of people currently visible).
+                    detection list.
 
         Logic:
           1. Every FACE_RECOGNITION_INTERVAL frames, re-run InsightFace.
           2. If recognised → store name in self._person_labels[track_id].
-          3. If not recognised (yet) → fall back to "Person {slot_index}".
+          3. If not recognised, we DO NOT clear it! As long as YOLO tracks them,
+             we remember who they are even if they turn around.
         """
         slot_label = f"Person {slot_index}"
 
         if self.face_recognizer is None or not self.face_recognizer.enabled:
-            return slot_label
+            return self._person_labels.get(track_id, slot_label)
 
         counter = self._face_rec_counters.get(track_id, 0) + 1
         self._face_rec_counters[track_id] = counter
 
         if counter >= Config.FACE_RECOGNITION_INTERVAL:
             self._face_rec_counters[track_id] = 0
-            label, is_known, _sim = self.face_recognizer.identify(box, frame)
+            label, is_known, _sim = self.face_recognizer.identify(box, frame, keypoints=keypoints)
             if is_known:
                 self._person_labels[track_id] = label
-            else:
-                # Clear stale name if person is no longer recognised
-                self._person_labels.pop(track_id, None)
+            # Notice: We removed the 'else: pop()' block.
+            # Once YOLO tracks an ID and we tag it, we keep it tagged until they leave the frame!
 
         return self._person_labels.get(track_id, slot_label)
 
@@ -709,7 +708,7 @@ class FallDetector:
 
                 for slot_index, (idx, keypoints, box, box_conf, track_id) in enumerate(frame_persons, start=1):
                     # Resolve slot-based display label with optional face recognition
-                    display_label = self._get_display_label(track_id, slot_index, box, frame)
+                    display_label = self._get_display_label(track_id, slot_index, box, frame, keypoints=keypoints)
 
                     current_person_ids.add(track_id)
                     

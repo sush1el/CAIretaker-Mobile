@@ -333,7 +333,7 @@ class Config:
 
     # ---- FACE RECOGNITION ----
     FACE_RECOGNITION_ENABLED   = True
-    FACE_RECOGNITION_THRESHOLD = 0.40   # cosine similarity cutoff
+    FACE_RECOGNITION_THRESHOLD = 0.30   # cosine similarity cutoff
     FACE_RECOGNITION_INTERVAL  = 10     # run every N frames per track_id (Pi CPU budget)
     
     # Camera to Room Name Mapping
@@ -1644,7 +1644,7 @@ class FallDetector:
         
         return normalized
 
-    def _get_display_label(self, track_id: int, slot_index: int, box, frame) -> str:
+    def _get_display_label(self, track_id: int, slot_index: int, box, frame, keypoints=None) -> str:
         """
         Resolve the display label for a tracked person.
         slot_index: 1-based position in the current frame's detection list.
@@ -1652,18 +1652,18 @@ class FallDetector:
         slot_label = f"Person {slot_index}"
 
         if self.face_recognizer is None or not self.face_recognizer.enabled:
-            return slot_label
+            return self._person_labels.get(track_id, slot_label)
 
         counter = self._face_rec_counters.get(track_id, 0) + 1
         self._face_rec_counters[track_id] = counter
 
         if counter >= Config.FACE_RECOGNITION_INTERVAL:
             self._face_rec_counters[track_id] = 0
-            label, is_known, _sim = self.face_recognizer.identify(box, frame)
+            label, is_known, _sim = self.face_recognizer.identify(box, frame, keypoints=keypoints)
             if is_known:
                 self._person_labels[track_id] = label
-            else:
-                self._person_labels.pop(track_id, None)
+            # Notice: We removed the 'else: pop()' block.
+            # Once YOLO tracks an ID and we tag it, we keep it tagged until they leave the frame!
 
         return self._person_labels.get(track_id, slot_label)
     
@@ -1693,7 +1693,7 @@ class FallDetector:
 
         for slot_index, (idx, hailo_det, box, box_conf, keypoints, track_id) in enumerate(frame_persons, start=1):
             # Resolve slot-based display label (with optional face recognition)
-            display_label = self._get_display_label(track_id, slot_index, box, frame)
+            display_label = self._get_display_label(track_id, slot_index, box, frame, keypoints=keypoints)
                 
             current_person_ids.add(track_id)
                 

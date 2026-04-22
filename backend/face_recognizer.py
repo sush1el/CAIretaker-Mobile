@@ -48,7 +48,7 @@ from database import FaceProfileDB
 # Helper: face crop from person bounding box
 # ---------------------------------------------------------------------------
 
-def _crop_face_region(frame, box_xyxy, face_fraction: float = 0.35):
+def _crop_face_region(frame, box_xyxy, keypoints=None, face_fraction: float = 0.35):
     """
     Crop the upper face_fraction of a person bounding box.
 
@@ -59,7 +59,8 @@ def _crop_face_region(frame, box_xyxy, face_fraction: float = 0.35):
     Args:
         frame:         BGR numpy array — full camera frame
         box_xyxy:      (x1, y1, x2, y2) in pixels
-        face_fraction: fraction of bbox height to take as face region
+        keypoints:     Optional YOLO keypoints for this person (num_kps, 3)
+        face_fraction: fallback fraction if keypoints not provided
 
     Returns:
         crop_bgr: numpy array or None if crop too small
@@ -77,7 +78,29 @@ def _crop_face_region(frame, box_xyxy, face_fraction: float = 0.35):
     if box_h < 20 or box_w < 10:
         return None
 
-    # Take upper face_fraction of height; full width
+    # Use keypoints if available (0: nose, 1: left eye, 2: right eye, 3: left ear, 4: right ear)
+    if keypoints is not None and len(keypoints) >= 5:
+        # Check if nose (0) or eyes (1, 2) are visible (conf > 0.3)
+        face_kps = [kp for kp in keypoints[0:5] if kp[2] > 0.3]
+        if face_kps:
+            # Center of the face based on visible face keypoints
+            avg_y = sum(kp[1] for kp in face_kps) / len(face_kps)
+            
+            # Use the box width to determine a reasonable crop height (faces are roughly square/slightly tall)
+            # We take a square crop centered around the face keypoints
+            crop_size = max(60, int(box_w * 1.2))  # Ensure minimum size
+            
+            cy = int(avg_y)
+            cy_start = max(y1, cy - crop_size // 2)
+            cy_end = min(y2, cy + crop_size // 2)
+            
+            # If the crop is reasonably sized, use it
+            if cy_end - cy_start >= 20:
+                crop = frame[cy_start:cy_end, x1:x2]
+                if crop.size > 0:
+                    return crop
+
+    # Fallback: Take upper face_fraction of height; full width
     face_y2 = y1 + max(20, int(box_h * face_fraction))
     face_y2 = min(face_y2, y2)
 
@@ -207,13 +230,14 @@ class FaceRecognizer:
     # Identification                                                        #
     # ------------------------------------------------------------------ #
 
-    def identify(self, box_xyxy, frame) -> tuple:
+    def identify(self, box_xyxy, frame, keypoints=None) -> tuple:
         """
         Attempt to identify the person inside box_xyxy.
 
         Args:
-            box_xyxy: (x1, y1, x2, y2) person bounding box in pixels
-            frame:    full BGR camera frame
+            box_xyxy:  (x1, y1, x2, y2) person bounding box in pixels
+            frame:     full BGR camera frame
+            keypoints: optional YOLO keypoints
 
         Returns:
             (label, is_known, similarity)
@@ -224,7 +248,7 @@ class FaceRecognizer:
         if not self.enabled:
             return None, False, 0.0
 
-        crop = _crop_face_region(frame, box_xyxy)
+        crop = _crop_face_region(frame, box_xyxy, keypoints)
         if crop is None:
             return None, False, 0.0
 
@@ -234,6 +258,13 @@ class FaceRecognizer:
 
         name, sim = self.face_db.find_match(emb)
         is_known   = name is not None
+        
+        # Debug logging to help understand why recognition might be failing
+        if name:
+            print(f"[FaceRecognizer] Match: {name} (sim: {sim:.3f})")
+        else:
+            print(f"[FaceRecognizer] No match (best sim: {sim:.3f})")
+            
         return name, is_known, float(sim)
 
     # ------------------------------------------------------------------ #

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView, Vibration, Modal, StatusBar, useWindowDimensions } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView, Vibration, Modal, StatusBar, useWindowDimensions, Alert } from 'react-native';
 import { FontAwesomeIcon } from '@fortawesome/react-native-fontawesome';
 import { faCamera, faChevronLeft, faChevronRight, faRefresh, faVideoCamera, faExclamationTriangle, faChartBar, faExpand, faCompress } from '@fortawesome/free-solid-svg-icons';
 import { WebView } from 'react-native-webview';
@@ -20,6 +20,7 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
   const [fallLogs, setFallLogs] = useState([]); // Persistent fall event logs
   const [isFullscreen, setIsFullscreen] = useState(false);
   const vibrationActiveRef = useRef(false);
+  const recognizedAlertsRef = useRef(new Set());
 
   const liveFps = Number.isFinite(Number(cameraStatus?.fps))
     ? Number(cameraStatus.fps).toFixed(1)
@@ -155,6 +156,26 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
               }
             }
           });
+
+          // Check for recognized profiles to show a testing modal/alert
+          result.data.detections.forEach(detection => {
+            const label = detection.label || '';
+            const trackId = detection.id || detection.track_id;
+            
+            // A profile is recognized if the label exists and is not just "Person X" or "Unknown"
+            if (label && !label.startsWith('Person') && !label.startsWith('Unknown')) {
+              // Only alert once per trackId/label combination to avoid spam
+              const alertKey = `${trackId}-${label}`;
+              if (!recognizedAlertsRef.current.has(alertKey)) {
+                recognizedAlertsRef.current.add(alertKey);
+                Alert.alert(
+                  'Profile Recognized (Test)',
+                  `Identified as: ${label}`,
+                  [{ text: 'OK' }]
+                );
+              }
+            }
+          });
         }
       } else {
         setCameraStatus(null);
@@ -202,6 +223,7 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
 
       return {
         trackId: trackId,
+        label: detection.label || `Person ${trackId}`,
         status: status,
         isFall: detection.is_fall || detection.is_fallen,
         isGaitAlert: detection.gait_status === 'abnormal',
@@ -225,6 +247,7 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
     const liveData = currentDetections.map(detection => ({
       id: detection.trackId,
       trackId: detection.trackId,
+      label: detection.label,
       status: detection.status,
       isLive: true,
       isFall: detection.isFall,
@@ -244,6 +267,7 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
     const fallData = fallLogs.map(log => ({
       id: log.id,
       trackId: log.trackId,
+      label: `Person ${log.trackId}`, // fallback for historical
       status: log.status,
       isLive: false,
       isFall: true,
@@ -439,7 +463,7 @@ export default function LiveView({ monitoringRoom, setMonitoringRoom }) {
                 return (
                   <View key={`${item.trackId}-${item.id}-${index}`} style={styles.tableRow}>
                     <View style={styles.columnSmall}>
-                      <Text style={styles.idText}>{item.trackId}</Text>
+                      <Text style={styles.idText} numberOfLines={1}>{item.label || item.trackId}</Text>
                     </View>
                     <View style={styles.columnCenter}>
                       <View style={[styles.statusBadge, { backgroundColor: statusStyle.bg }]}>
@@ -518,7 +542,7 @@ const styles = StyleSheet.create({
   tableRow: { flexDirection: 'row', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#F0F0F0', alignItems: 'center' },
   liveRow: { backgroundColor: '#E8F5E9' },
   tableText: { fontSize: 12, color: '#1E3A5F' },
-  columnSmall: { width: 50, alignItems: 'center', justifyContent: 'center' },
+  columnSmall: { width: 80, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 5 },
   columnCenter: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   idText: { fontSize: 12, color: '#1E3A5F', fontWeight: 'bold' },
   statusBadge: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 12 },
