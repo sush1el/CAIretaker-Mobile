@@ -300,12 +300,15 @@ class Config:
     TRACKER_MAX_AGE = 30           # Frames before unmatched track is deleted
     
     # TCN GAIT ANALYSIS SETTINGS
-    TCN_MODEL_PATH = os.path.join(BASE_DIR, "models", "tcn_gait_model.onnx")
-    TCN_WINDOW = 60               # Frames per analysis window (must match training)
-    TCN_STRIDE = 15               # Frames between analysis attempts
+    TCN_MODEL_PATH = os.getenv(
+        "TCN_MODEL_PATH",
+        os.path.join(BASE_DIR, "models", "tcn_gait_model_v3.onnx")
+    )
+    TCN_WINDOW = 90               # Frames per analysis window (must match training)
+    TCN_STRIDE = 10               # Frames between analysis attempts
     TCN_THRESHOLD = _get_env_float("TCN_THRESHOLD", 0.50)  # Abnormal-class probability threshold
     TCN_ALERT_COOLDOWN = 30       # Seconds between repeat gait alerts per person
-    TCN_IN_CHANNELS = 34          # 17 keypoints * 2 (x, y) — matches training
+    TCN_IN_CHANNELS = 119         # 17 keypoints * 7 features (x,y,dx,dy,ddx,ddy,conf)
     TCN_LEFT_HIP_IDX = 11         # COCO keypoint index for left hip
     TCN_RIGHT_HIP_IDX = 12        # COCO keypoint index for right hip
     TCN_MOTION_THRESHOLD = 15.0   # Min net hip displacement (px) over window to count as "walking"
@@ -1278,16 +1281,18 @@ db = FallIncidentDB()
 # ============================================================================
 
 class GaitAnalyzer:
-    """Real-time gait analysis using the TCN model exported by train_tcn_v2.py.
+    """Real-time gait analysis using the TCN model exported by train_tcn_v3.py.
     
     For each tracked person, maintains a rolling buffer of keypoints.
     When the buffer reaches TCN_WINDOW frames, runs ONNX inference to
     classify gait as Normal (0) or Abnormal (1).
     
-    Uses the EXACT same normalization as training:
+        Uses the same feature construction as training:
     - Hip-centered: subtract hip midpoint from all keypoints
     - Scale-invariant: divide by inter-hip distance
-    - Input shape: (1, 34, 60) = (batch, channels, time)
+        - Feature channels per frame: 17 * 7 = 119
+            (x, y, dx, dy, ddx, ddy, confidence)
+        - Input shape: (1, 119, 90) = (batch, channels, time)
     """
     
     # Exponential Moving Average factor for keypoint smoothing.
@@ -1307,6 +1312,8 @@ class GaitAnalyzer:
         threshold = Config.TCN_THRESHOLD
         candidates = [
             os.path.join(os.path.dirname(onnx_path), "config.json"),
+            os.path.join(os.path.dirname(onnx_path), "config_v3.json"),
+            os.path.join(os.path.dirname(onnx_path), "metrics_summary_v3.json"),
             os.path.splitext(onnx_path)[0] + ".json",
         ]
 
@@ -1317,6 +1324,8 @@ class GaitAnalyzer:
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
                 val = cfg.get("best_threshold", None)
+                if val is None:
+                    val = cfg.get("threshold", None)
                 if val is None:
                     continue
                 val = float(val)
@@ -1333,10 +1342,11 @@ class GaitAnalyzer:
         self.enabled = False
         self.session = None
         self.input_name = None
+        self.model_path = None
         self.threshold = Config.TCN_THRESHOLD
         
         # Per-person state
-        self.keypoint_buffers = {}     # track_id -> deque of (17, 2) arrays
+        self.keypoint_buffers = {}     # track_id -> deque of (17, 3) arrays [x,y,conf]
         self.frame_counters = {}       # track_id -> frames since last analysis
         self.last_alert_time = {}      # track_id -> timestamp of last alert
         self.gait_results = {}         # track_id -> {'is_abnormal': bool, 'confidence': float}
@@ -1347,26 +1357,35 @@ class GaitAnalyzer:
             print("[GaitAnalyzer] ONNX Runtime not available — gait analysis disabled")
             return
         
-        if not os.path.exists(onnx_path):
+        model_candidates = [
+            onnx_path,
+            os.path.join(Config.BASE_DIR, "models", "tcn_gait_model_v3.onnx"),
+            os.path.join(Config.BASE_DIR, "models", "tcn_gait_model.onnx"),
+        ]
+        resolved_model_path = next((p for p in model_candidates if os.path.exists(p)), None)
+
+        if resolved_model_path is None:
             print(f"[GaitAnalyzer] Model not found at: {onnx_path}")
             print(f"               Gait analysis disabled (fall detection unaffected)")
-            print(f"               Train with train_tcn_v2.py and copy tcn_gait_model.onnx to backend/models/")
+            print(f"               Train with train_tcn_v3.py and copy tcn_gait_model_v3.onnx to backend/models/")
             return
         
         try:
             # Use CPU execution provider (Pi doesn't have CUDA for ONNX)
             self.session = ort.InferenceSession(
-                onnx_path,
+                resolved_model_path,
                 providers=['CPUExecutionProvider']
             )
+            self.model_path = resolved_model_path
             self.input_name = self.session.get_inputs()[0].name
-            self.threshold = self._load_threshold_from_config(onnx_path)
+            self.threshold = self._load_threshold_from_config(resolved_model_path)
             self.enabled = True
             
             # Log model info
             inp = self.session.get_inputs()[0]
             out = self.session.get_outputs()[0]
             print(f"[GaitAnalyzer] TCN model loaded successfully")
+            print(f"  Path:   {resolved_model_path}")
             print(f"  Input:  {inp.name} {inp.shape}")
             print(f"  Output: {out.name} {out.shape}")
             print(f"  Threshold (abnormal): {self.threshold:.2f}")
@@ -1376,7 +1395,7 @@ class GaitAnalyzer:
     
     @staticmethod
     def _normalize_keypoints(kps_xy):
-        """Hip-centered normalization — MUST match train_tcn_v2.py exactly.
+        """Hip-centered normalization matching train_tcn_v3.py.
         
         Args:
             kps_xy: numpy array of shape (T, 17, 2) — x, y coordinates only
@@ -1404,8 +1423,9 @@ class GaitAnalyzer:
         if not self.enabled:
             return None
         
-        # Extract just x, y (drop confidence) — shape (17, 2)
+        # Keep x, y for motion + confidence for TCN v3 features.
         kps_xy = keypoints[:, :2].copy()
+        kps_conf = np.clip(keypoints[:, 2].copy(), 0.0, 1.0)
         
         # Initialize buffer for new person
         if track_id not in self.keypoint_buffers:
@@ -1420,7 +1440,8 @@ class GaitAnalyzer:
         smoothed = self.EMA_ALPHA * kps_xy + (1.0 - self.EMA_ALPHA) * prev
         self.smoothed_keypoints[track_id] = smoothed
         
-        self.keypoint_buffers[track_id].append(smoothed)
+        frame_kps = np.concatenate([smoothed, kps_conf[:, np.newaxis]], axis=1)
+        self.keypoint_buffers[track_id].append(frame_kps)
         self.frame_counters[track_id] += 1
         
         # Only run analysis when buffer is full and stride interval reached
@@ -1434,8 +1455,10 @@ class GaitAnalyzer:
         # Reset stride counter
         self.frame_counters[track_id] = 0
         
-        # Build window: (TCN_WINDOW, 17, 2)
+        # Build window: (TCN_WINDOW, 17, 3) = x, y, confidence
         window = np.array(list(buf), dtype=np.float32)
+        window_xy = window[:, :, :2]
+        window_conf = np.clip(window[:, :, 2], 0.0, 1.0)
         
         # ---- MOTION GATE: skip classification if person is standing still ----
         # Four layered checks to reject YOLO jitter-as-motion:
@@ -1447,7 +1470,7 @@ class GaitAnalyzer:
         # -- Check 1: KEYPOINT VARIANCE STILLNESS --
         # If all keypoints barely move across the window, person is definitively still.
         # This catches slow drift that passes displacement checks.
-        kp_std = np.std(window, axis=0)  # (17, 2) std per joint per axis
+        kp_std = np.std(window_xy, axis=0)  # (17, 2) std per joint per axis
         mean_kp_std = float(np.mean(kp_std))  # single scalar
         
         if mean_kp_std < Config.TCN_STILLNESS_STD_THRESHOLD:
@@ -1459,8 +1482,8 @@ class GaitAnalyzer:
                       f"(mean_kp_std={mean_kp_std:.2f}px < {Config.TCN_STILLNESS_STD_THRESHOLD}), skipping")
             return result
         
-        hip_centers = (window[:, Config.TCN_LEFT_HIP_IDX, :] + 
-                       window[:, Config.TCN_RIGHT_HIP_IDX, :]) / 2.0
+        hip_centers = (window_xy[:, Config.TCN_LEFT_HIP_IDX, :] +
+                   window_xy[:, Config.TCN_RIGHT_HIP_IDX, :]) / 2.0
         
         # -- Check 2: Net displacement --
         net_displacement = float(np.linalg.norm(hip_centers[-1] - hip_centers[0]))
@@ -1484,7 +1507,7 @@ class GaitAnalyzer:
         # Walking produces cyclic motion in knees (13,14) and ankles (15,16).
         # If these joints are static, the person isn't stepping.
         limb_indices = [13, 14, 15, 16]  # L-knee, R-knee, L-ankle, R-ankle
-        limb_positions = window[:, limb_indices, :]  # (T, 4, 2)
+        limb_positions = window_xy[:, limb_indices, :]  # (T, 4, 2)
         limb_deltas = np.diff(limb_positions, axis=0)  # (T-1, 4, 2)
         limb_motion_std = float(np.mean(np.std(np.linalg.norm(limb_deltas, axis=2), axis=0)))
         
@@ -1508,18 +1531,33 @@ class GaitAnalyzer:
                       f"({self.motion_window_counts[track_id]}/{Config.TCN_MIN_MOTION_WINDOWS} windows), waiting")
             return self.gait_results.get(track_id)
         
-        # Normalize (hip-centered) — matches training exactly
-        window_norm = self._normalize_keypoints(window)
-        
-        # Reshape to (TCN_WINDOW, 34) then transpose to (34, TCN_WINDOW) for TCN
-        window_flat = window_norm.reshape(Config.TCN_WINDOW, Config.TCN_IN_CHANNELS)
-        # Input shape for ONNX: (1, 34, 60)
+        # Build TCN v3 features exactly like training:
+        # pos(2) + vel(2) + acc(2) + conf(1) => 7 dims per keypoint.
+        window_norm = self._normalize_keypoints(window_xy)
+        conf_mask = (window_conf >= 0.3).astype(np.float32)
+        pos = window_norm * conf_mask[:, :, np.newaxis]
+        vel = np.diff(pos, axis=0, prepend=pos[[0]])
+        acc = np.diff(vel, axis=0, prepend=vel[[0]])
+        conf_feat = window_conf[:, :, np.newaxis]
+
+        window_feat = np.concatenate([pos, vel, acc, conf_feat], axis=2)
+        window_flat = window_feat.reshape(Config.TCN_WINDOW, Config.TCN_IN_CHANNELS)
+
+        # Training uses per-subject z-score. Online inference approximates this
+        # with per-window z-score to keep scale consistent at runtime.
+        mu = float(window_flat.mean())
+        sigma = float(window_flat.std())
+        if sigma < 1e-6:
+            sigma = 1.0
+        window_flat = (window_flat - mu) / sigma
+
+        # Input shape for ONNX: (1, 119, 90)
         input_tensor = window_flat.T[np.newaxis, :, :].astype(np.float32)
         
         try:
             # Run ONNX inference
             outputs = self.session.run(None, {self.input_name: input_tensor})
-            logit = float(outputs[0][0][0])
+            logit = float(np.ravel(outputs[0])[0])
             
             # Apply sigmoid to get probability
             prob = 1.0 / (1.0 + np.exp(-np.clip(logit, -50, 50)))
@@ -2271,6 +2309,15 @@ import threading
 camera_lock = threading.Lock()
 status_lock = threading.Lock()
 data_gathering_lock = threading.Lock()
+identity_lock = threading.Lock()
+
+# Latest raw frame + detections cache for profile enrollment.
+# This avoids re-detecting on MJPEG-compressed frames and preserves track alignment.
+latest_identity_snapshot = {
+    'frame': None,        # BGR numpy array (raw frame before overlay)
+    'detections': [],     # list of {'track_id', 'box', 'keypoints'}
+    'timestamp': 0.0,
+}
 
 # Start the background CPU sampler now that threading is available
 _cpu_sampler_thread = threading.Thread(target=_run_cpu_sampler, daemon=True)
@@ -2473,6 +2520,21 @@ def _frame_producer():
                 _t_detect_start = time.time()
                 detections = detector.detect(frame)
                 _inference_ms = (time.time() - _t_detect_start) * 1000
+
+                # Cache raw frame + detections for face enrollment/identification APIs.
+                with identity_lock:
+                    latest_identity_snapshot['frame'] = frame.copy()
+                    latest_identity_snapshot['detections'] = [
+                        {
+                            'track_id': int(d['track_id']),
+                            'box': np.array(d['box'], dtype=np.float32).copy(),
+                            'keypoints': np.array(d['keypoints'], dtype=np.float32).copy()
+                                if d.get('keypoints') is not None else None,
+                        }
+                        for d in detections
+                    ]
+                    latest_identity_snapshot['timestamp'] = time.time()
+
                 frame = detector.draw_results(frame, detections)
 
                 with status_lock:
@@ -3236,44 +3298,32 @@ def enroll_profile():
     except (TypeError, ValueError):
         return jsonify({'success': False, 'error': 'track_id must be an integer'}), 400
 
-    # Grab the latest frame (requires picamera2 active)
-    with camera_lock:
-        if camera is None:
-            return jsonify({'success': False, 'error': 'Camera not available'}), 503
-        try:
-            # We capture an unscaled image directly or take from the latest detection
-            pass
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)}), 503
-
-    # On Pi, it's safer to re-read from frame_buffer or use the latest capture
-    # Actually, we don't have a simple camera.read() on Pi, so we should fetch the current frame from the buffer,
-    # decode it to BGR, and use it.
-    last_frame_bytes, _ = frame_buffer.wait_and_get(-1, timeout=0.1)
-    if not last_frame_bytes:
-        return jsonify({'success': False, 'error': 'No recent frame available'}), 503
-
-    import cv2
-    import numpy as np
-    nparr = np.frombuffer(last_frame_bytes, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    # Use latest raw snapshot from producer (frame + detections in same timeline).
+    with identity_lock:
+        frame = None if latest_identity_snapshot['frame'] is None else latest_identity_snapshot['frame'].copy()
+        snap_dets = list(latest_identity_snapshot['detections'])
 
     if frame is None:
-        return jsonify({'success': False, 'error': 'Could not decode frame'}), 503
+        return jsonify({'success': False, 'error': 'No recent raw frame available yet'}), 503
 
-    # Re-detect on the current frame to get a fresh box.
-    raw_dets = detector.detect(frame)
-    box = None
-    for d in raw_dets:
-        if d['track_id'] == track_id:
-            box = d['box']
+    target = None
+    for d in snap_dets:
+        if int(d['track_id']) == track_id:
+            target = d
             break
 
-    if box is None:
-        return jsonify({'success': False, 'error': f'track_id {track_id} not found in current frame'}), 404
+    if target is None:
+        return jsonify({'success': False, 'error': f'track_id {track_id} not found in latest detections'}), 404
 
-    success = detector.face_recognizer.enroll(name, box, frame)
+    box = target['box']
+    keypoints = target.get('keypoints')
+
+    # Enroll with keypoints-aware crop to avoid accidental body-only crops.
+    success = detector.face_recognizer.enroll(name, box, frame, keypoints=keypoints)
     if success:
+        # Apply label immediately for current track so UI doesn't stay on "Person N".
+        detector._person_labels[track_id] = name
+        detector._face_rec_counters[track_id] = 0
         return jsonify({'success': True, 'message': f"Profile '{name}' enrolled successfully"})
     return jsonify({'success': False, 'error': 'Enrollment failed (no face detected in crop)'}), 422
 

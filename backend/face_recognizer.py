@@ -271,7 +271,7 @@ class FaceRecognizer:
     # Enrolment                                                            #
     # ------------------------------------------------------------------ #
 
-    def enroll(self, name: str, box_xyxy, frame) -> bool:
+    def enroll(self, name: str, box_xyxy, frame, keypoints=None) -> bool:
         """
         Enroll the face inside box_xyxy under the given name.
 
@@ -284,7 +284,7 @@ class FaceRecognizer:
             print(f"[FaceRecognizer] Cannot enrol '{name}' — InsightFace disabled")
             return False
 
-        crop = _crop_face_region(frame, box_xyxy)
+        crop = _crop_face_region(frame, box_xyxy, keypoints=keypoints)
         if crop is None:
             print(f"[FaceRecognizer] Enrol '{name}' failed — crop too small")
             return False
