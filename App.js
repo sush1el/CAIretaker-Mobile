@@ -95,10 +95,17 @@ function MainApp() {
             const activeFalls = result.data.active_falls || [];
             const dbIncident = activeFalls.find(f => f.status === 'active' && f.type === 'fall');
             pushNotifications.startFallAlarm(
-              fallDetection?.id || dbIncident?.person_id || 'Unknown',
-              dbIncident?.location || 'Room 1'
+              fallDetection?.display_label || dbIncident?.person_label || `Person ${fallDetection?.id ?? 'Unknown'}`,
+              dbIncident?.location || fallDetection?.location || 'Room 1'
             );
             fallAlarmRef.current = true;
+          } else if (hasRealTimeFall && fallAlarmRef.current) {
+            // Alarm already running — refresh name if recognition has resolved it since start
+            const fallDetection = currentDetections.find(d => d.is_fall === true);
+            const resolvedLabel = fallDetection?.display_label;
+            if (resolvedLabel && !resolvedLabel.startsWith('Person ')) {
+              pushNotifications.updateFallAlarmPerson(resolvedLabel);
+            }
           } else if (!hasRealTimeFall && fallAlarmRef.current) {
             // No active falls in real-time - stop alarm immediately
             pushNotifications.stopFallAlarm();
@@ -110,10 +117,17 @@ function MainApp() {
             // Gait alert detected — only alarm if no fall alarm is already active
             const gaitDetection = currentDetections.find(d => d.gait_status === 'abnormal');
             pushNotifications.startGaitAlarm(
-              gaitDetection?.id || 'Unknown',
+              gaitDetection?.display_label || `Person ${gaitDetection?.id ?? 'Unknown'}`,
               'Room 1'
             );
             gaitAlarmRef.current = true;
+          } else if (hasRealTimeGait && gaitAlarmRef.current) {
+            // Alarm already running — refresh name if recognition has resolved it since start
+            const gaitDetection = currentDetections.find(d => d.gait_status === 'abnormal');
+            const resolvedLabel = gaitDetection?.display_label;
+            if (resolvedLabel && !resolvedLabel.startsWith('Person ')) {
+              pushNotifications.updateGaitAlarmPerson(resolvedLabel);
+            }
           } else if (!hasRealTimeGait && gaitAlarmRef.current) {
             pushNotifications.stopGaitAlarm();
             gaitAlarmRef.current = false;

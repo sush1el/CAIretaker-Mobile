@@ -306,16 +306,22 @@ class Config:
     )
     TCN_WINDOW = 90               # Frames per analysis window (must match training)
     TCN_STRIDE = 10               # Frames between analysis attempts
-    TCN_THRESHOLD = _get_env_float("TCN_THRESHOLD", 0.50)  # Abnormal-class probability threshold
+    TCN_THRESHOLD = _get_env_float("TCN_THRESHOLD", 0.55)  # Abnormal-class probability threshold
     TCN_ALERT_COOLDOWN = 30       # Seconds between repeat gait alerts per person
     TCN_IN_CHANNELS = 119         # 17 keypoints * 7 features (x,y,dx,dy,ddx,ddy,conf)
+    TCN_TOWARD_CAMERA_THRESHOLD = 0.75  # Higher bar when walking toward/away camera
+                                        # (model trained on lateral gait; vertical view is unreliable)
     TCN_LEFT_HIP_IDX = 11         # COCO keypoint index for left hip
     TCN_RIGHT_HIP_IDX = 12        # COCO keypoint index for right hip
     TCN_MOTION_THRESHOLD = 15.0   # Min net hip displacement (px) over window to count as "walking"
-    TCN_AVG_FRAME_THRESHOLD = 2.5  # Min avg per-frame hip delta (px) for sustained movement
-    TCN_STILLNESS_STD_THRESHOLD = 3.0   # Max mean keypoint std-dev (px) to be "stationary"
-    TCN_LIMB_MOTION_STD_THRESHOLD = 2.0 # Min limb oscillation std to confirm walking
-    TCN_MIN_MOTION_WINDOWS = 5   # Consecutive motion-passing windows required before TCN runs
+    TCN_AVG_FRAME_THRESHOLD = 1.5  # Min avg per-frame hip delta (px) for sustained movement
+    TCN_STILLNESS_STD_THRESHOLD = 2.0   # Max mean keypoint std-dev (px) to be "stationary"
+    TCN_LIMB_MOTION_STD_THRESHOLD = 1.5 # Min limb oscillation std to confirm walking
+    TCN_MIN_MOTION_WINDOWS = 2   # Consecutive motion-passing windows required before TCN runs
+    TCN_BURST_RATIO_THRESHOLD = 0.50  # Max fraction of total motion allowed in any single frame
+                                      # (burst guard: real walking is spread across all frames)
+    TCN_MIN_STEPS = 1                 # Min detected ankle-alternation crossings per window
+                                      # (2 = one full L+R gait cycle; keeps out jolts/fidgets)
     
     CLASS_NAMES = {0: "Standing", 1: "Sitting", 2: "Fallen"}
     CLASS_COLORS = {
@@ -1352,6 +1358,7 @@ class GaitAnalyzer:
         self.gait_results = {}         # track_id -> {'is_abnormal': bool, 'confidence': float}
         self.smoothed_keypoints = {}   # track_id -> last EMA-smoothed (17, 2) array
         self.motion_window_counts = {} # track_id -> consecutive windows where motion gate passed
+        self.step_counts = {}          # track_id -> detected step count in last window
         
         if not ONNX_AVAILABLE:
             print("[GaitAnalyzer] ONNX Runtime not available — gait analysis disabled")
@@ -1409,6 +1416,65 @@ class GaitAnalyzer:
         hip_dist   = np.linalg.norm(left_hip - right_hip, axis=1, keepdims=True)
         hip_dist   = np.clip(hip_dist, 1e-6, None)
         return (kps_xy - hip_center[:, np.newaxis, :]) / hip_dist[:, np.newaxis, :]
+
+    @staticmethod
+    def _detect_step_count(window_xy: np.ndarray) -> int:
+        """Count walking steps from alternating ankle oscillation.
+
+        Algorithm:
+          1. Compute each ankle's position relative to the hip midpoint,
+             using whichever axis (x or y) shows the most variance — this
+             makes it robust to cameras mounted at different angles.
+          2. Form the difference: left_ankle_rel - right_ankle_rel.
+             This oscillates once per step (positive when left foot leads,
+             negative when right foot leads).
+          3. Smooth with a 5-frame box filter to remove YOLO jitter.
+          4. Count zero-crossings (sign changes). Each crossing ≈ one step.
+             Two crossings = one full L→R gait cycle.
+          5. Reject windows where the peak-to-peak amplitude is too small
+             (< 4 px) to distinguish real steps from sensor noise.
+
+        Returns:
+            int: zero-crossing count (0 if ankles/hips not visible or amplitude < 4 px)
+        """
+        LEFT_HIP    = Config.TCN_LEFT_HIP_IDX   # 11
+        RIGHT_HIP   = Config.TCN_RIGHT_HIP_IDX  # 12
+        LEFT_ANKLE  = 15
+        RIGHT_ANKLE = 16
+
+        # Hip midpoint (removes whole-body translation)
+        hip_x   = (window_xy[:, LEFT_HIP, 0] + window_xy[:, RIGHT_HIP, 0]) / 2.0
+        hip_y   = (window_xy[:, LEFT_HIP, 1] + window_xy[:, RIGHT_HIP, 1]) / 2.0
+
+        # Ankle positions relative to hip, on both axes
+        left_rel_x  = window_xy[:, LEFT_ANKLE,  0] - hip_x
+        right_rel_x = window_xy[:, RIGHT_ANKLE, 0] - hip_x
+        left_rel_y  = window_xy[:, LEFT_ANKLE,  1] - hip_y
+        right_rel_y = window_xy[:, RIGHT_ANKLE, 1] - hip_y
+
+        diff_x = left_rel_x - right_rel_x
+        diff_y = left_rel_y - right_rel_y
+
+        # Pick the axis with more variance (camera-angle agnostic)
+        diff = diff_x if float(np.var(diff_x)) >= float(np.var(diff_y)) else diff_y
+
+        # 5-frame box smooth to suppress YOLO pose jitter
+        kernel = np.ones(5) / 5.0
+        diff_smooth = np.convolve(diff, kernel, mode='same') if len(diff) >= 5 else diff
+
+        # Reject if peak-to-peak amplitude is too small (< 4 px = noise floor)
+        amplitude = float(np.max(diff_smooth) - np.min(diff_smooth))
+        if amplitude < 4.0:
+            return 0
+
+        # Count zero-crossings (sign changes)
+        signs = np.sign(diff_smooth)
+        signs = signs[signs != 0]   # drop exact-zero samples
+        if len(signs) < 2:
+            return 0
+        crossings = int(np.sum(np.abs(np.diff(signs)) > 0))
+        return crossings
+
     
     def feed_keypoints(self, track_id, keypoints):
         """Feed a single frame's keypoints for a tracked person.
@@ -1519,6 +1585,41 @@ class GaitAnalyzer:
                 print(f"[GaitAnalyzer] Person {track_id}: stationary "
                       f"(limb_std={limb_motion_std:.2f}px < {Config.TCN_LIMB_MOTION_STD_THRESHOLD}), skipping")
             return result
+
+        # -- Check 4b: BURST MOTION GUARD --
+        # Sudden small movements (cough, reach, stumble-catch) concentrate most
+        # of their motion energy into 1-2 frames. Real walking distributes
+        # movement evenly over the 90-frame window.
+        # If any single frame accounts for more than TCN_BURST_RATIO_THRESHOLD
+        # of the total hip displacement, treat it as a transient jolt, not gait.
+        total_displacement = float(frame_deltas.sum())
+        if total_displacement > 0:
+            max_single_frame = float(frame_deltas.max())
+            burst_ratio = max_single_frame / total_displacement
+            if burst_ratio > Config.TCN_BURST_RATIO_THRESHOLD:
+                self.motion_window_counts[track_id] = 0  # Reset; this was a jolt, not walking
+                result = {'is_abnormal': False, 'confidence': 0.0}
+                self.gait_results[track_id] = result
+                if Config.DEBUG_LOGGING:
+                    print(f"[GaitAnalyzer] Person {track_id}: burst motion detected "
+                          f"(burst_ratio={burst_ratio:.2f} > {Config.TCN_BURST_RATIO_THRESHOLD}), skipping")
+                return result
+
+        # -- Check 4c: STEP COUNT GATE --
+        # Count alternating ankle oscillations (zero-crossings of left-right ankle
+        # difference signal). Sudden movements — coughs, reaches, stumble-catches —
+        # do NOT produce bilateral alternating foot motion, so they score 0-1 steps.
+        # Genuine walking at any pace produces clear alternating cycles.
+        step_count = self._detect_step_count(window_xy)
+        self.step_counts[track_id] = step_count
+        if step_count < Config.TCN_MIN_STEPS:
+            self.motion_window_counts[track_id] = 0  # Jolt or tiny fidget — reset
+            result = {'is_abnormal': False, 'confidence': 0.0}
+            self.gait_results[track_id] = result
+            if Config.DEBUG_LOGGING:
+                print(f"[GaitAnalyzer] Person {track_id}: insufficient steps detected "
+                      f"({step_count} < {Config.TCN_MIN_STEPS}), skipping")
+            return result
         
         # -- Check 5: SUSTAINED MOTION --
         # Require motion to persist across multiple consecutive analysis windows.
@@ -1553,17 +1654,38 @@ class GaitAnalyzer:
 
         # Input shape for ONNX: (1, 119, 90)
         input_tensor = window_flat.T[np.newaxis, :, :].astype(np.float32)
-        
+
+        # ── DIRECTION BIAS GUARD ─────────────────────────────────────────────
+        # The TCN was trained on lateral (side-view) walking data.
+        # When a person walks toward/away from the camera, the 2D keypoint
+        # pattern differs significantly from training: hips appear nearly
+        # stationary, ankles alternate in Y (depth), arm-swing compresses.
+        # Walking backward (facing away) reverses arm-swing direction, which
+        # the model strongly associates with abnormal gait.
+        # → Detect predominantly vertical hip movement and raise the
+        #   classification threshold to avoid false positives in this view.
+        dx = float(abs(hip_centers[-1, 0] - hip_centers[0, 0]))   # horizontal travel
+        dy = float(abs(hip_centers[-1, 1] - hip_centers[0, 1]))   # vertical travel
+        vertical_dominance = dy / (dx + dy + 1e-6)
+        effective_threshold = (
+            Config.TCN_TOWARD_CAMERA_THRESHOLD
+            if vertical_dominance > 0.65          # mostly toward/away from camera
+            else self.threshold
+        )
+        if Config.DEBUG_LOGGING and vertical_dominance > 0.65:
+            print(f"[GaitAnalyzer] Person {track_id}: vertical movement detected "
+                  f"(v_dom={vertical_dominance:.2f}), using stricter threshold={effective_threshold:.2f}")
+
         try:
             # Run ONNX inference
             outputs = self.session.run(None, {self.input_name: input_tensor})
             logit = float(np.ravel(outputs[0])[0])
-            
+
             # Apply sigmoid to get probability
             prob = 1.0 / (1.0 + np.exp(-np.clip(logit, -50, 50)))
-            
-            is_abnormal = prob >= self.threshold
-            
+
+            is_abnormal = prob >= effective_threshold
+
             result = {
                 'is_abnormal': bool(is_abnormal),
                 'confidence': float(prob)
@@ -1594,6 +1716,7 @@ class GaitAnalyzer:
         self.gait_results.pop(track_id, None)
         self.smoothed_keypoints.pop(track_id, None)
         self.motion_window_counts.pop(track_id, None)
+        self.step_counts.pop(track_id, None)
     
     def get_result(self, track_id):
         """Get the latest gait result for a person (may be None)."""
@@ -1729,24 +1852,41 @@ class FallDetector:
         """
         Resolve the display label for a tracked person.
         slot_index: 1-based position in the current frame's detection list.
+
+        Behaviour:
+          - Once a profile name is recognised and stored, it is returned IMMEDIATELY
+            on every subsequent frame without re-running face recognition.
+            The label is sticky for the entire duration the person is tracked.
+          - Until a name is found, recognition is retried every 3 frames so
+            identification happens quickly even on an unknown/new track.
+          - The label is only cleared when the person leaves the frame
+            (via cleanup_person / disappeared_ids logic in detect()).
         """
-        slot_label = f"Person {slot_index}"
+        track_label = f"Person {track_id}"
 
         if self.face_recognizer is None or not self.face_recognizer.enabled:
-            return self._person_labels.get(track_id, slot_label)
+            return self._person_labels.get(track_id, track_label)
 
+        # ── STICKY LABEL ──────────────────────────────────────────────────────
+        # If we already know who this person is, return immediately.
+        # No more recognition needed — label holds across pose changes,
+        # fallen state, and track-ID reassignment (via inheritance).
+        if track_id in self._person_labels:
+            return self._person_labels[track_id]
+
+        # ── FAST RE-ID FOR UNKNOWN TRACKS ────────────────────────────────────
+        # Run recognition every 3 frames until a name is found.
         counter = self._face_rec_counters.get(track_id, 0) + 1
         self._face_rec_counters[track_id] = counter
 
-        if counter >= Config.FACE_RECOGNITION_INTERVAL:
+        if counter >= 3:
             self._face_rec_counters[track_id] = 0
             label, is_known, _sim = self.face_recognizer.identify(box, frame, keypoints=keypoints)
             if is_known:
                 self._person_labels[track_id] = label
-            # Notice: We removed the 'else: pop()' block.
-            # Once YOLO tracks an ID and we tag it, we keep it tagged until they leave the frame!
+                return label
 
-        return self._person_labels.get(track_id, slot_label)
+        return track_label
     
     def detect(self, frame):
         """Detect pose and classify activity with tracking (same logic as inference but multi-person)"""
@@ -1773,37 +1913,41 @@ class FallDetector:
                 frame_persons.append((idx, hailo_det, box, box_conf, keypoints, track_id))
 
         for slot_index, (idx, hailo_det, box, box_conf, keypoints, track_id) in enumerate(frame_persons, start=1):
-            # Resolve slot-based display label (with optional face recognition)
-            display_label = self._get_display_label(track_id, slot_index, box, frame, keypoints=keypoints)
-                
             current_person_ids.add(track_id)
-                
-            # Initialize fall state for new person
+
+            # Initialize fall state for new track ID
             if track_id not in self.fall_states:
-                # Inherit profile name from a recently lost track if close enough (fixes ID switch during fall)
                 new_cx = (box[0] + box[2]) / 2
                 new_cy = (box[1] + box[3]) / 2
                 best_dist = float('inf')
                 best_old_id = None
-                
-                for old_id, state in self.fall_states.items():
-                    if old_id not in current_person_ids and 'last_box' in state:
-                        old_box = state['last_box']
-                        old_cx = (old_box[0] + old_box[2]) / 2
-                        old_cy = (old_box[1] + old_box[3]) / 2
-                        dist = ((new_cx - old_cx)**2 + (new_cy - old_cy)**2)**0.5
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_old_id = old_id
-                            
-                if best_old_id is not None and best_dist < max(frame.shape[0], frame.shape[1]) * 0.4:
-                    if best_old_id in self._person_labels:
-                        self._person_labels[track_id] = self._person_labels[best_old_id]
-                        if track_id not in self._face_rec_counters:
-                            self._face_rec_counters[track_id] = self._face_rec_counters.get(best_old_id, 0)
-                        # Re-resolve display label using inherited _person_labels
-                        display_label = self._person_labels[track_id]
-                        
+
+                # ── PROFILE-FIRST INHERITANCE ────────────────────────────────
+                # The profile name IS the identity — track_id is just an internal handle.
+                # When a new track ID appears, find the nearest ALREADY-IDENTIFIED person
+                # in _person_labels (alive ghost, recently disappeared, or aged out — it
+                # doesn't matter). Copy their name. This single pass replaces all the
+                # complicated ghost/disappeared/two-radius logic that came before.
+                inherit_radius = max(frame.shape[0], frame.shape[1]) * 0.65
+
+                for old_id, profile_name in list(self._person_labels.items()):
+                    if old_id == track_id:
+                        continue
+                    old_state = self.fall_states.get(old_id)
+                    if not old_state or 'last_box' not in old_state:
+                        continue
+                    old_box = old_state['last_box']
+                    old_cx = (old_box[0] + old_box[2]) / 2
+                    old_cy = (old_box[1] + old_box[3]) / 2
+                    dist = ((new_cx - old_cx)**2 + (new_cy - old_cy)**2)**0.5
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_old_id = old_id
+
+                if best_old_id is not None and best_dist < inherit_radius:
+                    self._person_labels[track_id] = self._person_labels[best_old_id]
+                    self._face_rec_counters[track_id] = self._face_rec_counters.get(best_old_id, 0)
+
                 self.fall_states[track_id] = {
                     'is_fallen': False,
                     'incident_id': None,
@@ -1811,6 +1955,12 @@ class FallDetector:
                 }
             else:
                 self.fall_states[track_id]['last_box'] = box
+
+
+
+            # Resolve display label AFTER inheritance so the first frame already
+            # shows the inherited name instead of "Person <track_id>".
+            display_label = self._get_display_label(track_id, slot_index, box, frame, keypoints=keypoints)
 
             # STRUCTURAL VALIDATION: Require both shoulders and both knees visible
             visible_count = np.sum(keypoints[:, 2] > 0.3)
@@ -2024,10 +2174,15 @@ class FallDetector:
                         if time_threshold_met and frames_threshold_met:
                             if not self.fall_states[track_id]['is_fallen']:
                                 room_name = Config.get_room_name(current_camera_index)
+                                # Re-resolve the freshest name at alert time — face recognition
+                                # may have matched the person after display_label was first set.
+                                alert_label = self._person_labels.get(
+                                    track_id, f"Person {track_id}"
+                                )
                                 print(f"{'='*70}")
                                 print(f"CONFIRMED FALL ALERT")
                                 print(f"{'='*70}")
-                                print(f"Person: {display_label} (track_id={track_id})")
+                                print(f"Person: {alert_label} (track_id={track_id})")
                                 print(f"Location: {room_name}")
                                 print(f"Fallen Confidence: {fallen_confidence:.2%}")
                                 print(f"Time Fallen: {elapsed_time:.2f}s")
@@ -2037,12 +2192,18 @@ class FallDetector:
                                     person_id=track_id,
                                     confidence=fallen_confidence,
                                     location=room_name,
-                                    person_label=display_label,
+                                    person_label=alert_label,
                                 )
 
                                 if incident_id is None:
-                                    # Person already has an active fall in DB — skip duplicate
-                                    print(f"{display_label}: Active fall already exists in DB, skipping")
+                                    # Person already has an active fall in DB — mark as fallen
+                                    # locally too so monitoring exits and doesn't loop forever.
+                                    print(f"{alert_label}: Active fall already exists in DB — syncing local state")
+                                    self.fall_states[track_id]['is_fallen'] = True
+                                    # Clear the candidate so monitoring stops
+                                    candidate['start_time'] = None
+                                    candidate['frame_count'] = 0
+                                    candidate['consecutive_fallen_frames'] = 0
                                 else:
                                     self.fall_states[track_id]['is_fallen'] = True
                                     self.fall_states[track_id]['incident_id'] = incident_id
@@ -2055,10 +2216,10 @@ class FallDetector:
                                     fall_direction = self.fall_states[track_id].get('fall_direction')
                                     fused_score = self.fall_states[track_id].get('fused_score', fallen_confidence)
                                     direction_str = f" ({fall_direction})" if fall_direction else ""
-                                    
+
                                     send_expo_push_notification(
                                         "🚨 Fall Detected!",
-                                        f"{display_label} has fallen{direction_str} at {room_name}. Confidence: {fused_score:.0%}"
+                                        f"{alert_label} has fallen{direction_str} at {room_name}. Confidence: {fused_score:.0%}"
                                     )
                             else:
                                 if _should_log:
@@ -2172,8 +2333,9 @@ class FallDetector:
                 'gait_confidence': gait_result_for_det['confidence'] if gait_result_for_det else 0.0,
             })
         
-        # Clean up tracking for people who left the frame
-        disappeared_ids = set(self.fall_states.keys()) - current_person_ids
+        # Clean up tracking for people who left the frame (or aged out of the tracker)
+        active_tracker_ids = set(self.tracker.tracks.keys())
+        disappeared_ids = set(self.fall_states.keys()) - active_tracker_ids
         for person_id in disappeared_ids:
             if self.fall_states[person_id]['is_fallen']:
                 lbl = self._person_labels.get(person_id, f"Person (track={person_id})")
@@ -2229,7 +2391,7 @@ class FallDetector:
             # Determine color and label (use display_label)
             if is_monitoring and not is_fallen:
                 elapsed = current_time - candidate['start_time']
-                remaining = Config.FALL_CONFIRMATION_TIME - elapsed
+                remaining = max(0.0, Config.FALL_CONFIRMATION_TIME - elapsed)
                 color = (0, 165, 255)  # ORANGE for monitoring
                 label = f"{display_label}: MONITORING ({remaining:.1f}s)"
                 box_thickness = 3
@@ -2544,6 +2706,7 @@ def _frame_producer():
                     current_status['detections'] = [
                         {
                             'id': d['track_id'],
+                            'display_label': d.get('display_label', f"Person {d['track_id']}"),
                             'status': 'At Risk' if d.get('display_state') == 'at_risk' else Config.CLASS_NAMES.get(d['prediction'], 'Tracking') if d['status'] == 'classified' else 'Tracking',
                             'confidence': d['confidence'],
                             'confidence_tier': d.get('confidence_tier', 'N/A'),

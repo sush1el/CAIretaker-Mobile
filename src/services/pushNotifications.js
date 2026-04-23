@@ -11,6 +11,8 @@ import { Platform, Vibration } from 'react-native';
 // Store interval ID for continuous alarm
 let alarmIntervalId = null;
 let isAlarmActive = false;
+let _fallPersonId = 'Unknown';   // mutable — updated when recognition fires
+let _fallLocation = 'Unknown';
 
 // Configure how notifications should be handled when app is in foreground
 Notifications.setNotificationHandler({
@@ -25,11 +27,11 @@ Notifications.setNotificationHandler({
 /**
  * Send a local notification (for continuous alarm)
  */
-async function sendLocalFallNotification(personId, location) {
+async function sendLocalFallNotification() {
   await Notifications.scheduleNotificationAsync({
     content: {
       title: '🚨 FALL ALERT - ONGOING',
-      body: `Person ${personId} is still down at ${location}. Please respond!`,
+      body: `${_fallPersonId} is still down at ${_fallLocation}. Please respond!`,
       sound: true,
       priority: Notifications.AndroidNotificationPriority.MAX,
       vibrate: [0, 500, 200, 500, 200, 500],
@@ -51,33 +53,46 @@ export function startFallAlarm(personId = 'Unknown', location = 'Unknown') {
     return;
   }
 
+  _fallPersonId = personId;
+  _fallLocation = location;
   isAlarmActive = true;
   console.log('🔔 Starting continuous fall alarm');
 
   // Send first notification immediately
-  sendLocalFallNotification(personId, location);
+  sendLocalFallNotification();
 
-  // Then send every 3 seconds
+  // Then send every 3 seconds, always using the latest _fallPersonId
   alarmIntervalId = setInterval(() => {
     if (isAlarmActive) {
-      sendLocalFallNotification(personId, location);
+      sendLocalFallNotification();
       console.log('🔔 Fall alarm: notification sent');
     }
   }, 3000);
 }
 
+/**
+ * Update the person label shown in ongoing fall alarm notifications.
+ * Call this when face recognition resolves a name after the alarm started.
+ */
+export function updateFallAlarmPerson(personId, location) {
+  if (personId) _fallPersonId = personId;
+  if (location) _fallLocation = location;
+}
+
 // Store gait alarm state separately
 let gaitAlarmIntervalId = null;
 let isGaitAlarmActive = false;
+let _gaitPersonId = 'Unknown';   // mutable — updated when recognition fires
+let _gaitLocation = 'Unknown';
 
 /**
  * Send a local notification for abnormal gait
  */
-async function sendLocalGaitNotification(personId, location) {
+async function sendLocalGaitNotification() {
   await Notifications.scheduleNotificationAsync({
     content: {
       title: '⚠️ ABNORMAL GAIT DETECTED',
-      body: `Person ${personId} at ${location} shows abnormal walking pattern. Please check on them.`,
+      body: `${_gaitPersonId} at ${_gaitLocation} shows abnormal walking pattern. Please check on them.`,
       sound: true,
       priority: Notifications.AndroidNotificationPriority.HIGH,
       vibrate: [0, 300, 200, 300],
@@ -99,19 +114,30 @@ export function startGaitAlarm(personId = 'Unknown', location = 'Unknown') {
     return;
   }
 
+  _gaitPersonId = personId;
+  _gaitLocation = location;
   isGaitAlarmActive = true;
   console.log('🔔 Starting gait alarm');
 
   // Send first notification immediately
-  sendLocalGaitNotification(personId, location);
+  sendLocalGaitNotification();
 
-  // Then send every 5 seconds (less aggressive than fall alarm)
+  // Then send every 5 seconds, always using the latest _gaitPersonId
   gaitAlarmIntervalId = setInterval(() => {
     if (isGaitAlarmActive) {
-      sendLocalGaitNotification(personId, location);
+      sendLocalGaitNotification();
       console.log('🔔 Gait alarm: notification sent');
     }
   }, 5000);
+}
+
+/**
+ * Update the person label shown in ongoing gait alarm notifications.
+ * Call this when face recognition resolves a name after the alarm started.
+ */
+export function updateGaitAlarmPerson(personId, location) {
+  if (personId) _gaitPersonId = personId;
+  if (location) _gaitLocation = location;
 }
 
 /**
